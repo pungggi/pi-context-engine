@@ -58,6 +58,20 @@ Ten tools the agent can call, plus three slash commands.
 
 Commands: `/context-index [--full]`, `/context-status`, `/context-savings`.
 
+**Shipped guidance.** The package also injects a ~900-token guidance section
+into the system prompt while `context_search` is active: how to formulate
+queries, when *not* to search, how to read confidence and overflow markers,
+and the index lifecycle.
+
+- **Why it ships:** retrieval only saves tokens when queries are good, and
+  these rules describe this package's own semantics. Keeping them in the tool
+  description alone would leave every user guessing.
+- **Cost-aware gate:** the section appears only while the tool is selected, and
+  `guidance.enabled: false` turns it off entirely for prompt-lean setups.
+- **Structured, not forced:** it is written to `systemPromptOptions.sections`,
+  so pi replays and diffs it like any other section instead of freezing the
+  whole prompt.
+
 ## How it works
 
 1. **Chunk**: tree-sitter parses source into functions, classes and modules.
@@ -93,6 +107,8 @@ retrieval:
   top_k: 20
   confidence_threshold: 0.2
   marginal_ratio: 0.75   # stop adding chunks below this fraction of the top score
+guidance:
+  enabled: true          # inject context_search guidance into the system prompt
 compression:
   level: standard        # minimal | standard | full
   ollama_url: http://localhost:11434

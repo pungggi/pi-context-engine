@@ -26,6 +26,7 @@ pi session
 | `indexer/embedder.ts` | Ollama + local ONNX backends, selection | `indexer/embedder.py` |
 | `indexer/secrets.ts` | Secret filename skip, content redaction, PII scrub | `indexer/secrets.py` |
 | `retrieval/retriever.ts` | RRF merge, confidence blend, graph expansion | `retrieval/retriever.py` |
+| `guidance.ts` | Query-formulation system-prompt section (config-gated) | upstream's session-start tool instructions |
 | `compression/compressor.ts` | Truncation signatures, Ollama summaries, quality gate | `compression/*` |
 | `memory/db.ts` | Schema, vec recall, savings ledger, retention | `memory/db.py` |
 | `memory/grammar.ts` | Deterministic prose compression | `memory/grammar.py` |
@@ -71,6 +72,11 @@ contending with embedding writes. Upstream made the same split.
 - **Best-effort everywhere it must not crash.** Savings accounting, audit logs,
   session capture and shutdown all swallow their own errors: an instrumentation
   problem must never break a tool response.
+- **Guidance pays for its tokens or does not ship.** The ~900-token section is
+  injected only when `context_search` is in the run's selected tools *and*
+  `guidance.enabled` is true, through `sections` (replayable, diffable) rather
+  than a forced prompt replacement. Users who count prompt tokens opt out with
+  one config line.
 
 ## Degradation paths
 

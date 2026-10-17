@@ -309,9 +309,31 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_vec USING vec0(embedding float
 		this.writeVecRow("turn_summaries_vec", turnId, vec);
 	}
 
+	/**
+	 * Count rows still missing a vec entry, without touching an embedder.
+	 * Lets callers skip the backfill (and its model init) in the steady state.
+	 */
+	vecBackfillPending(): { decisions: number; turnSummaries: number } {
+		if (!this.hasVecTables()) return { decisions: 0, turnSummaries: 0 };
+		try {
+			const d = this.db
+				.prepare("SELECT COUNT(*) AS n FROM decisions d WHERE NOT EXISTS (SELECT 1 FROM decisions_vec v WHERE v.rowid = d.id)")
+				.get() as { n: number };
+			const t = this.db
+				.prepare("SELECT COUNT(*) AS n FROM turn_summaries t WHERE NOT EXISTS (SELECT 1 FROM turn_summaries_vec v WHERE v.rowid = t.id)")
+				.get() as { n: number };
+			return { decisions: Number(d?.n ?? 0), turnSummaries: Number(t?.n ?? 0) };
+		} catch {
+			return { decisions: 0, turnSummaries: 0 };
+		}
+	}
+
 	async backfillVecTables(embedder: Embedder): Promise<{ decisions: number; turnSummaries: number }> {
 		const counts = { decisions: 0, turnSummaries: 0 };
 		if (!this.hasVecTables()) return counts;
+		// Steady state: nothing missing — skip the embedder entirely.
+		const pending = this.vecBackfillPending();
+		if (pending.decisions + pending.turnSummaries === 0) return counts;
 		try {
 			this.ensureVecDim((await embedder.embedQuery("dimension probe")).length);
 		} catch {

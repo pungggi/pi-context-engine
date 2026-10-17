@@ -116,7 +116,6 @@ embedding:
   model: local           # or a specific transformers.js model id
   ollama_model: nomic-embed-text
 indexer:
-  watch: true
   redact_secrets: true
 memory:
   redact_pii: true

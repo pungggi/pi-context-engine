@@ -60,13 +60,9 @@ export interface Config {
 	retrievalConfidenceThreshold: number;
 	retrievalTopK: number;
 	retrievalMarginalRatio: number;
-	bootstrapMaxTokens: number;
-	indexerWatch: boolean;
-	indexerDebounceMs: number;
 	indexerIgnore: string[];
 	indexerRedactSecrets: boolean;
 	memoryRedactPii: boolean;
-	auditLogEnabled: boolean;
 	pricingModel: string;
 	pricingInput: number | null;
 	pricingOutput: number | null;
@@ -84,13 +80,9 @@ export function defaultConfig(): Config {
 		retrievalConfidenceThreshold: 0.2,
 		retrievalTopK: 20,
 		retrievalMarginalRatio: 0.75,
-		bootstrapMaxTokens: 10000,
-		indexerWatch: true,
-		indexerDebounceMs: 500,
 		indexerIgnore: [...DEFAULT_IGNORE],
 		indexerRedactSecrets: true,
 		memoryRedactPii: true,
-		auditLogEnabled: false,
 		pricingModel: "opus",
 		pricingInput: null,
 		pricingOutput: null,
@@ -109,13 +101,9 @@ const MAPPING: Record<string, keyof Config> = {
 	"retrieval.confidence_threshold": "retrievalConfidenceThreshold",
 	"retrieval.top_k": "retrievalTopK",
 	"retrieval.marginal_ratio": "retrievalMarginalRatio",
-	"retrieval.bootstrap_max_tokens": "bootstrapMaxTokens",
-	"indexer.watch": "indexerWatch",
-	"indexer.debounce_ms": "indexerDebounceMs",
 	"indexer.ignore": "indexerIgnore",
 	"indexer.redact_secrets": "indexerRedactSecrets",
 	"memory.redact_pii": "memoryRedactPii",
-	"audit.enabled": "auditLogEnabled",
 	"storage.path": "storagePath",
 	"pricing.model": "pricingModel",
 	"pricing.input": "pricingInput",

@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Config } from "./config.js";
 import { loadConfigForProject, resolveOllamaUrl } from "./config.js";
-import { epochSeconds, humaniseRelativeTime, projectStorageDir, sha256Hex } from "./utils.js";
+import { atomicWriteText, epochSeconds, humaniseRelativeTime, projectStorageDir, sha256Hex } from "./utils.js";
 import { LocalBackend } from "./storage/local-backend.js";
 import { Embedder, selectBackend } from "./indexer/embedder.js";
 import { HybridRetriever } from "./retrieval/retriever.js";
@@ -146,6 +146,7 @@ export class ContextEngine {
 	draining = false;
 	private searchesSinceDecision = 0;
 	private hasRecordedDecision = false;
+	private vecBackfillStarted = false;
 
 	constructor(options: EngineOptions) {
 		this.projectDir = fs.realpathSync(path.resolve(options.projectDir));
@@ -247,7 +248,7 @@ export class ContextEngine {
 
 	private saveStats(): void {
 		try {
-			fs.writeFileSync(this.statsPath, JSON.stringify(this.stats));
+			atomicWriteText(this.statsPath, JSON.stringify(this.stats));
 		} catch {
 			// stats are best-effort
 		}
@@ -426,6 +427,24 @@ export class ContextEngine {
 			void this.drainCompressionQueue();
 		}, 5000);
 		this.drainTimer.unref?.();
+		void this.backfillMemoryVec().catch(() => undefined);
+	}
+
+	/**
+	 * One-shot semantic-memory backfill (upstream #137 lesson). After an
+	 * embedder change the vec tables are recreated empty; without this, old
+	 * decisions silently lose semantic recall (FTS still works, so the loss is
+	 * easy to miss). Guarded by a cheap missing-row count so the steady state
+	 * never initialises an embedder for this.
+	 */
+	private async backfillMemoryVec(): Promise<void> {
+		if (this.vecBackfillStarted) return;
+		this.vecBackfillStarted = true;
+		const memory = this.getMemory();
+		if (!memory || !memory.vecAvailable || !memory.hasVecTables()) return;
+		const pending = memory.vecBackfillPending();
+		if (pending.decisions + pending.turnSummaries === 0) return;
+		await memory.backfillVecTables(await this.getEmbedder());
 	}
 
 	async shutdown(): Promise<void> {

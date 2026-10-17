@@ -139,6 +139,15 @@ function resolveWithin(projectDir: string, target: string): string {
 	return resolved;
 }
 
+/** A directory target is excluded when it or any ancestor matches a dir rule (upstream #165b). */
+function cceignoreMatchesDir(relPosix: string, patterns: string[]): boolean {
+	const parts = relPosix.split("/");
+	for (let i = 1; i <= parts.length; i++) {
+		if (matchesAny(parts.slice(0, i).join("/"), true, patterns)) return true;
+	}
+	return false;
+}
+
 function safeRead(filePath: string): string | null {
 	try {
 		if (fs.statSync(filePath).size > MAX_FILE_BYTES) return null;
@@ -385,32 +394,66 @@ async function runIndexingLocked(
 	if (cceignorePatterns.length > 0) log?.(`  [.cceignore] ${cceignorePatterns.length} pattern(s) loaded`);
 
 	// ── Determine the file set ─────────────────────────────────────────────
+	/**
+	 * A file the inclusion policy now rejects must not leave stale chunks
+	 * behind (upstream #127): purge its manifest entry and indexed rows so a
+	 * targeted reindex is enough to enforce a new secret/ignore rule.
+	 */
+	const purgeIndexed = (rels: string[]): void => {
+		const indexed = rels.filter((rel) => manifest.getHash(rel) !== undefined);
+		if (indexed.length === 0) return;
+		backend.deleteByFiles(indexed);
+		for (const rel of indexed) {
+			manifest.remove(rel);
+			result.deletedFiles.push(rel);
+			log?.(`  [delete] ${rel} (excluded by policy)`);
+		}
+		manifest.save();
+	};
 	let fileList: string[];
 	if (targetPath) {
 		const target = resolveWithin(projectDir, targetPath);
 		if (fs.existsSync(target) && fs.statSync(target).isFile()) {
 			const rel = path.relative(projectDir, target).replace(/\\/g, "/");
 			if (SKIP_EXTENSIONS.has(path.extname(target).toLowerCase())) {
+				purgeIndexed([rel]);
 				fileList = [];
 			} else if (ignoreSet.has(path.basename(target))) {
 				result.skippedFiles.push(rel);
+				purgeIndexed([rel]);
 				fileList = [];
 			} else if (config.indexerRedactSecrets && isSecretFile(target)) {
 				result.skippedFiles.push(rel);
+				purgeIndexed([rel]);
 				fileList = [];
 			} else if (cceignorePatterns.length > 0 && cceignoreMatchesFile(rel, cceignorePatterns)) {
 				result.skippedFiles.push(rel);
+				purgeIndexed([rel]);
 				fileList = [];
 			} else {
 				fileList = [target];
 			}
 		} else if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
-			fileList = [
-				...iterProjectFiles(target, ignoreSet, {
-					redactSecrets: config.indexerRedactSecrets,
-					cceignorePatterns,
-				}),
-			];
+			// Upstream #165b: the walk starts inside the target, so the target
+			// itself (and its ancestors) must be tested against the same
+			// exclusions here — or `reindex(path)` can index an excluded subtree.
+			const rel = path.relative(projectDir, target).replace(/\\/g, "/");
+			const excluded =
+				ignoreSet.has(path.basename(target)) ||
+				(config.indexerRedactSecrets && isSecretFile(target)) ||
+				(cceignorePatterns.length > 0 && cceignoreMatchesDir(rel, cceignorePatterns));
+			if (excluded) {
+				result.skippedFiles.push(rel);
+				purgeIndexed(Object.keys(manifest.fileEntries).filter((p) => p === rel || p.startsWith(`${rel}/`)));
+				fileList = [];
+			} else {
+				fileList = [
+					...iterProjectFiles(target, ignoreSet, {
+						redactSecrets: config.indexerRedactSecrets,
+						cceignorePatterns,
+					}),
+				];
+			}
 		} else {
 			// Watcher deletion path: prune instead of erroring out.
 			const rel = path.relative(projectDir, target).replace(/\\/g, "/");

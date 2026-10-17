@@ -51,6 +51,12 @@ export interface Config {
 	ollamaUrl: string;
 	embeddingModel: string;
 	ollamaEmbedModel: string;
+	/**
+	 * Inject the query-formulation guidance section into the system prompt
+	 * while `context_search` is active. Default true: retrieval quality depends
+	 * on how queries are written. Set false for the leanest possible prompt.
+	 */
+	guidanceEnabled: boolean;
 	retrievalConfidenceThreshold: number;
 	retrievalTopK: number;
 	retrievalMarginalRatio: number;
@@ -74,6 +80,7 @@ export function defaultConfig(): Config {
 		ollamaUrl: "http://localhost:11434",
 		embeddingModel: "local",
 		ollamaEmbedModel: "nomic-embed-text",
+		guidanceEnabled: true,
 		retrievalConfidenceThreshold: 0.2,
 		retrievalTopK: 20,
 		retrievalMarginalRatio: 0.75,
@@ -96,6 +103,7 @@ const MAPPING: Record<string, keyof Config> = {
 	"compression.level": "compressionLevel",
 	"compression.model": "compressionModel",
 	"compression.ollama_url": "ollamaUrl",
+	"guidance.enabled": "guidanceEnabled",
 	"embedding.model": "embeddingModel",
 	"embedding.ollama_model": "ollamaEmbedModel",
 	"retrieval.confidence_threshold": "retrievalConfidenceThreshold",

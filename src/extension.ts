@@ -11,6 +11,7 @@ import { Type } from "typebox";
 import fs from "node:fs";
 import path from "node:path";
 import { ContextEngine, isPceConfig } from "./engine.js";
+import { applyContextSearchGuidance } from "./guidance.js";
 
 /** Tools whose payloads are worth capturing for session timelines. */
 const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
@@ -304,6 +305,12 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		const eng = getEngine(ctx.cwd);
 		promptNumber = eng.recordPrompt(event.prompt ?? "");
 		eng.enqueueTurnCompression(promptNumber);
+
+		// Query-formulation guidance for context_search: gated on the tool being
+		// active and on `guidance.enabled` (config), so prompt-lean setups pay
+		// nothing. Section, not a forced prompt override: pi diffs it like any
+		// other section and the transcript stays stable.
+		applyContextSearchGuidance(event.systemPromptOptions, eng.config.guidanceEnabled);
 
 		// First prompt of the session: inject a compact "where you left off"
 		// block as a non-displayed custom message (upstream's SessionStart hook).

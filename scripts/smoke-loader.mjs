@@ -133,6 +133,22 @@ if (problems.length === 0) {
 
 		const recall = await tools.get("session_recall").execute("t4", { topic: "jwt auth" }, undefined, undefined, ctx);
 		if (!textOf(recall).includes("JWT")) problems.push(`session_recall missed the decision:\n${textOf(recall)}`);
+
+		// Guidance wiring: fire before_agent_start like pi does and verify the
+		// package's guidance section lands (tool active + config default on).
+		const beforeAgent = handlers.get("before_agent_start");
+		if (!beforeAgent) {
+			problems.push("before_agent_start handler missing");
+		} else {
+			const promptOptions = { selectedTools: ["context_search", "read"], sections: {}, appendSystemPrompt: "" };
+			await beforeAgent(
+				{ type: "before_agent_start", messageType: "user", prompt: "hi", systemPrompt: "", systemPromptOptions: promptOptions },
+				ctx,
+			);
+			const section = promptOptions.sections["context_search_guidelines"];
+			if (!section) problems.push("guidance section not injected while context_search selected");
+			else if (!section.includes("/context-index")) problems.push("guidance section missing index lifecycle text");
+		}
 	} catch (err) {
 		problems.push(`tool invocation threw: ${err.stack ?? err}`);
 	} finally {
@@ -151,6 +167,7 @@ if (problems.length === 0) {
 console.log(`tools (${tools.size}): ${[...tools.keys()].join(", ")}`);
 console.log(`commands (${commands.length}): ${commands.map((c) => `/${c}`).join(", ")}`);
 console.log(`events (${events.size}): ${[...events].join(", ")}`);
+console.log("guidance: injected through before_agent_start (validated above)");
 
 if (problems.length > 0) {
 	console.error("\nPROBLEMS:");

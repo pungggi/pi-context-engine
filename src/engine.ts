@@ -435,7 +435,8 @@ export class ContextEngine {
 	 * embedder change the vec tables are recreated empty; without this, old
 	 * decisions silently lose semantic recall (FTS still works, so the loss is
 	 * easy to miss). Guarded by a cheap missing-row count so the steady state
-	 * never initialises an embedder for this.
+	 * never initialises an embedder for this. Recall also self-heals via
+	 * `MemoryDb.healVecTables`, covering wipes that happen after this runs.
 	 */
 	private async backfillMemoryVec(): Promise<void> {
 		if (this.vecBackfillStarted) return;

@@ -16,9 +16,15 @@ acknowledgement within 7 days.
 
 - The npm package `pi-context-engine` and its GitHub repository
   (`pungggi/pi-context-engine`).
-- Everything runs locally: the index, memory database, and embeddings never
-  leave the machine. Reports about data handling (secret redaction, PII
-  scrubbing, path validation) are especially welcome.
+- **Local by default**: the index and memory database live on disk on your
+  machine, and embeddings are computed locally (ONNX model) or by a local
+  Ollama at `localhost:11434`.
+- **Remote endpoint caveat**: if you configure a remote Ollama
+  (`PCE_OLLAMA_URL` or `compression.ollama_url`), chunk text and memory text
+  are sent to that endpoint for embedding. That configuration is the user's
+  responsibility, including how the endpoint handles the data.
+- Reports about data handling (secret redaction, PII scrubbing, path
+  validation) are especially welcome.
 
 ## Handling
 

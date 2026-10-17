@@ -211,4 +211,141 @@ describe("memory vec backfill (upstream #137)", () => {
 		}
 		memory.close();
 	});
+
+	it("self-heals at recall when tables are populated at a foreign dim (review C1)", async () => {
+		const dir = makeTempDir("pce-memvec-heal-");
+		tempDirs.push(dir);
+		const memory = new MemoryDb(memoryDbPath(dir));
+		const embedder = makeFakeEmbedder(); // 64-dim
+
+		// History written by a different embedder: tables fully populated at a
+		// foreign dim (17), so pending-count is zero but every 64-dim query
+		// would mismatch and silently return nothing.
+		memory.db
+			.prepare("INSERT INTO decisions (session_id, decision, reason, source, created_at_epoch, created_at) VALUES (NULL, 'use sqlite wal', 'crash safety', 'manual', 0, '')")
+			.run();
+		memory.db.exec("DROP TABLE IF EXISTS decisions_vec");
+		memory.db.exec("DROP TABLE IF EXISTS turn_summaries_vec");
+		memory.db.exec("CREATE VIRTUAL TABLE decisions_vec USING vec0(embedding float[17])");
+		memory.db.exec("CREATE VIRTUAL TABLE turn_summaries_vec USING vec0(embedding float[17])");
+		memory.db
+			.prepare("INSERT INTO decisions_vec(rowid, embedding) VALUES (?, ?)")
+			.run(1n, Buffer.from(Float32Array.from(new Array(17).fill(0.1)).buffer));
+		expect(memory.vecBackfillPending()).toEqual({ decisions: 0, turnSummaries: 0 }); // the trap
+
+		const hits = await memory.searchDecisionsVec(embedder, "sqlite crash safety", 5);
+		expect(hits).toContain(1); // healed: recreated at 64 + backfilled
+		expect(memory.vecBackfillPending().decisions).toBe(0);
+		memory.close();
+	});
+
+	it("self-heals missing rows when dims already match — mid-session wipe after the one-shot backfill (review C1)", async () => {
+		const dir = makeTempDir("pce-memvec-wipe-");
+		tempDirs.push(dir);
+		const memory = new MemoryDb(memoryDbPath(dir));
+		const embedder = makeFakeEmbedder();
+
+		memory.db
+			.prepare("INSERT INTO decisions (session_id, decision, reason, source, created_at_epoch, created_at) VALUES (NULL, 'use sqlite wal', 'crash safety', 'manual', 0, '')")
+			.run();
+		memory.db
+			.prepare("INSERT INTO decisions (session_id, decision, reason, source, created_at_epoch, created_at) VALUES (NULL, 'hash project slugs', 'avoid collisions', 'manual', 0, '')")
+			.run();
+		await memory.recordDecisionVec(embedder, 1, "use sqlite wal", "crash safety");
+		await memory.recordDecisionVec(embedder, 2, "hash project slugs", "avoid collisions");
+
+		// Mid-session `recordDecisionVec` dim change: tables wiped and recreated
+		// at the SAME dim the query will use, so no dim mismatch is detectable —
+		// only the pending count reveals the loss.
+		memory.db.exec("DROP TABLE IF EXISTS decisions_vec");
+		memory.db.exec("DROP TABLE IF EXISTS turn_summaries_vec");
+		memory.db.exec("CREATE VIRTUAL TABLE decisions_vec USING vec0(embedding float[64])");
+		memory.db.exec("CREATE VIRTUAL TABLE turn_summaries_vec USING vec0(embedding float[64])");
+		expect(memory.vecBackfillPending().decisions).toBe(2);
+
+		const hits = await memory.searchDecisionsVec(embedder, "sqlite crash safety", 5);
+		expect(hits).toContain(1);
+		expect(memory.vecBackfillPending().decisions).toBe(0); // heal ran and restored rows
+		// Row 2 restored AND searchable: query by its own recorded content.
+		const hits2 = await memory.searchDecisionsVec(embedder, "hash project slugs avoid collisions", 5);
+		expect(hits2).toContain(2);
+		memory.close();
+	});
+});
+
+/** Engine over an existing project/storage pair with the fake embedder injected. */
+function attachEngine(projectDir: string, storageRoot: string): ContextEngine {
+	const config: Config = { ...defaultConfig(), storagePath: storageRoot };
+	const engine = new ContextEngine({ projectDir, config });
+	const embedder = makeFakeEmbedder();
+	const backend = new LocalBackend(engine.storageBase);
+	engines.push(engine);
+	const internals = engine as unknown as {
+		backendInstance: LocalBackend | null;
+		embedderInstance: unknown;
+		injectedRuntime: unknown;
+	};
+	internals.backendInstance = backend;
+	internals.embedderInstance = embedder;
+	internals.injectedRuntime = { backend, embedder };
+	return engine;
+}
+
+describe("review C2: ancestor ignore rules for nested targets", () => {
+	it("rejects a directory target under an indexer.ignore ancestor (default: dist)", async () => {
+		const projectDir = makeTempDir("pce-targets-");
+		tempDirs.push(projectDir);
+		writeFiles(projectDir, { "dist/nested/x.ts": "export const x = 1;\n" });
+		const storageRoot = makeTempDir("pce-store-");
+		tempDirs.push(storageRoot);
+		const engine = attachEngine(projectDir, storageRoot);
+
+		const dir = await engine.reindex({ targetPath: "dist/nested" });
+		expect(dir.indexed).toBe(0);
+		expect(dir.skipped).toBe(1);
+		expect(engine.chunkCount()).toBe(0);
+
+		const file = await engine.reindex({ targetPath: "dist/nested/x.ts" });
+		expect(file.indexed).toBe(0);
+		expect(file.skipped).toBe(1);
+	});
+});
+
+describe("review C3+C4: project-relative walk + scoped purge under a directory target", () => {
+	it("omits newly-excluded descendants of the target and purges their stale chunks", async () => {
+		const { engine, projectDir } = await harness({
+			"src/private/secret-notes.ts": "export const privateNote = 1;\n",
+			"src/public/api.ts": "export const api = 2;\n",
+		});
+		expect((await engine.reindex({})).indexed).toBe(2);
+
+		fs.writeFileSync(path.join(projectDir, ".cceignore"), "src/private/\n", "utf-8");
+		// Touch both: without the fixes private would be re-yielded (rel was
+		// computed against the target, so `src/private/` never matched).
+		fs.appendFileSync(path.join(projectDir, "src/private/secret-notes.ts"), "// touched\n");
+		fs.appendFileSync(path.join(projectDir, "src/public/api.ts"), "// touched\n");
+
+		const result = await engine.reindex({ targetPath: "src" });
+		expect(result.indexed).toBe(1); // only public — private omitted by the walk
+		expect(result.deleted).toBe(1); // stale private chunks purged (targeted runs skip the full prune)
+		expect(engine.chunkCount()).toBeGreaterThan(0); // public kept
+	});
+});
+
+describe("review C5: project root as target", () => {
+	it("indexes via path '.' even when the checkout's own basename is in indexer.ignore", async () => {
+		const parent = makeTempDir("pce-parent-");
+		tempDirs.push(parent);
+		const projectDir = path.join(parent, "build");
+		fs.mkdirSync(projectDir, { recursive: true });
+		tempDirs.push(projectDir);
+		writeFiles(projectDir, { "src/a.ts": "export const a = 1;\n" });
+		const storageRoot = makeTempDir("pce-store-");
+		tempDirs.push(storageRoot);
+		const engine = attachEngine(projectDir, storageRoot);
+
+		const result = await engine.reindex({ targetPath: "." });
+		expect(result.indexed).toBe(1);
+		expect(engine.chunkCount()).toBeGreaterThan(0);
+	});
 });

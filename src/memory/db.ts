@@ -370,6 +370,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_vec USING vec0(embedding float
 		} catch {
 			return [];
 		}
+		await this.healVecTables(embedder, vec);
 		return this.vecSearch("decisions_vec", vec, k, maxDistance);
 	}
 
@@ -381,7 +382,30 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_vec USING vec0(embedding float
 		} catch {
 			return [];
 		}
+		await this.healVecTables(embedder, vec);
 		return this.vecSearch("turn_summaries_vec", vec, k, maxDistance);
+	}
+
+	/**
+	 * Self-heal at the point of recall (upstream #137), covering both failure
+	 * shapes a dim-mismatched or partially-empty vec table produces:
+	 *
+	 * 1. Tables built by another embedder: a dim-mismatched MATCH errors and
+	 *    silently returns nothing → recreate at the query's dim.
+	 * 2. Rows missing for any reason (e.g. a mid-session `recordDecisionVec`
+	 *    wiped the tables via `ensureVecDim` after the engine's one-shot
+	 *    backfill already ran) → restore them here, where the embedder is
+	 *    already in hand.
+	 *
+	 * Steady state costs two COUNT queries; the embedder is only touched when
+	 * something is actually wrong.
+	 */
+	private async healVecTables(embedder: Embedder, vec: readonly number[]): Promise<void> {
+		if (!this.hasVecTables()) return;
+		const declared = this.declaredVecDim();
+		if (declared !== null && declared !== vec.length) this.ensureVecDim(vec.length);
+		const pending = this.vecBackfillPending();
+		if (pending.decisions + pending.turnSummaries > 0) await this.backfillVecTables(embedder);
 	}
 
 	private vecSearch(table: string, vec: number[], k: number, maxDistance: number): number[] {

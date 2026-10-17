@@ -148,6 +148,31 @@ function cceignoreMatchesDir(relPosix: string, patterns: string[]): boolean {
 	return false;
 }
 
+/**
+ * Target-path policy gate, mirroring what the full walker enforces while
+ * descending: every path segment must pass `indexer.ignore`, files must pass
+ * the secret-filename check, and `.cceignore` is matched against the
+ * project-relative path (dir rules for directories, file + ancestor rules for
+ * files). The project root (`rel === ""`) is exempt — rules apply to entries
+ * below the root, not to the root itself (a checkout named `build` must still
+ * reindex via `path: "."`).
+ */
+function targetExcluded(
+	relPosix: string,
+	opts: { isDir: boolean; ignoreSet: Set<string>; redactSecrets: boolean; patterns: string[] },
+): boolean {
+	if (relPosix === "") return false;
+	const segments = relPosix.split("/");
+	for (const seg of segments) {
+		if (opts.ignoreSet.has(seg)) return true;
+	}
+	// The walker only classifies secret names on file entries; a secret-named
+	// directory's contents are still gated per file.
+	if (!opts.isDir && opts.redactSecrets && isSecretFile(segments[segments.length - 1]!)) return true;
+	if (opts.patterns.length === 0) return false;
+	return opts.isDir ? cceignoreMatchesDir(relPosix, opts.patterns) : cceignoreMatchesFile(relPosix, opts.patterns);
+}
+
 function safeRead(filePath: string): string | null {
 	try {
 		if (fs.statSync(filePath).size > MAX_FILE_BYTES) return null;
@@ -158,7 +183,9 @@ function safeRead(filePath: string): string | null {
 }
 
 function* iterProjectFiles(
-	root: string,
+	walkRoot: string,
+	/** Project root: `.cceignore` patterns are matched against project-relative paths even when walking from a target. */
+	relRoot: string,
 	ignoreSet: Set<string>,
 	opts: { redactSecrets: boolean; cceignorePatterns: string[] },
 ): Generator<string> {
@@ -184,7 +211,7 @@ function* iterProjectFiles(
 			}
 			if (seen.has(resolved)) continue;
 			seen.add(resolved);
-			const rel = path.relative(root, full).replace(/\\/g, "/");
+			const rel = path.relative(relRoot, full).replace(/\\/g, "/");
 			if (opts.cceignorePatterns.length > 0 && matchesAny(rel, entry.isDirectory(), opts.cceignorePatterns)) {
 				continue;
 			}
@@ -197,7 +224,7 @@ function* iterProjectFiles(
 			}
 		}
 	};
-	yield* walk(root);
+	yield* walk(walkRoot);
 }
 
 /** `{embeddings, cacheHits, cacheMisses}` for a batch, using the content cache. */
@@ -418,15 +445,16 @@ async function runIndexingLocked(
 			if (SKIP_EXTENSIONS.has(path.extname(target).toLowerCase())) {
 				purgeIndexed([rel]);
 				fileList = [];
-			} else if (ignoreSet.has(path.basename(target))) {
-				result.skippedFiles.push(rel);
-				purgeIndexed([rel]);
-				fileList = [];
-			} else if (config.indexerRedactSecrets && isSecretFile(target)) {
-				result.skippedFiles.push(rel);
-				purgeIndexed([rel]);
-				fileList = [];
-			} else if (cceignorePatterns.length > 0 && cceignoreMatchesFile(rel, cceignorePatterns)) {
+			} else if (
+				targetExcluded(rel, {
+					isDir: false,
+					ignoreSet,
+					redactSecrets: config.indexerRedactSecrets,
+					patterns: cceignorePatterns,
+				})
+			) {
+				// Ancestor segments included: the full walker would have pruned
+				// the path before reaching this file (upstream #165b parity).
 				result.skippedFiles.push(rel);
 				purgeIndexed([rel]);
 				fileList = [];
@@ -435,25 +463,35 @@ async function runIndexingLocked(
 			}
 		} else if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
 			// Upstream #165b: the walk starts inside the target, so the target
-			// itself (and its ancestors) must be tested against the same
-			// exclusions here — or `reindex(path)` can index an excluded subtree.
+			// path itself must first pass the same policy the full walker
+			// enforces while descending — every segment vs `indexer.ignore`
+			// (e.g. `dist/nested` is rejected because `dist` is), plus
+			// `.cceignore` dir rules for the target and its ancestors.
 			const rel = path.relative(projectDir, target).replace(/\\/g, "/");
-			const excluded =
-				ignoreSet.has(path.basename(target)) ||
-				(config.indexerRedactSecrets && isSecretFile(target)) ||
-				(cceignorePatterns.length > 0 && cceignoreMatchesDir(rel, cceignorePatterns));
+			const excluded = targetExcluded(rel, {
+				isDir: true,
+				ignoreSet,
+				redactSecrets: config.indexerRedactSecrets,
+				patterns: cceignorePatterns,
+			});
 			if (excluded) {
 				result.skippedFiles.push(rel);
-				purgeIndexed(Object.keys(manifest.fileEntries).filter((p) => p === rel || p.startsWith(`${rel}/`)));
 				fileList = [];
 			} else {
 				fileList = [
-					...iterProjectFiles(target, ignoreSet, {
+					...iterProjectFiles(target, projectDir, ignoreSet, {
 						redactSecrets: config.indexerRedactSecrets,
 						cceignorePatterns,
 					}),
 				];
 			}
+			// Targeted runs skip the full-run prune below, so purge manifest
+			// entries under this subtree the walk no longer yields: newly
+			// excluded files, secret files, and deleted files (upstream
+			// #127/#165b). Scoped to the target so siblings are untouched.
+			const yielded = new Set(fileList.map((f) => path.relative(projectDir, f).replace(/\\/g, "/")));
+			const underScope = (p: string): boolean => (rel === "" ? true : p === rel || p.startsWith(`${rel}/`));
+			purgeIndexed(Object.keys(manifest.fileEntries).filter((p) => underScope(p) && !yielded.has(p)));
 		} else {
 			// Watcher deletion path: prune instead of erroring out.
 			const rel = path.relative(projectDir, target).replace(/\\/g, "/");
@@ -469,7 +507,7 @@ async function runIndexingLocked(
 		}
 	} else {
 		fileList = [
-			...iterProjectFiles(projectDir, ignoreSet, {
+			...iterProjectFiles(projectDir, projectDir, ignoreSet, {
 				redactSecrets: config.indexerRedactSecrets,
 				cceignorePatterns,
 			}),

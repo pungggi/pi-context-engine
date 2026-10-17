@@ -40,13 +40,37 @@ interface TransformersModule {
 	env: Record<string, unknown>;
 }
 
+export type TransformersLoader = () => Promise<TransformersModule>;
+
+const defaultLoadTransformers: TransformersLoader = async () =>
+	(await import("@huggingface/transformers")) as unknown as TransformersModule;
+
+/**
+ * The package ships `@huggingface/transformers` as an optional dependency, so a
+ * plain npm install has it, but installs done with `--omit=optional` do not.
+ * Detect that case so we can tell the user exactly how to fix it instead of
+ * crashing with a bare "Cannot find module".
+ */
+function isModuleNotFoundError(err: unknown): boolean {
+	const code = (err as NodeJS.ErrnoException | undefined)?.code;
+	if (code === "ERR_MODULE_NOT_FOUND" || code === "MODULE_NOT_FOUND") return true;
+	const message = (err as Error | undefined)?.message ?? "";
+	return message.includes("Cannot find module") || message.includes("Cannot find package");
+}
+
+const LOCAL_BACKEND_INSTALL_HINT =
+	"Local embedding backend unavailable: @huggingface/transformers is not installed. " +
+	"It ships as an optional dependency, so a plain install includes it. " +
+	"Fix: reinstall pi-context-engine (pi update npm:pi-context-engine), " +
+	"or force the Ollama backend with PCE_EMBED_BACKEND=ollama.";
+
 export class LocalBackend implements EmbeddingBackend {
 	readonly name = "local";
 	readonly modelName: string;
 	dimension = 0;
 	private pipelinePromise: Promise<(inputs: string | string[]) => Promise<number[][]>> | null = null;
 
-	constructor(modelName: string = DEFAULT_LOCAL_MODEL) {
+	constructor(modelName: string = DEFAULT_LOCAL_MODEL, private readonly loadTransformers: TransformersLoader = defaultLoadTransformers) {
 		this.modelName = modelName;
 	}
 
@@ -55,7 +79,16 @@ export class LocalBackend implements EmbeddingBackend {
 			this.pipelinePromise = (async () => {
 				const cacheDir = resolveModelCacheDir();
 				fs.mkdirSync(cacheDir, { recursive: true });
-				const transformers = (await import("@huggingface/transformers")) as unknown as TransformersModule;
+				let transformers: TransformersModule;
+				try {
+					transformers = await this.loadTransformers();
+				} catch (err) {
+					// Drop the memoized failure so a retry (after installing the
+					// package) gets a fresh chance instead of replaying the error.
+					this.pipelinePromise = null;
+					if (isModuleNotFoundError(err)) throw new Error(LOCAL_BACKEND_INSTALL_HINT);
+					throw err;
+				}
 				transformers.env.cacheDir = cacheDir;
 				const extractor = await transformers.pipeline("feature-extraction", this.modelName, {
 					pooling: "mean",

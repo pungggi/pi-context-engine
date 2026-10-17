@@ -36,7 +36,7 @@ jobs:
       # end-to-end against a fixture project. Catches ESM/CJS interop and
       # runtime-only import problems that vitest can mask.
       - name: Cache embedding model
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.pi-context-engine/models
           key: pce-embedding-model-v1

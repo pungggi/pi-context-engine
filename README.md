@@ -130,6 +130,16 @@ Environment overrides:
 - **`PCE_EMBED_BACKEND`**: force `local` or `ollama` instead of auto-detect.
 - **`PCE_RECALL_DISPLAY_CAP`**: how many recall hits to show (default 7).
 
+**Embedding backends**: two options, picked automatically per project.
+
+- **Ollama** (default when reachable): no extra model files on disk beyond the
+  Ollama model itself.
+- **Local ONNX** (transformers.js): works with no server. Needs the
+  `@huggingface/transformers` optional dependency, which plain `npm` and `pi`
+  installs include. If it was stripped (e.g. `--omit=optional`), indexing fails
+  with a clear message telling you to reinstall or switch to Ollama, instead of
+  a bare module error.
+
 ## Security
 
 Indexing is local, but the index is still a copy of your code. Two guards ship on

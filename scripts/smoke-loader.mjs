@@ -17,16 +17,41 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 
 // ── Load the extension exactly the way pi does ─────────────────────────────
-const jitiPath = path.join(
-	process.env.APPDATA ?? "",
-	"npm",
-	"node_modules",
-	"@earendil-works",
-	"pi-coding-agent",
-	"node_modules",
-	"jiti",
-);
-const { createJiti } = require(jitiPath);
+// `exports` restrictions block `require.resolve("jiti")` through pi's entry
+// point, so locate jiti by walking up from candidate paths instead: this works
+// whether jiti is hoisted into the project or nested under pi's own
+// node_modules, and on any OS.
+function findJiti(startDir) {
+	let dir = startDir;
+	for (;;) {
+		const candidate = path.join(dir, "node_modules", "jiti");
+		if (fs.existsSync(path.join(candidate, "package.json"))) return candidate;
+		const parent = path.dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+}
+
+function resolveJitiModule() {
+	const candidates = [root];
+	try {
+		candidates.push(path.dirname(require.resolve("@earendil-works/pi-coding-agent")));
+	} catch {
+		// global npm install — fall through to the layout fallback below
+	}
+	if (process.env.APPDATA) {
+		candidates.push(path.join(process.env.APPDATA, "npm", "node_modules", "@earendil-works", "pi-coding-agent"));
+	}
+	for (const start of candidates) {
+		const found = findJiti(start);
+		// Resolve the package by name *from inside* the directory containing it:
+		// `require(<dir>)` ignores the exports map, which jiti relies on.
+		if (found) return createRequire(path.join(found, "noop.js"))("jiti");
+	}
+	throw new Error("jiti not found — install pi or the pi-context-engine dev dependencies first");
+}
+
+const { createJiti } = resolveJitiModule();
 const jiti = createJiti(path.join(root, "src", "extension.ts"), { interopDefault: true });
 
 const mod = await jiti.import(path.join(root, "src", "extension.ts"));

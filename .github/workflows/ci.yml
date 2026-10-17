@@ -32,6 +32,16 @@ jobs:
       # for users.
       - run: npm run smoke:env
 
+      # Load the extension through pi's jiti loader and execute a tool
+      # end-to-end against a fixture project. Catches ESM/CJS interop and
+      # runtime-only import problems that vitest can mask.
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.pi-context-engine/models
+          key: pce-embedding-model-v1
+      - run: npm run smoke:loader
+
       # Guard the published tarball. This package ships raw .ts source (pi loads
       # TypeScript extensions at runtime via jiti — no build step). The `files`
       # allowlist is authoritative; verify nothing stray leaks in.

@@ -61,7 +61,7 @@ interface ContentPattern {
 
 const CONTENT_PATTERNS: ContentPattern[] = [
 	{ regex: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, label: "AWS_ACCESS_KEY" },
-	{ regex: /(?i:aws_secret_access_key\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})['"]?)/, label: "AWS_SECRET_KEY" },
+	{ regex: /(?:aws_secret_access_key\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})['"]?)/i, label: "AWS_SECRET_KEY" },
 	{ regex: /\bghp_[A-Za-z0-9]{36}\b/, label: "GITHUB_PAT" },
 	{ regex: /\bgithub_pat_[A-Za-z0-9_]{82}\b/, label: "GITHUB_FINE_GRAINED_PAT" },
 	// Prefix groups must be NON-capturing: `_sub` treats a capture group as
@@ -75,12 +75,12 @@ const CONTENT_PATTERNS: ContentPattern[] = [
 	{ regex: /\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b/, label: "JWT" },
 	{ regex: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----/, label: "PRIVATE_KEY_BLOCK" },
 	{
-		regex: /(?i:\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key|auth[_-]?token|client[_-]?secret)\b['"\]\s]*[:=]\s*['"]([^'"\s]{16,})['"])/,
+		regex: /\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key|auth[_-]?token|client[_-]?secret)\b['"\]\s]*[:=]\s*['"]([^'"\s]{16,})['"]/i,
 		label: "GENERIC_CREDENTIAL",
 		filterPlaceholders: true,
 	},
 	{
-		regex: /(?im:^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_.\-]*(?:password|passwd|secret|token|credential|api[_-]?key|key)s?[ \t]*[:=][ \t]*([^\s'\"#`]{16,}))/,
+		regex: /^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_.\-]*(?:password|passwd|secret|token|credential|api[_-]?key|key)s?[ \t]*[:=][ \t]*([^\s'\"#`]{16,})/im,
 		label: "GENERIC_CREDENTIAL",
 		filterPlaceholders: true,
 	},

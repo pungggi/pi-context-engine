@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+coverage/
+.DS_Store
+
+# pi local session state (scratchpad, metrics) — never published
+.pi/

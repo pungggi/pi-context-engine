@@ -34,7 +34,13 @@ export class Manifest {
 			const loaded = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as ManifestData;
 			const version = loaded && typeof loaded === "object" ? loaded.__schema_version : undefined;
 			const files = loaded && typeof loaded === "object" ? loaded.files : undefined;
-			if (typeof version === "number" && version > 0 && files !== null && typeof files === "object") {
+			if (
+				typeof version === "number" &&
+				version > 0 &&
+				files !== null &&
+				typeof files === "object" &&
+				!Array.isArray(files)
+			) {
 				recognized = true;
 				this.schemaVersionValue = version;
 				this.entries = files ?? {};

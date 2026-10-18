@@ -180,7 +180,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			reason: Type.String({ description: "Why — the constraint or tradeoff" }),
 			related_to: Type.Optional(
 				Type.Array(Type.Integer(), {
-					description: "Ids of earlier decisions this one annotates (memory evolution; original texts stay immutable)",
+					description: "Ids of earlier decisions this one annotates — ids appear in record_decision replies ([#N]) and session_recall lines ([decision #N …])",
 				}),
 			),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "Short labels for later filtering" })),

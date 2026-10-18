@@ -46,13 +46,20 @@ const STOPWORDS = new Set([
 export function escapeFts5(query: string): string {
 	const phrases: string[] = [];
 	const rest = query.replace(/"([^"]+)"/g, (_match, inner: string) => {
-		// Tokenize the phrase the way FTS5's tokenizer will have indexed it.
-		const words = inner.split(/[^a-zA-Z0-9]+/).filter((w) => /[a-zA-Z0-9]/.test(w));
+		// Tokenize the phrase the way FTS5's tokenizer will have indexed it
+		// (unicode61: letters/digits are tokenchars, underscores and punctuation
+		// split — `encode_token` indexes as `encode token`). Unicode-aware so
+		// diacritics survive ("café" stays "café"; the tokenizer folds accents
+		// on BOTH sides, so ASCII-splitting them away made quoted phrases miss
+		// content the unquoted query could find).
+		const words = inner
+			.split(/[^\p{L}\p{N}]+/u)
+			.filter((w) => /[\p{L}\p{N}]/u.test(w));
 		if (words.length > 0) phrases.push(`"${words.join(" ")}"`);
 		return " ";
 	});
 
-	const tokens = rest.split(/\s+/).filter((t) => /[a-zA-Z0-9]/.test(t));
+	const tokens = rest.split(/\s+/).filter((t) => /[\p{L}\p{N}]/u.test(t));
 	let kept = tokens.filter((t) => !STOPWORDS.has(t.toLowerCase()));
 	if (kept.length === 0) kept = tokens;
 	const tokenExpr = kept.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");

@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { Config } from "../config.js";
 import { projectStorageDir, sha256Hex } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
-import { applyContextHeaderToChunk } from "./context-header.js";
+import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
 import { EmbeddingCache } from "./embedding-cache.js";
 import { Manifest, CURRENT_SCHEMA_VERSION } from "./manifest.js";
@@ -419,6 +419,12 @@ async function runIndexingLocked(
 		cacheMisses: 0,
 	};
 
+	// PR #7 review fix: migrations below call manifest.clearEntries(), which
+	// also erases the file list pruneFilesNotIn() needs to detect files that
+	// vanished BEFORE this run. Snapshot the paths first so the prune step
+	// can still delete their indexed chunks instead of orphaning them.
+	const preMigrationPaths = Object.keys(manifest.fileEntries);
+
 	if (backend.metricRebuilt) {
 		manifest.clearEntries();
 		log?.("  [migration] vector index rebuilt (cosine metric) — reindexing all files");
@@ -552,6 +558,8 @@ async function runIndexingLocked(
 	// call symbols defined in late ones — order-independent).
 	const runChunks: { id: string; filePath: string; identifiers: string[] }[] = [];
 	const symbolOwners = new Map<string, { id: string; filePath: string }[]>();
+	// PR #7 review: files whose chunks were (re)built this run, across ALL batches.
+	const changedRelPaths = new Set<string>();
 
 	// ── Lazy embedder + cache ─────────────────────────────────────────────
 	const holders: { embedder: Embedder | null; cache: EmbeddingCache | null } = {
@@ -634,6 +642,7 @@ async function runIndexingLocked(
 		const batchIndexed: string[] = [];
 
 		for (const item of toChunk) {
+			changedRelPaths.add(item.relPath);
 			let chunks: Chunk[] = [];
 			let importedModules: string[] = [];
 			let importSpecs: string[] = [];
@@ -785,8 +794,41 @@ async function runIndexingLocked(
 	// by file/defines edges. Capped per chunk — a retrieval prior, not a
 	// faithful call graph.
 	{
+		// PR #7 review fix (incremental call graph): derive over ALL indexed
+		// files, not just this run's changes. deleteByFiles(changed) removes
+		// call edges touching changed chunk nodes in BOTH directions, so a
+		// run-only derivation silently dropped (a) changed files' calls into
+		// unchanged files and (b) unchanged callers' edges into changed files.
+		// Re-deriving from every indexed file recreates exactly the deleted
+		// edges; unchanged→unchanged duplicates collapse on the edge PK
+		// (INSERT OR REPLACE).
 		const callsEdges: GraphEdge[] = [];
-		for (const src of runChunks) {
+		const derivationSources = [...runChunks];
+		const changedThisRun = changedRelPaths;
+		for (const rel of Object.keys(manifest.fileEntries)) {
+			if (changedThisRun.has(rel)) continue;
+			for (const stored of backend.chunksByFile(rel, 500)) {
+				if (stored.chunkType === "module") continue;
+				derivationSources.push({
+					id: stored.id,
+					filePath: rel,
+					// Stored content carries the R1 context header; strip it so
+					// header tokens cannot pollute the identifier set.
+					identifiers: extractIdentifiers(stripContextHeader(stored.content)),
+				});
+			}
+		}
+		// Symbol owners over all files: run chunks first (fresh), then graph
+		// nodes of files that did not change (they are still valid).
+		for (const node of backend.listSymbolNodes()) {
+			if (changedThisRun.has(node.filePath)) continue;
+			const short = node.name.includes(".") ? node.name.slice(node.name.lastIndexOf(".") + 1) : node.name;
+			if (short.length < 3 || CALL_GRAPH_STOPLIST.has(short)) continue;
+			let owners = symbolOwners.get(short);
+			if (!owners) symbolOwners.set(short, (owners = []));
+			owners.push({ id: node.id, filePath: node.filePath });
+		}
+		for (const src of derivationSources) {
 			let out = 0;
 			for (const ident of src.identifiers) {
 				if (out >= CALLS_EDGES_PER_CHUNK) break;
@@ -826,7 +868,7 @@ async function runIndexingLocked(
 
 	// ── Prune files that vanished from disk ───────────────────────────────
 	if (!targetPath) {
-		const previousPaths = new Set(Object.keys(manifest.fileEntries));
+		const previousPaths = new Set([...Object.keys(manifest.fileEntries), ...preMigrationPaths]);
 		const removed = [...previousPaths].filter((rel) => !currentRelPaths.has(rel));
 		if (removed.length > 0) {
 			backend.deleteByFiles(removed);

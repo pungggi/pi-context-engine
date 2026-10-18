@@ -90,6 +90,20 @@ export class GraphStore {
 	}
 
 	/**
+	 * PR #7 review fix (incremental call graph): every function/class node
+	 * across ALL indexed files, so calls-edge derivation on an incremental
+	 * run still sees symbols owned by files that did not change this run.
+	 */
+	listSymbolNodes(): GraphNode[] {
+		const rows = this.db
+			.prepare(
+				"SELECT id, node_type, name, file_path, properties FROM nodes WHERE node_type IN ('function','class')",
+			)
+			.all() as Record<string, unknown>[];
+		return rows.map(rowToNode);
+	}
+
+	/**
 	 * R5: structured symbol lookup for the multi-path retriever. Matches a
 	 * chunk-level node whose name EQUALS a queried identifier, ENDS with
 	 * `.identifier` (so `charge` finds `PaymentGateway.charge`), or STARTS with

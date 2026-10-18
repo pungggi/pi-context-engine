@@ -183,7 +183,7 @@ describe("ContextEngine memory", () => {
 		const recall = await engine.sessionRecall("jwt auth");
 		expect(recall).toContain("JWT");
 		// Decisions render with provenance and a drill-down affordance.
-		expect(recall).toMatch(/\[decision src=manual\|sid:/);
+		expect(recall).toMatch(/\[decision #\d+ src=manual\|sid:/);
 	});
 
 	it("returns guidance when nothing matches", async () => {

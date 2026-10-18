@@ -384,8 +384,9 @@ export class ContextEngine {
 			}
 			if (linked.length > 0) {
 				const heads = linked.map((id) => memory.decisionHeadline(id)).filter(Boolean).join("; ");
-				if (heads) return decision + " (linked: " + heads + ")";
+				if (heads) return decision + " (linked: " + heads + ") [#" + newId + "]";
 			}
+			return decision + " [#" + newId + "]";
 		}
 		return decision;
 	}
@@ -1001,7 +1002,7 @@ export class ContextEngine {
 			}
 			if (r.session_id) tail += ` · → session_timeline("${r.session_id}")`;
 			out.push(
-				`[decision src=${r.source}|sid:${r.session_id ?? "-"}] ${expand(r.decision)} — ${expand(r.reason)}${tail}`,
+				`[decision #${r.id} src=${r.source}|sid:${r.session_id ?? "-"}] ${expand(r.decision)} — ${expand(r.reason)}${tail}`,
 			);
 		}
 		return out;

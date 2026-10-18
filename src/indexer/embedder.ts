@@ -33,6 +33,11 @@ function resolveModelCacheDir(): string {
 	return path.join(os.homedir(), ".pi-context-engine", "models");
 }
 
+/** R10: shared with the reranker so every transformers.js load uses one models dir. */
+export function transformersCacheDir(): string {
+	return resolveModelCacheDir();
+}
+
 interface TransformersModule {
 	pipeline: (
 		task: string,

@@ -80,6 +80,11 @@ export class LocalBackend {
 		return this.graphStore.getNodesByFile(filePath);
 	}
 
+	/** PR #7 review: all function/class nodes, for incremental call-graph derivation. */
+	listSymbolNodes(): GraphNode[] {
+		return this.graphStore.listSymbolNodes();
+	}
+
 	/** R5: chunks of one file in source order. */
 	chunksByFile(filePath: string, limit = 10): Chunk[] {
 		return this.vectorStore.byFile(filePath, limit);

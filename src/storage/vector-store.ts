@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { openDatabase, type SqliteHandle } from "../sqlite.js";
 import { batchedParams } from "../utils.js";
+import { parseContextHeaderUnit } from "../indexer/context-header.js";
 import type { Chunk, ChunkType } from "../types.js";
 
 const MAX_CONTENT_CHARS = 5_000;
@@ -144,6 +145,12 @@ export class VectorStore {
 		};
 		if (row.modified_ts != null) chunk.metadata["modified_ts"] = row.modified_ts;
 		if (distance !== undefined) chunk.metadata["_distance"] = distance;
+		// Restore `unit` from the R1 context header line so served chunks carry
+		// their symbol (refine hints filter siblings by it; the header is the
+		// single source of truth for indexed content). No header → no unit,
+		// same as before.
+		const unit = parseContextHeaderUnit(chunk.content);
+		if (unit) chunk.metadata["unit"] = unit;
 		return chunk;
 	}
 

@@ -336,10 +336,32 @@ function firstChildOfType(node: TsNode, types: string[]): TsNode | null {
  * `Class.method` / `functionName` for a chunk, from the first name-bearing
  * child plus the enclosing chain. Used by the R1 context header and by the
  * symbol path in retrieval (exact identifier hits rank by name, not vibes).
+ *
+ * The name child is picked by TYPE priority, not document order: for a Java
+ * method with a reference-type return (`Result compute()`), the return type
+ * is a `type_identifier` that appears BEFORE the method name — picking the
+ * first name-bearing child mislabeled the unit as `Result` and broke exact
+ * symbol lookup. Field/property identifiers win, plain identifiers come
+ * next, type identifiers only as a last resort.
  */
+const NAME_TYPE_PRIORITY: Record<string, number> = {
+	field_identifier: 0,
+	property_identifier: 0,
+	identifier: 1,
+	name: 1,
+	type_identifier: 2,
+};
+
 function nodeUnit(node: TsNode, ancestors: string[]): string | null {
-	const nameNode = node.children.find((c) => NAME_TYPES.has(c.type));
-	const name = nameNode?.text?.trim();
+	let best: { name: string; priority: number } | null = null;
+	for (const child of node.children) {
+		const priority = NAME_TYPE_PRIORITY[child.type];
+		if (priority === undefined) continue;
+		const text = child.text?.trim();
+		if (!text) continue;
+		if (!best || priority < best.priority) best = { name: text, priority };
+	}
+	const name = best?.name;
 	if (name && ancestors.length > 0) return [...ancestors, name].join(".");
 	if (name) return name;
 	if (ancestors.length > 0) return ancestors.join(".");

@@ -72,3 +72,15 @@ export function applyContextHeaderToChunk(chunk: Chunk, imports: string[]): void
 		imports,
 	});
 }
+
+/**
+ * Drop the context header line from stored chunk content (inverse of
+ * `applyContextHeader`). Used when re-deriving call-graph identifiers from
+ * backend-stored chunks, so header tokens (`file`, `unit`, `imports`, path
+ * segments) cannot pollute the identifier set.
+ */
+export function stripContextHeader(content: string): string {
+	if (!content.startsWith(HEADER_PREFIX)) return content;
+	const nl = content.indexOf("\n");
+	return nl === -1 ? "" : content.slice(nl + 1);
+}

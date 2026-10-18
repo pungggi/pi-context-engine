@@ -259,6 +259,12 @@ export class HybridRetriever {
 						topN[i]!.score = blended;
 						topN[i]!.chunk.confidenceScore = blended;
 					}
+					// PR #7 review: a reranked candidate can blend down to ~0.3 while
+					// unreranked rank-31+ entries keep their raw ~0.7 scores — a full
+					// sort would promote unjudged tail hits OVER judged ones. Cap the
+					// tail strictly below the blended floor so reranking can only
+					// reorder within the judged set.
+					capTailBelowRerankedFloor(scored, RERANK_TOPN);
 					scored.sort((a, b) => b.score - a.score);
 				}
 			}
@@ -459,6 +465,22 @@ function applyPathPenalty(filePath: string, score: number): number {
 		if (fp.includes(marker)) return score * 0.8;
 	}
 	return score;
+}
+
+/**
+ * PR #7 review fix: after blending rerank scores into the top-N, cap every
+ * unreranked tail entry strictly below the blended floor (monotonically
+ * decreasing, preserving the tail's own order). Without this, a full sort
+ * promotes unjudged rank-31+ hits over reranked candidates whose blend
+ * dropped low. Exported for unit testing.
+ */
+export function capTailBelowRerankedFloor(scored: { score: number }[], topN: number): void {
+	if (scored.length <= topN) return;
+	let floor = Math.min(...scored.slice(0, topN).map((s) => s.score));
+	for (let i = topN; i < scored.length; i++) {
+		floor = Math.min(floor - 1e-6, scored[i]!.score);
+		scored[i]!.score = floor;
+	}
 }
 
 function dedupeOverlaps(scored: { chunk: Chunk; score: number }[]): { chunk: Chunk; score: number }[] {

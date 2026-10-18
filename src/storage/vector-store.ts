@@ -327,6 +327,21 @@ export class VectorStore {
 		}
 	}
 
+	/** R5: chunks of one file in source order (file-hint retrieval path). */
+	byFile(filePath: string, limit = 10): Chunk[] {
+		try {
+			const rows = this.db
+				.prepare(
+					`SELECT id, content, chunk_type, file_path, start_line, end_line, language, modified_ts
+					 FROM chunks WHERE file_path = ? ORDER BY start_line ASC LIMIT ?`,
+				)
+				.all(filePath, limit) as Record<string, unknown>[];
+			return rows.map((r) => this.rowToChunk(r));
+		} catch {
+			return [];
+		}
+	}
+
 	close(): void {
 		this.db.close();
 	}

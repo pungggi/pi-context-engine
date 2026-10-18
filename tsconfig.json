@@ -3,8 +3,12 @@
 		"target": "ES2023",
 		"module": "ESNext",
 		"moduleResolution": "bundler",
-		"lib": ["ES2023"],
-		"types": ["node"],
+		"lib": [
+			"ES2023"
+		],
+		"types": [
+			"node"
+		],
 		"strict": true,
 		"noUncheckedIndexedAccess": true,
 		"noImplicitOverride": true,
@@ -15,7 +19,13 @@
 		"resolveJsonModule": true,
 		"isolatedModules": true,
 		"verbatimModuleSyntax": true,
-		"noEmit": true
+		"noEmit": true,
+		"allowImportingTsExtensions": true
 	},
-	"include": ["src", "tests", "vitest.config.ts"]
+	"include": [
+		"src",
+		"tests",
+		"scripts",
+		"vitest.config.ts"
+	]
 }

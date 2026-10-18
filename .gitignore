@@ -6,3 +6,6 @@ coverage/
 
 # pi local session state (scratchpad, metrics) — never published
 .pi/
+
+# stray transformers.js model cache (default cacheDir is relative)
+Xenova/

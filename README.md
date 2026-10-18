@@ -97,6 +97,30 @@ unchanged repo took 237 ms.
 
 No Python. No build tools. No API key.
 
+### Embedding model choice (measured, not claimed)
+
+Evaluated on this package's own 76-query suite (`npm run eval -- --local`, same
+code state, CPU only):
+
+| local model | R@5 | R@10 | nDCG@10 | distraction@10 | served tokens | p50/p95 |
+|---|---|---|---|---|---|---|
+| `Xenova/all-MiniLM-L6-v2` (default, ~25 MB) | 0.752 | 0.827 | 0.744 | 0.713 | 702 | 28/33 ms |
+| `michaelfeil/jina-embeddings-v2-base-code` (recommended for code) | **0.798** | **0.899** | **0.813** | **0.640** | 654 | 55/61 ms |
+
+Why the split default: the code-trained model wins every quality metric on
+this codebase (natural-language queries most of all: R@10 0.433 → 0.700) at
+~2× CPU latency and a larger first download. Keep MiniLM as the default for
+fast general use; point code-heavy projects at the jina model:
+
+```yaml
+embedding:
+  model: michaelfeil/jina-embeddings-v2-base-code
+```
+
+Long inputs are pre-truncated to ~2000 chars per embedding so long-context
+models cannot OOM the CPU runtime, and changing the model (dimension change)
+forces a full reindex automatically.
+
 ## Configuration
 
 Zero config by default. Override in `~/.pi-context-engine/config.yaml` or a
@@ -107,16 +131,28 @@ retrieval:
   top_k: 20
   confidence_threshold: 0.2
   marginal_ratio: 0.75   # stop adding chunks below this fraction of the top score
+  expand_context: true   # serve a hit's module parent + adjacent chunk (small-to-big)
+  confidence_high: 0.55  # query-quality composite at/above which a search reports `high`
+  confidence_low: 0.45   # below this the result gets a `[query confidence: low ...]` line with hints
+  auto_elaborate: false  # opt-in: fuse a deterministic query variant as an extra candidate source
+  refine_hints: true     # append a `[refine: ...]` line with next-query candidates
+  rerank: off            # off | local — opt-in cross-encoder reranking of the top 30 fused hits
+  rerank_model: Xenova/ms-marco-MiniLM-L-6-v2
+  rerank_topn: 30
 guidance:
   enabled: true          # inject context_search guidance into the system prompt
 compression:
   level: standard        # minimal | standard | full
   ollama_url: http://localhost:11434
+  query_aware: true      # keep query-relevant lines when truncating
 embedding:
   model: local           # or a specific transformers.js model id
   ollama_model: nomic-embed-text
 indexer:
   redact_secrets: true
+  context_headers: true  # prepend `// file: ... | unit: ... | imports: ...` to chunk text
+  chunking: legacy        # legacy (default) | ast-density — cAST-style budgeted split-merge (experimental)
+  chunk_budget_chars: 1200 # non-whitespace budget per ast-density chunk
 memory:
   redact_pii: true
 pricing:
@@ -129,6 +165,19 @@ Environment overrides:
 - **`PCE_OLLAMA_URL`**: point at a remote Ollama; wins over config.
 - **`PCE_EMBED_BACKEND`**: force `local` or `ollama` instead of auto-detect.
 - **`PCE_RECALL_DISPLAY_CAP`**: how many recall hits to show (default 7).
+
+**Reranking caveat**: `retrieval.rerank: local` is opt-in because it downloads
+an ~80 MB cross-encoder model on first use (into the same models dir as the
+embedder) and adds CPU latency per query. It reorders only the top 30 fused
+candidates; if the model cannot load, retrieval falls back to the fused order
+instead of failing.
+
+**Chunking caveat**: `indexer.chunking: ast-density` (cAST-style budgeted
+split-merge) is experimental and measured WORSE than the legacy walk on this
+package's eval (R@10 0.818 vs 0.936 with the deterministic embedder): tiling
+trivia into chunks dilutes fixed-size result sets. It stays behind a flag for
+A/B on other workloads; chunks concatenate byte-for-byte back to the source,
+so it is safe to try on a branch.
 
 **Embedding backends**: two options, picked automatically per project.
 

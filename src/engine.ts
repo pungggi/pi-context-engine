@@ -11,6 +11,9 @@ import { atomicWriteText, epochSeconds, humaniseRelativeTime, projectStorageDir,
 import { LocalBackend } from "./storage/local-backend.js";
 import { Embedder, selectBackend } from "./indexer/embedder.js";
 import { HybridRetriever } from "./retrieval/retriever.js";
+import { LocalReranker } from "./retrieval/reranker.js";
+import { assessQuery, type QueryAssessment } from "./retrieval/confidence.js";
+import { QueryParser } from "./retrieval/query-parser.js";
 import { Compressor } from "./compression/compressor.js";
 import { MemoryDb, memoryDbPath, scrubPii, setPiiRedaction, type Bucket } from "./memory/db.js";
 import { SessionCapture } from "./memory/session-capture.js";
@@ -126,6 +129,22 @@ export interface EngineOptions {
 	runtime?: { backend: LocalBackend; embedder: Embedder };
 }
 
+/** R13: cheap keyword extraction for decision tags (no LLM): distinctive
+ * lowercased tokens, stopwords stripped, longest first for stability. */
+const KEYWORD_STOPWORDS = new Set([
+	"the", "and", "for", "with", "that", "this", "from", "into", "use", "using", "was", "are",
+	"when", "then", "than", "will", "shall", "should", "would", "could", "have", "has", "been",
+	"because", "since", "given", "instead", "only", "also", "just", "like", "over", "under",
+]);
+function keywordsOf(text: string, max = 5): string[] {
+	const tokens = text
+		.toLowerCase()
+		.replace(/[^a-z0-9_.-]+/g, " ")
+		.split(" ")
+		.filter((w) => w.length >= 4 && !KEYWORD_STOPWORDS.has(w));
+	return [...new Set(tokens)].sort((a, b) => b.length - a.length).slice(0, max);
+}
+
 export class ContextEngine {
 	readonly projectDir: string;
 	readonly projectName: string;
@@ -187,7 +206,14 @@ export class ContextEngine {
 
 	async getRetriever(): Promise<HybridRetriever> {
 		if (!this.retrieverInstance) {
-			this.retrieverInstance = new HybridRetriever(this.backend, await this.getEmbedder());
+			this.retrieverInstance = new HybridRetriever(this.backend, await this.getEmbedder(), {
+				expandContext: this.config.retrievalExpandContext,
+				autoElaborate: this.config.retrievalAutoElaborate,
+				reranker:
+					this.config.retrievalRerank === "local"
+						? new LocalReranker(this.config.retrievalRerankModel)
+						: null,
+			});
 		}
 		return this.retrieverInstance;
 	}
@@ -297,6 +323,10 @@ export class ContextEngine {
 			callbacks: { phase: options.onProgress },
 			runtime: this.injectedRuntime,
 		});
+		// R7: graph edges changed → refresh the PageRank prior and force the
+		// retriever to pick it up on the next query.
+		this.backend.recomputePriors();
+		this.retrieverInstance = null;
 		return {
 			indexed: result.indexedFiles.length,
 			chunks: result.totalChunks,
@@ -308,9 +338,16 @@ export class ContextEngine {
 
 	// ── Memory writes ─────────────────────────────────────────────────────
 
-	async recordDecision(decisionInput: string, reasonInput: string): Promise<string> {
+	async recordDecision(
+		decisionInput: string,
+		reasonInput: string,
+		opts: { relatedTo?: number[]; tags?: string[]; files?: string[] } = {},
+	): Promise<string> {
 		const decision = scrubPii(decisionInput.trim());
 		const reason = scrubPii(reasonInput.trim());
+		// R13: structured attributes - scrubbed before any write, like the text.
+		const tags = (opts.tags ?? []).map((x) => scrubPii(x.trim())).filter(Boolean).slice(0, 8);
+		const files = (opts.files ?? []).map((x) => scrubPii(x.trim())).filter(Boolean).slice(0, 8);
 		this.sessionCapture.recordDecision(this.sessionId, decision, reason);
 		this.sessionCapture.persist(this.sessionId);
 		this.searchesSinceDecision = 0;
@@ -324,11 +361,31 @@ export class ContextEngine {
 			this.recordBucket("grammar", stored.rawTokens + storedReason.rawTokens, stored.compressedTokens + storedReason.compressedTokens);
 			const result = memory.db
 				.prepare(
-					"INSERT INTO decisions (session_id, decision, reason, source, created_at_epoch, created_at) VALUES (?, ?, ?, 'manual', ?, ?)",
+					"INSERT INTO decisions (session_id, decision, reason, source, created_at_epoch, created_at, tags, files) VALUES (?, ?, ?, 'manual', ?, ?, ?, ?)",
 				)
-				.run(this.sessionId, stored.text, storedReason.text, epoch, new Date(epoch * 1000).toISOString());
+				.run(
+					this.sessionId,
+					stored.text,
+					storedReason.text,
+					epoch,
+					new Date(epoch * 1000).toISOString(),
+					JSON.stringify([...tags, ...keywordsOf(decision)].slice(0, 8)),
+					JSON.stringify(files),
+				);
+			const newId = Number(result.lastInsertRowid);
 			const embedder = await this.getEmbedder();
-			await memory.recordDecisionVec(embedder, Number(result.lastInsertRowid), stored.text, storedReason.text);
+			await memory.recordDecisionVec(embedder, newId, stored.text, storedReason.text);
+			// R13 auto-linking: connect similar past decisions with related_to edges.
+			const linked = await memory.autoLinkDecision(embedder, newId, stored.text + " - " + storedReason.text, { cap: 3 });
+			// R13 memory evolution: an explicit relatedTo annotates an earlier
+			// decision (original text stays immutable; the note lives on the edge).
+			for (const target of opts.relatedTo ?? []) {
+				memory.linkDecisions(newId, Number(target), "annotates", reason || null);
+			}
+			if (linked.length > 0) {
+				const heads = linked.map((id) => memory.decisionHeadline(id)).filter(Boolean).join("; ");
+				if (heads) return decision + " (linked: " + heads + ")";
+			}
 		}
 		return decision;
 	}
@@ -494,13 +551,21 @@ export class ContextEngine {
 		inline: Chunk[];
 		overflow: Chunk[];
 		droppedLowValue: number;
+		/** R8: query-level confidence assessment for this call. */
+		queryAssessment: QueryAssessment;
 	}> {
 		const retriever = await this.getRetriever();
 		const compressor = await this.getCompressor();
 		const topK = Math.max(1, Math.min(opts.topK ?? 10, MAX_TOP_K));
 		const maxTokens = Math.max(500, Math.min(opts.maxTokens ?? 8000, 50_000));
 
-		const stats: { candidates?: number; selected?: number; droppedLowValue?: number } = {};
+		const stats: {
+		candidates?: number;
+		selected?: number;
+		droppedLowValue?: number;
+		querySignals?: import("./retrieval/retriever.js").QuerySignals;
+		nearMissFiles?: string[];
+	} = {};
 		let chunks = await retriever.retrieve(query, {
 			topK: topK * 2,
 			confidenceThreshold: this.config.retrievalConfidenceThreshold,
@@ -508,7 +573,14 @@ export class ContextEngine {
 			maxTokens: null,
 			statsOut: stats,
 		});
-		chunks = await compressor.compress(chunks, this.config.compressionLevel);
+		// R3: the compressor keeps lines that answer THIS query when it has to
+		// truncate. Query-agnostic setups (or `compression.query_aware: false`)
+		// keep the old head-truncation behaviour.
+		chunks = await compressor.compress(
+			chunks,
+			this.config.compressionLevel,
+			this.config.compressionQueryAware ? query : undefined,
+		);
 		chunks = chunks.filter((c) => !isPceConfig(c.filePath));
 
 		const inline: Chunk[] = [];
@@ -569,8 +641,101 @@ export class ContextEngine {
 		this.searchesSinceDecision += 1;
 
 		const body = formatResults(inline, overflow);
+		// R8: query-confidence line — silent when high, actionable hints when the
+		// evidence says the query was weak (predicted query performance tracks
+		// answer quality; telling the agent beats silently serving junk).
+		const assessment = assessQuery(
+			stats.querySignals ?? { topScore: 0, margin: 0, agreement: 0, candidates: 0 },
+			new QueryParser().parse(query),
+			{ high: this.config.retrievalConfidenceHigh, low: this.config.retrievalConfidenceLow },
+		);
+		const bodyWithConfidence =
+			assessment.level === "high" || (inline.length === 0 && overflow.length === 0)
+				? body
+				: `${body}\n[query confidence: ${assessment.level}${assessment.hints.length > 0 ? ` — ${assessment.hints.join("; ")}` : ""}]`;
+		// R9: one `refine:` line — the next query candidates the retriever can
+		// already see (sibling symbol, just-missed file, an alternate term), so
+		// the search tool becomes a guided loop instead of a one-shot.
+		const refine = this.buildRefineLine(query, inline, stats.nearMissFiles ?? []);
+		const finalBody = refine ? `${bodyWithConfidence}\n${refine}` : bodyWithConfidence;
 		this.recordQuery(rawTokens, servedTokens, fullFileTokens);
-		return { body, inline, overflow, droppedLowValue: stats.droppedLowValue ?? 0 };
+		return {
+			body: finalBody,
+			inline,
+			overflow,
+			droppedLowValue: stats.droppedLowValue ?? 0,
+			queryAssessment: assessment,
+		};
+	}
+
+	/** Chunker fallback node names that are never useful refine hints. */
+	private static readonly REFINE_JUNK_NAMES = new Set([
+		"function",
+		"class",
+		"module",
+		"const",
+		"export",
+		"import",
+		"interface",
+		"return",
+		"async",
+	]);
+
+	/**
+	 * R9: deterministic refine suggestions from what the retriever already
+	 * knows: a sibling symbol from the top hit's file (graph defines), a file
+	 * that ranked 11-15 but was not served, and a term frequent across the
+	 * top hits but absent from the query. Capped at 3 items and 160 chars
+	 * (≤40 tokens) per call.
+	 */
+	private buildRefineLine(query: string, hits: Chunk[], nearMissFiles: string[]): string | null {
+		if (!this.config.retrievalRefineHints) return null;
+		const items: string[] = [];
+		const top = hits[0];
+		if (top) {
+			try {
+				const units = new Set(
+					hits
+						.filter((h) => h.filePath === top.filePath)
+						.map((h) => {
+							const u = h.metadata["unit"];
+							return typeof u === "string" && u.includes(".") ? u.slice(u.lastIndexOf(".") + 1) : typeof u === "string" ? u : "";
+						}),
+				);
+				const sibling = this.backend
+					.getNodesByFile(top.filePath)
+					.filter((n) => n.nodeType === "function" || n.nodeType === "class")
+					.map((n) => n.name)
+					.filter((n) => !ContextEngine.REFINE_JUNK_NAMES.has(n) && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n))
+					.find((n) => !units.has(n));
+				if (sibling) items.push(`"${sibling}"`);
+			} catch {
+				// graph lookup is best-effort
+			}
+		}
+		const servedFiles = new Set(hits.map((h) => h.filePath));
+		for (const f of nearMissFiles.slice(0, 1)) {
+			if (!servedFiles.has(f)) items.push(`file:${f}`);
+		}
+		const termFreq = new Map<string, number>();
+		for (const chunk of hits.slice(0, 3)) {
+			const text = chunk.compressedContent || chunk.content;
+			const local = new Set<string>();
+			for (const m of text.matchAll(/[A-Za-z_$][A-Za-z0-9_$]{4,}/g)) {
+				const w = m[0];
+				if (!query.includes(w)) local.add(w);
+			}
+			for (const w of local) termFreq.set(w, (termFreq.get(w) ?? 0) + 1);
+		}
+		const alt = [...termFreq.entries()]
+			.filter(([w, n]) => n >= 2 && !ContextEngine.REFINE_JUNK_NAMES.has(w))
+			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.map(([w]) => `"${w}"`)
+		.find((w) => !items.includes(w));
+		if (alt) items.push(alt);
+		if (items.length === 0) return null;
+		const line = `[refine: ${items.slice(0, 3).join(" · ")}]`;
+		return line.length <= 160 ? line : null;
 	}
 
 	/** Memory nudge appended to search results when the agent never records. */
@@ -823,6 +988,17 @@ export class ContextEngine {
 			if (!r) continue;
 			const recency = humaniseRelativeTime(r.created_at_epoch);
 			let tail = recency ? ` · ${recency}` : "";
+			// R13: surface linked decisions so the agent can walk the graph.
+			const links = memory.getDecisionLinks(r.id);
+			if (links.relatedTo.length > 0) {
+				tail += ` · related: ${links.relatedTo.join(", ")}`;
+			}
+			if (links.relatedFrom.length > 0) {
+				tail += ` · relatedFrom: ${links.relatedFrom.join(", ")}`;
+			}
+			for (const ann of links.annotatedBy.slice(0, 2)) {
+				tail += ` · annotation #${ann.id}${ann.note ? ": " + ann.note.slice(0, 80) : ""}`;
+			}
 			if (r.session_id) tail += ` · → session_timeline("${r.session_id}")`;
 			out.push(
 				`[decision src=${r.source}|sid:${r.session_id ?? "-"}] ${expand(r.decision)} — ${expand(r.reason)}${tail}`,
@@ -986,9 +1162,26 @@ export class ContextEngine {
 	}
 
 	relatedContext(chunkId: string): string {
-		const neighbors = this.backend.graphNeighbors(chunkId);
-		if (neighbors.length === 0) return "No related context found for this chunk.";
-		return neighbors.map((n) => `- ${n.nodeType}: ${n.name} (${n.filePath})`).join("\n");
+		// R7: with real calls edges, a chunk's outgoing calls are genuine
+		// neighbours. Node ids that are not calls sources (e.g. file nodes,
+		// whose DEFINES edges point at their chunks) keep working via the
+		// unfiltered lookup, then file-level imports as the last resort.
+		// Before R7 all of this was dead: imports edges pointed at nodes that
+		// never existed.
+		const render = (ns: { nodeType: string; name: string; filePath: string }[]): string =>
+			ns.map((n) => `- ${n.nodeType}: ${n.name} (${n.filePath})`).join("\n");
+		const callTargets = this.backend.graphNeighbors(chunkId, "calls");
+		if (callTargets.length > 0) return render(callTargets);
+		const any = this.backend.graphNeighbors(chunkId);
+		if (any.length > 0) return render(any);
+		const chunk = this.backend.getChunkById(chunkId);
+		if (chunk) {
+			const related = this.backend.getRelatedFilePaths([chunk.filePath]);
+			if (related.length > 0) {
+				return related.map((fp) => `- file: ${fp}`).join("\n");
+			}
+		}
+		return "No related context found for this chunk.";
 	}
 
 	/** Cost note like ", $4.37 saved" for the status line. */

@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges (source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges (target_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_file   ON nodes  (file_path);
+CREATE TABLE IF NOT EXISTS pagerank (
+	file_path TEXT PRIMARY KEY,
+	score     REAL NOT NULL
+);
 `;
 
 type Sqlite = SqliteHandle;
@@ -85,6 +89,50 @@ export class GraphStore {
 		return rows.map(rowToNode);
 	}
 
+	/**
+	 * R5: structured symbol lookup for the multi-path retriever. Matches a
+	 * chunk-level node whose name EQUALS a queried identifier, ENDS with
+	 * `.identifier` (so `charge` finds `PaymentGateway.charge`), or STARTS with
+	 * `identifier.` (so `PaymentGateway` surfaces its methods). Exact matches
+	 * rank first; results are deterministic (name length as the tiebreak) so
+	 * RRF fusion is reproducible.
+	 */
+	findSymbols(names: string[], limit = 20): GraphNode[] {
+		if (names.length === 0) return [];
+		const conds: string[] = [];
+		const params: unknown[] = [];
+		for (const raw of names) {
+			const name = raw.trim().toLowerCase();
+			if (name.length < 3) continue;
+			conds.push("(lower(name) = ? OR lower(name) LIKE ? OR lower(name) LIKE ?)");
+			params.push(name, `%.${name}`, `${name}.%`);
+		}
+		if (conds.length === 0) return [];
+		params.push(Math.max(limit * 3, 30)); // overfetch: JS ranks exact-first, then cuts
+		let rows: Record<string, unknown>[];
+		try {
+			rows = this.db
+				.prepare(
+					`SELECT id, node_type, name, file_path, properties FROM nodes
+					 WHERE node_type IN ('function', 'class', 'module', 'doc')
+					 AND (${conds.join(" OR ")})
+					 LIMIT ?`,
+				)
+				.all(...params) as Record<string, unknown>[];
+		} catch {
+			return [];
+		}
+		const exact = new Set(names.map((n) => n.trim().toLowerCase()));
+		const nodes = rows.map(rowToNode);
+		nodes.sort((a, b) => {
+			const ax = exact.has(a.name.toLowerCase()) ? 0 : 1;
+			const bx = exact.has(b.name.toLowerCase()) ? 0 : 1;
+			if (ax !== bx) return ax - bx;
+			return a.name.length - b.name.length;
+		});
+		return nodes.slice(0, limit);
+	}
+
 	neighborsForFiles(filePaths: string[], edgeTypes: EdgeType[], nodeTypes?: NodeType[]): GraphNode[] {
 		if (filePaths.length === 0 || edgeTypes.length === 0) return [];
 		const fpPh = filePaths.map(() => "?").join(",");
@@ -107,6 +155,86 @@ export class GraphStore {
 		return rows.map(rowToNode);
 	}
 
+	/**
+	 * R7: PageRank over the file-level projection of the graph (imports +
+	 * calls edges collapsed to file→file). Scores are normalised so the
+	 * best-connected file is 1.0; the retriever applies them as a bounded
+	 * multiplicative prior. Hub files genuinely central to a codebase —
+	 * types, shared utils, the engine — consistently rank above leaves, which
+	 * is exactly the tie-break signal fusion needs when lexical and vector
+	 * evidence disagree.
+	 */
+	computePageRank(): void {
+		const nodeFile = new Map<string, string>();
+		for (const row of this.db.prepare("SELECT id, file_path FROM nodes").all() as {
+			id: string;
+			file_path: string;
+		}[]) {
+			nodeFile.set(row.id, row.file_path);
+		}
+		const edgeRows = this.db
+			.prepare("SELECT source_id, target_id FROM edges WHERE edge_type IN ('imports', 'calls')")
+			.all() as { source_id: string; target_id: string }[];
+
+		const nodes = new Set<string>();
+		for (const fp of nodeFile.values()) if (fp) nodes.add(fp);
+		const out = new Map<string, Set<string>>();
+		for (const e of edgeRows) {
+			const s = nodeFile.get(e.source_id);
+			const tgt = nodeFile.get(e.target_id);
+			if (!s || !tgt || s === tgt) continue;
+			let set = out.get(s);
+			if (!set) out.set(s, (set = new Set()));
+			set.add(tgt);
+		}
+
+		const run = this.db.transaction(() => {
+			this.db.exec("DELETE FROM pagerank");
+			if (nodes.size === 0) return;
+			const d = 0.85;
+			const n = nodes.size;
+			const incoming = new Map<string, string[]>();
+			for (const [s, targets] of out) {
+				for (const tgt of targets) {
+					let arr = incoming.get(tgt);
+					if (!arr) incoming.set(tgt, (arr = []));
+					arr.push(s);
+				}
+			}
+			let rank = new Map<string, number>();
+			for (const node of nodes) rank.set(node, 1 / n);
+			for (let iter = 0; iter < 25; iter++) {
+				const next = new Map<string, number>();
+				let dangling = 0;
+				for (const node of nodes) {
+					const o = out.get(node);
+					if (!o || o.size === 0) dangling += rank.get(node) ?? 0;
+				}
+				for (const node of nodes) {
+					let s = (1 - d) / n + (d * dangling) / n;
+					for (const src of incoming.get(node) ?? []) {
+						s += (d * (rank.get(src) ?? 0)) / (out.get(src)?.size ?? 1);
+					}
+					next.set(node, s);
+				}
+				rank = next;
+			}
+			const max = Math.max(...rank.values(), 1e-12);
+			const ins = this.db.prepare("INSERT OR REPLACE INTO pagerank (file_path, score) VALUES (?, ?)");
+			for (const [fp, s] of rank) ins.run(fp, s / max);
+		});
+		run();
+	}
+
+	/** Read of the PageRank table (file_path → score in [0,1]). */
+	pageRanks(): Map<string, number> {
+		const rows = this.db.prepare("SELECT file_path, score FROM pagerank").all() as {
+			file_path: string;
+			score: number;
+		}[];
+		return new Map(rows.map((r) => [r.file_path, r.score]));
+	}
+
 	getNodesByType(nodeType: NodeType): GraphNode[] {
 		const rows = this.db
 			.prepare("SELECT id, node_type, name, file_path, properties FROM nodes WHERE node_type = ?")
@@ -126,15 +254,28 @@ export class GraphStore {
 				const nodeIds = (
 					this.db.prepare(`SELECT id FROM nodes WHERE file_path IN (${ph})`).all(...batch) as {
 						id: string;
-					}[]
+				}[]
 				).map((r) => r.id);
+				// R7: file_* node ids are STABLE across re-ingest of the same
+				// file, so inbound imports edges from other files stay valid.
+				// Only delete edges pointing at this file's chunk-level nodes
+				// (their ids change when content changes). Without this,
+				// re-indexing b.ts silently deleted every a.ts→b.ts imports
+				// edge unless a.ts changed too.
+				const chunkNodeIds = nodeIds.filter((id) => !id.startsWith("file_"));
 				for (const idBatch of batchedParams(nodeIds)) {
 					const idPh = idBatch.map(() => "?").join(",");
 					this.db
-						.prepare(`DELETE FROM edges WHERE source_id IN (${idPh}) OR target_id IN (${idPh})`)
-						.run(...idBatch, ...idBatch);
-					this.db.prepare(`DELETE FROM nodes WHERE id IN (${idPh})`).run(...idBatch);
+						.prepare(`DELETE FROM nodes WHERE id IN (${idPh})`).run(...idBatch);
 				}
+				const srcPh = nodeIds.map(() => "?").join(",");
+				this.db.prepare("DELETE FROM edges WHERE source_id IN (" + srcPh + ")").run(...nodeIds);
+				if (chunkNodeIds.length > 0) {
+					const tgtPh = chunkNodeIds.map(() => "?").join(",");
+					this.db.prepare("DELETE FROM edges WHERE target_id IN (" + tgtPh + ")").run(...chunkNodeIds);
+				}
+				const filePh = batch.map(() => "?").join(",");
+				this.db.prepare("DELETE FROM pagerank WHERE file_path IN (" + filePh + ")").run(...batch);
 			}
 		});
 		run([...batchedParams(filePaths)]);
@@ -143,6 +284,7 @@ export class GraphStore {
 	clear(): void {
 		this.db.exec("DELETE FROM edges");
 		this.db.exec("DELETE FROM nodes");
+		this.db.exec("DELETE FROM pagerank");
 	}
 
 	close(): void {

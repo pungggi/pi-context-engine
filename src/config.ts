@@ -19,7 +19,7 @@ export const DEFAULT_IGNORE: string[] = [
 	// Dependencies (JS, PHP, Python, Ruby, Go, Rust, Java, .NET)
 	"node_modules", "vendor", "bower_components",
 	".pnpm-store", ".pnpm", ".yarn",
-	".venv", "venv", "env", ".env",
+	".venv", "venv", ".env",
 	".tox", ".nox", ".mypy_cache", ".pytest_cache",
 	".ruff_cache", ".cache",
 	"Pods",
@@ -41,13 +41,23 @@ export const DEFAULT_IGNORE: string[] = [
 	// Package locks (huge, not useful)
 	"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
 	"composer.lock", "poetry.lock",
-	// Storage / logs
-	"storage", "logs", "tmp", "temp",
 ];
+
+/**
+ * Directory names that are ambiguous: equally plausible as junk at the project
+ * root (`./storage`, `./logs`, `./tmp`) as they are as real source trees
+ * nested below it (`src/storage/`, `app/logs/`). Matching them at any depth
+ * silently hid whole source trees from the index — including this package's
+ * own `src/storage/*.ts`. They are therefore ignored ONLY at the project root;
+ * nested dirs with these names are indexed.
+ */
+export const ROOT_ONLY_IGNORE: string[] = ["storage", "logs", "tmp", "temp", "env"];
 
 export interface Config {
 	compressionLevel: "minimal" | "standard" | "full";
 	compressionModel: string;
+	/** R3: keep query-matching lines when truncating instead of the head. */
+	compressionQueryAware: boolean;
 	ollamaUrl: string;
 	embeddingModel: string;
 	ollamaEmbedModel: string;
@@ -60,7 +70,29 @@ export interface Config {
 	retrievalConfidenceThreshold: number;
 	retrievalTopK: number;
 	retrievalMarginalRatio: number;
+	/** R6: attach a hit's module parent + adjacent chunk (small-to-big serving). */
+	retrievalExpandContext: boolean;
+	/** R8: composite quality score at/above which a query reports `high`. */
+	retrievalConfidenceHigh: number;
+	/** R8: composite quality score below which a query reports `low` + hints. */
+	retrievalConfidenceLow: number;
+	/** R8: deterministic query elaboration fused as an extra candidate source. */
+	retrievalAutoElaborate: boolean;
+	/** R9: append a `[refine: ...]` hint line to search results. */
+	retrievalRefineHints: boolean;
+	/** R10: opt-in reranking of the fused list. `off` (default) | `local`. */
+	retrievalRerank: "off" | "local";
+	/** R10: HF model id for the local cross-encoder reranker. */
+	retrievalRerankModel: string;
+	/** R10: how many fused candidates the reranker may reorder. */
+	retrievalRerankTopn: number;
+	/** R12: chunking strategy — `legacy` function/class walk (default) or `ast-density` split-merge. */
+	indexerChunking: "legacy" | "ast-density";
+	/** R12: non-whitespace char budget per ast-density chunk. */
+	indexerChunkBudgetChars: number;
 	indexerIgnore: string[];
+	/** Prepend the R1 context header (path/lang/unit/imports) to chunk content. */
+	indexerContextHeaders: boolean;
 	indexerRedactSecrets: boolean;
 	memoryRedactPii: boolean;
 	pricingModel: string;
@@ -73,6 +105,7 @@ export function defaultConfig(): Config {
 	return {
 		compressionLevel: "standard",
 		compressionModel: "phi3:mini",
+		compressionQueryAware: true,
 		ollamaUrl: "http://localhost:11434",
 		embeddingModel: "local",
 		ollamaEmbedModel: "nomic-embed-text",
@@ -80,7 +113,18 @@ export function defaultConfig(): Config {
 		retrievalConfidenceThreshold: 0.2,
 		retrievalTopK: 20,
 		retrievalMarginalRatio: 0.75,
+		retrievalExpandContext: true,
+		retrievalConfidenceHigh: 0.55,
+		retrievalConfidenceLow: 0.45,
+		retrievalAutoElaborate: false,
+		retrievalRefineHints: true,
+		retrievalRerank: "off",
+		retrievalRerankModel: "Xenova/ms-marco-MiniLM-L-6-v2",
+		retrievalRerankTopn: 30,
+		indexerChunking: "legacy",
+		indexerChunkBudgetChars: 1200,
 		indexerIgnore: [...DEFAULT_IGNORE],
+		indexerContextHeaders: true,
 		indexerRedactSecrets: true,
 		memoryRedactPii: true,
 		pricingModel: "opus",
@@ -94,6 +138,7 @@ export function defaultConfig(): Config {
 const MAPPING: Record<string, keyof Config> = {
 	"compression.level": "compressionLevel",
 	"compression.model": "compressionModel",
+	"compression.query_aware": "compressionQueryAware",
 	"compression.ollama_url": "ollamaUrl",
 	"guidance.enabled": "guidanceEnabled",
 	"embedding.model": "embeddingModel",
@@ -101,7 +146,18 @@ const MAPPING: Record<string, keyof Config> = {
 	"retrieval.confidence_threshold": "retrievalConfidenceThreshold",
 	"retrieval.top_k": "retrievalTopK",
 	"retrieval.marginal_ratio": "retrievalMarginalRatio",
+	"retrieval.expand_context": "retrievalExpandContext",
+	"retrieval.confidence_high": "retrievalConfidenceHigh",
+	"retrieval.confidence_low": "retrievalConfidenceLow",
+	"retrieval.auto_elaborate": "retrievalAutoElaborate",
+	"retrieval.refine_hints": "retrievalRefineHints",
+	"retrieval.rerank": "retrievalRerank",
+	"retrieval.rerank_model": "retrievalRerankModel",
+	"retrieval.rerank_topn": "retrievalRerankTopn",
+	"indexer.chunking": "indexerChunking",
+	"indexer.chunk_budget_chars": "indexerChunkBudgetChars",
 	"indexer.ignore": "indexerIgnore",
+	"indexer.context_headers": "indexerContextHeaders",
 	"indexer.redact_secrets": "indexerRedactSecrets",
 	"memory.redact_pii": "memoryRedactPii",
 	"storage.path": "storagePath",

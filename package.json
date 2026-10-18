@@ -30,6 +30,7 @@
 		"smoke:env": "node scripts/smoke-env.mjs",
 		"smoke:loader": "node scripts/smoke-loader.mjs",
 		"smoke:real-world": "tsx scripts/smoke-real-world.mjs",
+		"eval": "tsx scripts/eval-retrieval.mts",
 		"prepublishOnly": "node -e \"if(!process.env.CI)throw new Error('publish via release.yml CI: push a v* tag. Manual npm publish is blocked to guarantee provenance + version sync.')\""
 	},
 	"pi": {
@@ -64,6 +65,7 @@
 		"@earendil-works/pi-coding-agent": ">=0.99.2",
 		"@types/node": "^22.0.0",
 		"typebox": "^1.0.0",
+		"tsx": "^4.23.15",
 		"typescript": "^5.9.0",
 		"vitest": "^3.1.0"
 	},

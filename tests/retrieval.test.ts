@@ -177,3 +177,73 @@ describe("HybridRetriever", () => {
 		backend.close();
 	});
 });
+
+describe("keyword coverage scoring", () => {
+	it("prefers the chunk naming the rare identifier over generic-word matches", async () => {
+		const dir = makeTempDir("pce-kw-");
+		dirs.push(dir);
+		const backend = new LocalBackend(dir);
+		const fake = new FakeEmbeddingBackend();
+		// Identical embeddings isolate keyword scoring: the identifier chunk
+		// matches 6/8 of the query weight, the generic chunk only 2/8, and the
+		// old any-hit rule scored both identically (0 distance).
+		const body = "shared neutral body text for both candidates equally";
+		const identifierChunk = makeChunk({
+			id: "kw-id",
+			content: "const marginalRatio = 0.75; // stop threshold",
+			chunkType: "function",
+			filePath: "src/retriever.ts",
+			startLine: 10,
+			endLine: 12,
+			language: "typescript",
+			embedding: fake.vec(body),
+		});
+		const genericChunk = makeChunk({
+			id: "kw-generic",
+			content: "the result list shows entries",
+			chunkType: "function",
+			filePath: "src/other.ts",
+			startLine: 5,
+			endLine: 7,
+			language: "typescript",
+			embedding: fake.vec(body),
+		});
+		backend.ingest([identifierChunk, genericChunk], [], []);
+		const retriever = new HybridRetriever(backend, makeFakeEmbedder());
+		const results = await retriever.retrieve("marginalRatio result list", { topK: 5, confidenceThreshold: 0 });
+		expect(results[0]!.id).toBe("kw-id");
+		backend.close();
+	});
+
+	it("still gives full credit for a file-hint hit", async () => {
+		const dir = makeTempDir("pce-kwhint-");
+		dirs.push(dir);
+		const backend = new LocalBackend(dir);
+		const fake = new FakeEmbeddingBackend();
+		const hinted = makeChunk({
+			id: "hinted",
+			content: "export const whatever = 1;",
+			chunkType: "module",
+			filePath: "src/payments.py",
+			startLine: 1,
+			endLine: 1,
+			language: "python",
+			embedding: fake.vec("whatever"),
+		});
+		const other = makeChunk({
+			id: "other",
+			content: "export const anything = 2;",
+			chunkType: "module",
+			filePath: "src/unrelated.py",
+			startLine: 1,
+			endLine: 1,
+			language: "python",
+			embedding: fake.vec("anything"),
+		});
+		backend.ingest([hinted, other], [], []);
+		const retriever = new HybridRetriever(backend, makeFakeEmbedder());
+		const results = await retriever.retrieve("src/payments.py whatever", { topK: 5, confidenceThreshold: 0 });
+		expect(results[0]!.filePath).toBe("src/payments.py");
+		backend.close();
+	});
+});

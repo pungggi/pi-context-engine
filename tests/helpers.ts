@@ -28,13 +28,17 @@ export class FakeEmbeddingBackend implements EmbeddingBackend {
 	readonly modelName = "fake-embed";
 	dimension = DIM;
 
+	constructor(private readonly dim: number = DIM) {
+		this.dimension = dim;
+	}
+
 	async init(): Promise<void> {
-		this.dimension = DIM;
+		this.dimension = this.dim;
 	}
 
 	vec(text: string): number[] {
-		const v = new Array<number>(DIM).fill(0);
-		for (const token of tokenize(text)) v[hashToken(token)]! += 1;
+		const v = new Array<number>(this.dim).fill(0);
+		for (const token of tokenize(text)) v[hashToken(token) % this.dim]! += 1;
 		const norm = Math.sqrt(v.reduce((acc, x) => acc + x * x, 0)) || 1;
 		return v.map((x) => x / norm);
 	}
@@ -48,8 +52,8 @@ export class FakeEmbeddingBackend implements EmbeddingBackend {
 	}
 }
 
-export function makeFakeEmbedder(): Embedder {
-	return new Embedder(new FakeEmbeddingBackend());
+export function makeFakeEmbedder(dim?: number): Embedder {
+	return new Embedder(new FakeEmbeddingBackend(dim));
 }
 
 export function makeTempDir(prefix = "pce-test-"): string {

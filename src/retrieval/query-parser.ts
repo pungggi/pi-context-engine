@@ -80,3 +80,36 @@ export class QueryParser {
 		return result;
 	}
 }
+
+/**
+ * R8: deterministic query elaboration. Strips stopwords, caps the raw terms,
+ * and injects up to three identifier-like words that appear in ≥2 of the
+ * near-miss FTS hits. No LLM, no network, fully reproducible — the raw
+ * query's own ranking is never modified (callers fuse the variant as an
+ * additional, lower-weighted candidate source only).
+ */
+export function elaborateQuery(query: string, nearMissChunks: { content: string }[]): string | null {
+	const words = query.match(/[a-zA-Z_$][a-zA-Z0-9_$]*/g) ?? [];
+	const kept: string[] = [];
+	for (const w of words) {
+		if (STOP_WORDS.has(w.toLowerCase()) || w.length < 3) continue;
+		if (!kept.includes(w)) kept.push(w);
+	}
+	const freq = new Map<string, number>();
+	for (const chunk of nearMissChunks) {
+		const local = new Set<string>();
+		for (const m of chunk.content.matchAll(/[A-Za-z_$][A-Za-z0-9_$]{3,}/g)) {
+			const w = m[0];
+			if (!kept.includes(w)) local.add(w);
+		}
+		for (const w of local) freq.set(w, (freq.get(w) ?? 0) + 1);
+	}
+	const extras = [...freq.entries()]
+		.filter(([, n]) => n >= 2)
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.slice(0, 3)
+		.map(([w]) => w);
+	const variant = [...kept.slice(0, 8), ...extras].join(" ");
+	if (variant.length < 3 || variant === query.trim()) return null;
+	return variant;
+}

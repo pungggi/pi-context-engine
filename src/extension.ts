@@ -178,12 +178,23 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			decision: Type.String({ description: "What was decided" }),
 			reason: Type.String({ description: "Why — the constraint or tradeoff" }),
+			related_to: Type.Optional(
+				Type.Array(Type.Integer(), {
+					description: "Ids of earlier decisions this one annotates — ids appear in record_decision replies ([#N]) and session_recall lines ([decision #N …])",
+				}),
+			),
+			tags: Type.Optional(Type.Array(Type.String(), { description: "Short labels for later filtering" })),
+			files: Type.Optional(Type.Array(Type.String(), { description: "Affected file paths (relative)" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const decision = (params.decision ?? "").trim();
 			const reason = (params.reason ?? "").trim();
 			if (!decision) return text("decision is required.");
-			const stored = await getEngine(ctx.cwd).recordDecision(decision, reason);
+			const stored = await getEngine(ctx.cwd).recordDecision(decision, reason, {
+				relatedTo: params.related_to,
+				tags: params.tags,
+				files: params.files,
+			});
 			return text(`✓ Decision recorded: ${stored}`);
 		},
 	});

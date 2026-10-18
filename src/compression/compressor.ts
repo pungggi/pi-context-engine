@@ -25,7 +25,16 @@ const PROMPT_MAP: Partial<Record<ChunkType, string>> = {
 };
 
 const TRUNCATION_LIMITS: Record<string, number> = { minimal: 100, standard: 300, full: 800 };
-const FULL_PASSTHROUGH_THRESHOLD = 0.8;
+// Query-aware selection: keep matched lines within the level budget, never more.
+const MAX_QUERY_LINES = 40;
+/** Words that must not win the line budget just because they recur. */
+const QUERY_NOISE_TERMS = new Set([
+	"the", "and", "for", "with", "that", "this", "from", "are", "was", "not",
+	"you", "all", "can", "has", "its", "but", "how", "what", "when", "where",
+	"which", "who", "why", "does", "did", "should", "would", "into", "than",
+	"then", "them", "they", "use", "used", "using", "show", "find", "call",
+	"calls", "make", "made", "need", "needs", "get", "set", "returns", "return",
+]);
 // TTL for the Ollama liveness probe so compress() calls don't all pay it.
 const OLLAMA_PROBE_TTL_MS = 30_000;
 
@@ -153,33 +162,56 @@ export class Compressor {
 		return this.probeInFlight;
 	}
 
-	async compress(chunks: Chunk[], level = "standard"): Promise<Chunk[]> {
+	/**
+	 * Compress chunks for serving.
+	 *
+	 * `query` enables R3 query-aware selection: when a truncation would cut
+	 * lines (minimal/standard without the LLM path), keep the lines that
+	 * mention the query's terms within the same character budget instead of
+	 * the first N lines. That stops the compressor from deleting the only
+	 * line that answers the question, which fixed head-cuts did routinely.
+	 *
+	 * `queryAware=false` preserves the old head-truncation behaviour. `full`
+	 * never truncates: the retrieval token budget decides (plan R3), so
+	 * there is nothing for the query to protect at that level.
+	 */
+	async compress(chunks: Chunk[], level = "standard", query?: string, queryAware = true): Promise<Chunk[]> {
 		const ollamaAvailable = await this.isOllamaAvailable();
+		const queryText = (query ?? "").trim();
+		// Query selection only applies where truncation would otherwise cut.
+		// An LLM summary is query-independent (and therefore cacheable), so it
+		// keeps precedence when Ollama is up at standard/full.
+		const querySelection =
+			queryAware && queryText.length > 0 && level !== "full" && !(ollamaAvailable && level !== "minimal");
 		for (const chunk of chunks) {
-			if (level === "full" && this.isFullPassthrough(chunk)) {
+			if (level === "full") {
+				// Budget-driven: the engine's maxTokens packing trims, not us.
 				chunk.compressedContent = chunk.content;
 				continue;
 			}
-			const cached = this.cache?.getCachedCompression(chunk.id, level);
-			if (cached !== null && cached !== undefined) {
-				chunk.compressedContent = cached;
-				continue;
+			if (!querySelection) {
+				const cached = this.cache?.getCachedCompression(chunk.id, level);
+				if (cached !== null && cached !== undefined) {
+					chunk.compressedContent = cached;
+					continue;
+				}
 			}
-			if (ollamaAvailable && level !== "minimal") {
-				chunk.compressedContent = await this.llmCompress(chunk, level);
+			let compressed: string;
+			if (querySelection) {
+				// Never read or write the cache here: its key is (chunk, level)
+				// and would leak a stale selection from another query.
+				compressed = this.queryAwareFallback(chunk, level, queryText);
+			} else if (ollamaAvailable && level !== "minimal") {
+				compressed = await this.llmCompress(chunk, level);
 			} else {
-				chunk.compressedContent = this.fallbackCompress(chunk, level);
+				compressed = this.fallbackCompress(chunk, level);
 			}
-			if (this.cache && chunk.compressedContent) {
-				this.cache.putCachedCompression(chunk.id, level, chunk.compressedContent);
+			chunk.compressedContent = compressed;
+			if (this.cache && compressed && !querySelection) {
+				this.cache.putCachedCompression(chunk.id, level, compressed);
 			}
 		}
 		return chunks;
-	}
-
-	private isFullPassthrough(chunk: Chunk): boolean {
-		if (chunk.confidenceScore > FULL_PASSTHROUGH_THRESHOLD) return true;
-		return chunk.embedding === null;
 	}
 
 	private async llmCompress(chunk: Chunk, level: string): Promise<string> {
@@ -195,11 +227,57 @@ export class Compressor {
 
 	private fallbackCompress(chunk: Chunk, level: string): string {
 		const limit = TRUNCATION_LIMITS[level] ?? 300;
+		// The R1 header is retrieval context, not serving context: the result
+		// formatter already prints `[path:start]`, so paying for it again inside
+		// a 100-char signature would waste most of the budget.
+		const content = stripContextHeader(chunk.content);
 		if (chunk.chunkType === "function" || chunk.chunkType === "class") {
-			return this.extractSignature(chunk.content, limit);
+			return this.extractSignature(content, limit);
 		}
-		if (chunk.content.length <= limit) return chunk.content;
-		return chunk.content.slice(0, limit) + "...";
+		if (content.length <= limit) return content;
+		return content.slice(0, limit) + "...";
+	}
+
+	/**
+	 * R3: keep the lines that answer the query instead of the first N lines.
+	 *
+	 * The level's character cap still bounds the output, so serving size never
+	 * grows: matched lines simply win the budget over leading boilerplate, then
+	 * the selection is restored to source order for readability. When nothing
+	 * matches (a vague query), plain truncation is returned — a weak query must
+	 * not blank the result.
+	 */
+	private queryAwareFallback(chunk: Chunk, level: string, query: string): string {
+		const limit = TRUNCATION_LIMITS[level] ?? 300;
+		const terms = queryTerms(query);
+		const body = stripContextHeader(chunk.content);
+		if (terms.length === 0) return this.fallbackCompress(chunk, level);
+
+		const lines = body.split("\n");
+		const matches: { line: string; idx: number; hits: number }[] = [];
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i]!;
+			if (line.trim().length === 0) continue;
+			const lower = line.toLowerCase();
+			let hits = 0;
+			for (const t of terms) if (lower.includes(t)) hits++;
+			if (hits > 0) matches.push({ line, idx: i, hits });
+		}
+		if (matches.length === 0) return this.fallbackCompress(chunk, level);
+
+		matches.sort((a, b) => b.hits - a.hits || a.idx - b.idx);
+		let budget = limit;
+		const selected: typeof matches = [];
+		let used = 0;
+		for (const m of matches) {
+			if (used + m.line.length + 1 > budget) continue;
+			selected.push(m);
+			used += m.line.length + 1;
+			if (selected.length >= MAX_QUERY_LINES) break;
+		}
+		if (selected.length === 0) return this.fallbackCompress(chunk, level);
+		selected.sort((a, b) => a.idx - b.idx);
+		return selected.map((m) => m.line).join("\n");
 	}
 
 	private extractSignature(content: string, limit: number): string {
@@ -219,4 +297,25 @@ export class Compressor {
 		}
 		return resultLines.join("\n");
 	}
+}
+
+/** Drop the R1 `// file: …` header line (serving shows `[path:start]` already). */
+function stripContextHeader(content: string): string {
+	if (!content.startsWith("// file: ")) return content;
+	const nl = content.indexOf("\n");
+	return nl < 0 ? content : content.slice(nl + 1);
+}
+
+/** Distinct query terms (>=3 chars, non-boilerplate) for line matching. */
+function queryTerms(query: string): string[] {
+	const tokens = query.toLowerCase().match(/[a-z0-9_]+/g) ?? [];
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const t of tokens) {
+		if (t.length < 3 || QUERY_NOISE_TERMS.has(t) || seen.has(t)) continue;
+		seen.add(t);
+		out.push(t);
+		if (out.length >= 40) break;
+	}
+	return out;
 }

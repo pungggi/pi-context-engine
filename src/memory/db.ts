@@ -11,7 +11,7 @@ import { batchedParams, epochSeconds } from "../utils.js";
 import { redactPii } from "../indexer/secrets.js";
 import type { Embedder } from "../indexer/embedder.js";
 
-export const CURRENT_VERSION = 3;
+export const CURRENT_VERSION = 4;
 const VEC_DIM = 384; // bootstrap dim; rebuilt automatically on mismatch
 
 /** Canonical savings buckets — keep in sync with the savings renderer. */
@@ -170,6 +170,20 @@ CREATE TABLE IF NOT EXISTS savings_log (
 CREATE INDEX IF NOT EXISTS idx_savings_bucket_ts ON savings_log(bucket, ts);
 `;
 
+const SCHEMA_V4 = `
+CREATE TABLE IF NOT EXISTS decision_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_id INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+  to_id INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('related_to','annotates')),
+  note TEXT,
+  created_at_epoch INTEGER NOT NULL,
+  UNIQUE(from_id, to_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_links_from ON decision_links(from_id);
+CREATE INDEX IF NOT EXISTS idx_decision_links_to ON decision_links(to_id);
+`;
+
 const VEC_TRIGGERS = `
 CREATE TRIGGER IF NOT EXISTS decisions_vec_ad AFTER DELETE ON decisions BEGIN
   DELETE FROM decisions_vec WHERE rowid = old.id;
@@ -210,6 +224,8 @@ export class MemoryDb {
 					this.db.exec(VEC_TRIGGERS);
 				}
 				this.db.exec(SCHEMA_V3);
+				this.applyV4Columns();
+				this.db.exec(SCHEMA_V4);
 				this.db
 					.prepare("INSERT INTO schema_versions (version, applied_at_epoch) VALUES (?, ?)")
 					.run(this.hasVec ? CURRENT_VERSION : 1, epochSeconds());
@@ -225,12 +241,123 @@ export class MemoryDb {
 				this.db.exec(VEC_TRIGGERS);
 			}
 			if (current < 3) this.db.exec(SCHEMA_V3);
+			if (current < 4) {
+				this.applyV4Columns();
+				this.db.exec(SCHEMA_V4);
+			}
 			if (current < 2 && !this.hasVec) return; // vec step still pending
 			this.db
 				.prepare("INSERT INTO schema_versions (version, applied_at_epoch) VALUES (?, ?)")
 				.run(CURRENT_VERSION, epochSeconds());
 		});
 		run();
+	}
+
+	/** v4 adds `decisions.tags` / `decisions.files` (JSON arrays); ALTER is guarded so re-runs and partial states stay safe. */
+	private applyV4Columns(): void {
+		const cols = new Set(
+			(this.db.prepare("PRAGMA table_info(decisions)").all() as { name: string }[]).map((c) => c.name),
+		);
+		if (!cols.has("tags")) this.db.exec("ALTER TABLE decisions ADD COLUMN tags TEXT");
+		if (!cols.has("files")) this.db.exec("ALTER TABLE decisions ADD COLUMN files TEXT");
+	}
+
+	// ── R13: linked memory (A-MEM style) ─────────────────────────────────────
+
+	/** Outgoing `related_to` links a single decision may accumulate. */
+	static readonly MAX_OUTGOING_RELATED = 6;
+	/** Inbound `related_to` links a hub decision accepts before new links skip it. */
+	static readonly MAX_INBOUND_RELATED = 8;
+
+	/**
+	 * Create a directed link between two decisions. Refuses self-links,
+	 * unknown ids and cap overflow; dedupes via UNIQUE(from_id, to_id, kind)
+	 * (returns false on conflict instead of throwing).
+	 */
+	linkDecisions(fromId: number, toId: number, kind: "related_to" | "annotates", note: string | null = null): boolean {
+		if (!Number.isInteger(fromId) || !Number.isInteger(toId) || fromId === toId) return false;
+		const fromRow = this.db.prepare("SELECT 1 FROM decisions WHERE id = ?").get(fromId);
+		const toRow = this.db.prepare("SELECT 1 FROM decisions WHERE id = ?").get(toId);
+		if (!fromRow || !toRow) return false;
+		if (kind === "related_to") {
+			const outN = (
+				this.db.prepare("SELECT COUNT(*) AS n FROM decision_links WHERE from_id = ? AND kind = 'related_to'").get(fromId) as { n: number }
+			).n;
+			if (outN >= MemoryDb.MAX_OUTGOING_RELATED) return false;
+			const inN = (
+				this.db.prepare("SELECT COUNT(*) AS n FROM decision_links WHERE to_id = ? AND kind = 'related_to'").get(toId) as { n: number }
+			).n;
+			if (inN >= MemoryDb.MAX_INBOUND_RELATED) return false;
+		}
+		try {
+			this.db
+				.prepare("INSERT INTO decision_links (from_id, to_id, kind, note, created_at_epoch) VALUES (?, ?, ?, ?, ?)")
+				.run(fromId, toId, kind, note, epochSeconds());
+			return true;
+		} catch {
+			return false; // duplicate or FK violation — already linked
+		}
+	}
+
+	/** Both directions of a decision's links, ready for recall rendering. */
+	getDecisionLinks(id: number): {
+		relatedTo: number[];
+		relatedFrom: number[];
+		annotates: { id: number; note: string | null }[];
+		annotatedBy: { id: number; note: string | null }[];
+	} {
+		const rows = this.db
+			.prepare("SELECT from_id, to_id, kind, note FROM decision_links WHERE from_id = ? OR to_id = ?")
+			.all(id, id) as { from_id: number; to_id: number; kind: string; note: string | null }[];
+		const out = {
+			relatedTo: [] as number[],
+			relatedFrom: [] as number[],
+			annotates: [] as { id: number; note: string | null }[],
+			annotatedBy: [] as { id: number; note: string | null }[],
+		};
+		for (const r of rows) {
+			if (r.kind === "related_to") {
+				if (r.from_id === id) out.relatedTo.push(r.to_id);
+				else out.relatedFrom.push(r.from_id);
+			} else {
+				if (r.from_id === id) out.annotates.push({ id: r.to_id, note: r.note });
+				else out.annotatedBy.push({ id: r.from_id, note: r.note });
+			}
+		}
+		return out;
+	}
+
+	/** Short one-line text of a decision (for link rendering). */
+	decisionHeadline(id: number): string | null {
+		const row = this.db.prepare("SELECT decision FROM decisions WHERE id = ?").get(id) as { decision: string } | undefined;
+		return row ? row.decision : null;
+	}
+
+	/**
+	 * R13 auto-linking: embed the new decision, find similar past decisions
+	 * and connect them with `related_to` edges (A-MEM's dynamic indexing).
+	 * The similarity gate is deliberately tighter than recall (0.85 vs 0.92
+	 * L2 on normalized vectors ≈ cosine ≥ 0.64): a wrong link is worse than a
+	 * missing one, because recall walks them.
+	 */
+	autoLinkDecision(
+		embedder: Embedder,
+		newId: number,
+		text: string,
+		opts: { k?: number; maxDistance?: number; cap?: number } = {},
+	): Promise<number[]> {
+		const { k = 4, maxDistance = 0.85, cap = 3 } = opts;
+		return (async () => {
+			if (!this.hasVecTables() || !text.trim()) return [];
+			const ids = await this.searchDecisionsVec(embedder, text, k, maxDistance);
+			const linked: number[] = [];
+			for (const id of ids) {
+				if (id === newId) continue;
+				if (linked.length >= cap) break;
+				if (this.linkDecisions(newId, id, "related_to")) linked.push(id);
+			}
+			return linked;
+		})();
 	}
 
 	private vecTableStmts(dim: number): string {

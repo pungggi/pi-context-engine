@@ -10,6 +10,8 @@ import os from "node:os";
 import { sha256Hex } from "../utils.js";
 
 export const DEFAULT_LOCAL_MODEL = "Xenova/all-MiniLM-L6-v2";
+/** R11: code-trained local embedder, measured in README (not a default — see eval table). */
+export const RECOMMENDED_CODE_MODEL = "michaelfeil/jina-embeddings-v2-base-code";
 export const DEFAULT_OLLAMA_MODEL = "nomic-embed-text";
 export const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 
@@ -29,6 +31,11 @@ function resolveModelCacheDir(): string {
 	const override = process.env.PCE_TRANSFORMERS_CACHE?.trim() || process.env.TRANSFORMERS_CACHE?.trim();
 	if (override) return path.resolve(override.replace(/^~/, os.homedir()));
 	return path.join(os.homedir(), ".pi-context-engine", "models");
+}
+
+/** R10: shared with the reranker so every transformers.js load uses one models dir. */
+export function transformersCacheDir(): string {
+	return resolveModelCacheDir();
 }
 
 interface TransformersModule {
@@ -94,8 +101,16 @@ export class LocalBackend implements EmbeddingBackend {
 					pooling: "mean",
 					normalize: true,
 				} as Record<string, unknown>);
+				// R11: transformers.js truncates to the MODEL's max length — up to 8192
+				// tokens for long-context embedders, which OOMs a batch on CPU. Cap the
+				// text ourselves; ~2000 chars ≈ 512 BPE tokens covers almost every chunk.
+				const MAX_EMBED_CHARS = 2000;
+				const cap = (s: string) => (s.length > MAX_EMBED_CHARS ? s.slice(0, MAX_EMBED_CHARS) : s);
 				return async (inputs: string | string[]): Promise<number[][]> => {
-					const out = (await extractor(inputs)) as { data: Float32Array; dims: number[] } | { data: Float32Array; dims: number[] }[];
+					const capped = typeof inputs === "string" ? cap(inputs) : inputs.map(cap);
+					const out = (await extractor(capped)) as
+						| { data: Float32Array; dims: number[] }
+						| { data: Float32Array; dims: number[] }[];
 					const single = Array.isArray(out) ? out[0]! : out;
 					const dim = single.dims[single.dims.length - 1]!;
 					const vecs: number[][] = [];

@@ -11,6 +11,8 @@ export class LocalBackend {
 	private vectorStore: VectorStore;
 	private ftsStore: FTSStore;
 	private graphStore: GraphStore;
+	/** R7: cached PageRank table; refreshed by recomputePriors(). */
+	private pageRankCache: Map<string, number> | null = null;
 
 	constructor(basePath: string) {
 		this.vectorStore = new VectorStore(path.join(basePath, "vectors"));
@@ -56,6 +58,38 @@ export class LocalBackend {
 		return this.vectorStore.getById(chunkId);
 	}
 
+	/** R7: recompute file PageRank after indexing; retrieval reads it as a prior. */
+	recomputePriors(): void {
+		this.graphStore.computePageRank();
+		this.pageRankCache = null;
+	}
+
+	/** R7: cached file→[0,1] PageRank (empty until first recomputePriors). */
+	pageRanks(): Map<string, number> {
+		if (!this.pageRankCache) this.pageRankCache = this.graphStore.pageRanks();
+		return this.pageRankCache;
+	}
+
+	/** R5: symbol lookup over graph node names (exact / `.suffix`). */
+	findSymbols(names: string[], limit = 20): GraphNode[] {
+		return this.graphStore.findSymbols(names, limit);
+	}
+
+	/** R9: graph nodes of one file (sibling-symbol hints). */
+	getNodesByFile(filePath: string): GraphNode[] {
+		return this.graphStore.getNodesByFile(filePath);
+	}
+
+	/** PR #7 review: all function/class nodes, for incremental call-graph derivation. */
+	listSymbolNodes(): GraphNode[] {
+		return this.graphStore.listSymbolNodes();
+	}
+
+	/** R5: chunks of one file in source order. */
+	chunksByFile(filePath: string, limit = 10): Chunk[] {
+		return this.vectorStore.byFile(filePath, limit);
+	}
+
 	getChunksByIds(chunkIds: string[]): Chunk[] {
 		return this.vectorStore.getChunksByIds(chunkIds);
 	}
@@ -69,6 +103,7 @@ export class LocalBackend {
 		this.vectorStore.deleteByFiles(filePaths);
 		this.ftsStore.deleteByFiles(filePaths);
 		this.graphStore.deleteByFiles(filePaths);
+		this.pageRankCache = null;
 	}
 
 	countChunks(): number {
@@ -91,6 +126,7 @@ export class LocalBackend {
 		this.vectorStore.clear();
 		this.ftsStore.clear();
 		this.graphStore.clear();
+		this.pageRankCache = null;
 	}
 
 	close(): void {

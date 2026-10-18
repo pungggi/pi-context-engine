@@ -10,14 +10,15 @@ import { promisify } from "node:util";
 import type { Config } from "../config.js";
 import { projectStorageDir, sha256Hex } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
+import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
 import { EmbeddingCache } from "./embedding-cache.js";
-import { Manifest } from "./manifest.js";
+import { Manifest, CURRENT_SCHEMA_VERSION } from "./manifest.js";
 import { loadIgnorePatterns, matchesAny } from "./ignorefile.js";
 import { isSecretFile, redactSecrets } from "./secrets.js";
 import { LocalBackend } from "../storage/local-backend.js";
 import type { Chunk, ChunkType, GraphEdge, GraphNode, NodeType } from "../types.js";
-import { resolveOllamaUrl } from "../config.js";
+import { resolveOllamaUrl, ROOT_ONLY_IGNORE } from "../config.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -159,13 +160,16 @@ function cceignoreMatchesDir(relPosix: string, patterns: string[]): boolean {
  */
 function targetExcluded(
 	relPosix: string,
-	opts: { isDir: boolean; ignoreSet: Set<string>; redactSecrets: boolean; patterns: string[] },
+	opts: { isDir: boolean; ignoreSet: Set<string>; rootIgnoreSet: Set<string>; redactSecrets: boolean; patterns: string[] },
 ): boolean {
 	if (relPosix === "") return false;
 	const segments = relPosix.split("/");
 	for (const seg of segments) {
 		if (opts.ignoreSet.has(seg)) return true;
 	}
+	// Only the first segment is project-root level; root-only names must not
+	// reject nested paths like `src/storage/x.ts`.
+	if (opts.rootIgnoreSet.has(segments[0]!)) return true;
 	// The walker only classifies secret names on file entries; a secret-named
 	// directory's contents are still gated per file.
 	if (!opts.isDir && opts.redactSecrets && isSecretFile(segments[segments.length - 1]!)) return true;
@@ -187,6 +191,7 @@ function* iterProjectFiles(
 	/** Project root: `.cceignore` patterns are matched against project-relative paths even when walking from a target. */
 	relRoot: string,
 	ignoreSet: Set<string>,
+	rootIgnoreSet: Set<string>,
 	opts: { redactSecrets: boolean; cceignorePatterns: string[] },
 ): Generator<string> {
 	const seen = new Set<string>();
@@ -200,7 +205,10 @@ function* iterProjectFiles(
 		}
 		entries.sort((a, b) => a.name.localeCompare(b.name));
 		for (const entry of entries) {
-			if (ignoreSet.has(entry.name)) continue;
+			// Root-only names (`storage`, `logs`, ...) only match at the project
+			// root — nested `src/storage/` is real source and must be indexed.
+			const atProjectRoot = directory === relRoot;
+			if (ignoreSet.has(entry.name) || (atProjectRoot && rootIgnoreSet.has(entry.name))) continue;
 			const full = path.join(directory, entry.name);
 			if (entry.isSymbolicLink()) continue;
 			let resolved: string;
@@ -411,12 +419,29 @@ async function runIndexingLocked(
 		cacheMisses: 0,
 	};
 
+	// PR #7 review fix: migrations below call manifest.clearEntries(), which
+	// also erases the file list pruneFilesNotIn() needs to detect files that
+	// vanished BEFORE this run. Snapshot the paths first so the prune step
+	// can still delete their indexed chunks instead of orphaning them.
+	const preMigrationPaths = Object.keys(manifest.fileEntries);
+
 	if (backend.metricRebuilt) {
 		manifest.clearEntries();
 		log?.("  [migration] vector index rebuilt (cosine metric) — reindexing all files");
 	}
 
+	// Index-format migrations (e.g. v3 added R1 context headers) change how
+	// chunk content is built WITHOUT changing the file on disk, so the content
+	// hash alone would leave a stale, header-less index behind forever.
+	if (manifest.schemaVersion !== CURRENT_SCHEMA_VERSION) {
+		log?.(
+			`  [migration] index format v${manifest.schemaVersion} → v${CURRENT_SCHEMA_VERSION} — reindexing all files`,
+		);
+		manifest.clearEntries();
+	}
+
 	const ignoreSet = new Set(config.indexerIgnore);
+	const rootIgnoreSet = new Set(ROOT_ONLY_IGNORE);
 	const cceignorePatterns = loadIgnorePatterns(projectDir);
 	if (cceignorePatterns.length > 0) log?.(`  [.cceignore] ${cceignorePatterns.length} pattern(s) loaded`);
 
@@ -449,6 +474,7 @@ async function runIndexingLocked(
 				targetExcluded(rel, {
 					isDir: false,
 					ignoreSet,
+					rootIgnoreSet,
 					redactSecrets: config.indexerRedactSecrets,
 					patterns: cceignorePatterns,
 				})
@@ -471,6 +497,7 @@ async function runIndexingLocked(
 			const excluded = targetExcluded(rel, {
 				isDir: true,
 				ignoreSet,
+				rootIgnoreSet,
 				redactSecrets: config.indexerRedactSecrets,
 				patterns: cceignorePatterns,
 			});
@@ -479,7 +506,7 @@ async function runIndexingLocked(
 				fileList = [];
 			} else {
 				fileList = [
-					...iterProjectFiles(target, projectDir, ignoreSet, {
+					...iterProjectFiles(target, projectDir, ignoreSet, rootIgnoreSet, {
 						redactSecrets: config.indexerRedactSecrets,
 						cceignorePatterns,
 					}),
@@ -507,7 +534,7 @@ async function runIndexingLocked(
 		}
 	} else {
 		fileList = [
-			...iterProjectFiles(projectDir, projectDir, ignoreSet, {
+			...iterProjectFiles(projectDir, projectDir, ignoreSet, rootIgnoreSet, {
 				redactSecrets: config.indexerRedactSecrets,
 				cceignorePatterns,
 			}),
@@ -521,6 +548,18 @@ async function runIndexingLocked(
 		if (lang && isAstLanguage(lang)) languages.add(lang);
 	}
 	if (languages.size > 0) await warmupLanguages(languages);
+
+	// R7: every rel path this run touches (changed or not) plus everything
+	// already indexed forms the resolution universe for import specifiers.
+	const knownFiles = new Set<string>(Object.keys(manifest.fileEntries));
+	for (const f of fileList) knownFiles.add(path.relative(projectDir, f).replace(/\\/g, "/"));
+	// R7: cross-file call-graph state, filled during the batch loop, emitted
+	// as chunk-to-chunk `calls` edges after ALL batches (so early files can
+	// call symbols defined in late ones — order-independent).
+	const runChunks: { id: string; filePath: string; identifiers: string[] }[] = [];
+	const symbolOwners = new Map<string, { id: string; filePath: string }[]>();
+	// PR #7 review: files whose chunks were (re)built this run, across ALL batches.
+	const changedRelPaths = new Set<string>();
 
 	// ── Lazy embedder + cache ─────────────────────────────────────────────
 	const holders: { embedder: Embedder | null; cache: EmbeddingCache | null } = {
@@ -603,13 +642,19 @@ async function runIndexingLocked(
 		const batchIndexed: string[] = [];
 
 		for (const item of toChunk) {
+			changedRelPaths.add(item.relPath);
 			let chunks: Chunk[] = [];
 			let importedModules: string[] = [];
+			let importSpecs: string[] = [];
 			try {
 				if (isAstLanguage(item.language)) {
-					const out = chunker.chunkWithImports(item.content, item.relPath, item.language);
+					const out = chunker.chunkWithImports(item.content, item.relPath, item.language, {
+							chunking: config.indexerChunking,
+							budgetChars: config.indexerChunkBudgetChars,
+						});
 					chunks = out.chunks;
 					importedModules = out.imports;
+					importSpecs = out.importSpecs;
 				}
 				if (chunks.length === 0) {
 					// Fallback: module-level chunk (upstream _fallback_chunk).
@@ -652,18 +697,27 @@ async function runIndexingLocked(
 				filePath: item.relPath,
 				properties: {},
 			});
-			for (const module of importedModules) {
-				batchEdges.push({
-					sourceId: fileNodeId,
-					targetId: `module_${module}`,
-					edgeType: "imports",
-					properties: {},
-				});
+			for (const spec of importSpecs) {
+				// R7: resolve relative specifiers to a real indexed file. Before this,
+				// edges pointed at `module_<spec>` nodes that were never created, so
+				// every imports-edge JOIN silently produced nothing and
+				// related_context / getRelatedFilePaths were dead code. Bare package
+				// imports ("react", "node:fs") stay out: they resolve to nothing in
+				// the index and would only add noise.
+				const resolved = resolveImportPath(spec, item.relPath, knownFiles);
+				if (resolved) {
+					batchEdges.push({
+						sourceId: fileNodeId,
+						targetId: `file_${resolved}`,
+						edgeType: "imports",
+						properties: {},
+					});
+				}
 			}
 			for (const chunk of chunks) {
-				const nodeName = chunk.content.includes("(")
-					? chunk.content.split("(")[0]!.split(":").pop()!.trim()
-					: chunk.id;
+				const nodeName =
+					(typeof chunk.metadata["unit"] === "string" && chunk.metadata["unit"]) ||
+					(chunk.content.includes("(") ? chunk.content.split("(")[0]!.split(":").pop()!.trim() : chunk.id);
 				batchNodes.push({
 					id: chunk.id,
 					nodeType: CHUNK_TO_NODE_TYPE[chunk.chunkType] ?? "module",
@@ -677,6 +731,31 @@ async function runIndexingLocked(
 					edgeType: "defines",
 					properties: {},
 				});
+				// R7 calls-graph collection (raw content, before the context header
+				// prepends file paths and `defines:` lists that would pollute the
+				// identifier set).
+				const unit = typeof chunk.metadata["unit"] === "string" ? chunk.metadata["unit"] : "";
+				if (chunk.chunkType === "function" || chunk.chunkType === "class") {
+					const short = unit.includes(".") ? unit.slice(unit.lastIndexOf(".") + 1) : unit;
+					if (short.length >= 3 && !CALL_GRAPH_STOPLIST.has(short)) {
+						let owners = symbolOwners.get(short);
+						if (!owners) symbolOwners.set(short, (owners = []));
+						owners.push({ id: chunk.id, filePath: item.relPath });
+					}
+				}
+				if (chunk.chunkType !== "module") {
+					runChunks.push({
+						id: chunk.id,
+						filePath: item.relPath,
+						identifiers: extractIdentifiers(chunk.content),
+					});
+				}
+			}
+			// R1 context headers go on LAST: graph node names above derive from raw
+			// content, and every downstream consumer (embed, FTS, compression,
+			// expand_chunk) reads `chunk.content`, so one prepend covers them all.
+			if (config.indexerContextHeaders) {
+				for (const chunk of chunks) applyContextHeaderToChunk(chunk, importedModules);
 			}
 			batchChunks.push(...chunks);
 			batchManifestUpdates.push([item.relPath, item.contentHash]);
@@ -709,6 +788,64 @@ async function runIndexingLocked(
 		result.skippedFiles.push(...toChunk.filter((t) => !batchIndexed.includes(t.relPath)).map((t) => t.relPath));
 	}
 
+	// ── R7: emit chunk→chunk calls edges ──────────────────────────────────
+	// Runs AFTER all batches so the symbol table is complete regardless of
+	// batch order. Cross-file only: intra-file structure is already covered
+	// by file/defines edges. Capped per chunk — a retrieval prior, not a
+	// faithful call graph.
+	{
+		// PR #7 review fix (incremental call graph): derive over ALL indexed
+		// files, not just this run's changes. deleteByFiles(changed) removes
+		// call edges touching changed chunk nodes in BOTH directions, so a
+		// run-only derivation silently dropped (a) changed files' calls into
+		// unchanged files and (b) unchanged callers' edges into changed files.
+		// Re-deriving from every indexed file recreates exactly the deleted
+		// edges; unchanged→unchanged duplicates collapse on the edge PK
+		// (INSERT OR REPLACE).
+		const callsEdges: GraphEdge[] = [];
+		const derivationSources = [...runChunks];
+		const changedThisRun = changedRelPaths;
+		for (const rel of Object.keys(manifest.fileEntries)) {
+			if (changedThisRun.has(rel)) continue;
+			for (const stored of backend.chunksByFile(rel, 500)) {
+				if (stored.chunkType === "module") continue;
+				derivationSources.push({
+					id: stored.id,
+					filePath: rel,
+					// Stored content carries the R1 context header; strip it so
+					// header tokens cannot pollute the identifier set.
+					identifiers: extractIdentifiers(stripContextHeader(stored.content)),
+				});
+			}
+		}
+		// Symbol owners over all files: run chunks first (fresh), then graph
+		// nodes of files that did not change (they are still valid).
+		for (const node of backend.listSymbolNodes()) {
+			if (changedThisRun.has(node.filePath)) continue;
+			const short = node.name.includes(".") ? node.name.slice(node.name.lastIndexOf(".") + 1) : node.name;
+			if (short.length < 3 || CALL_GRAPH_STOPLIST.has(short)) continue;
+			let owners = symbolOwners.get(short);
+			if (!owners) symbolOwners.set(short, (owners = []));
+			owners.push({ id: node.id, filePath: node.filePath });
+		}
+		for (const src of derivationSources) {
+			let out = 0;
+			for (const ident of src.identifiers) {
+				if (out >= CALLS_EDGES_PER_CHUNK) break;
+				for (const owner of symbolOwners.get(ident) ?? []) {
+					if (owner.filePath === src.filePath) continue;
+					callsEdges.push({ sourceId: src.id, targetId: owner.id, edgeType: "calls", properties: {} });
+					out += 1;
+					if (out >= CALLS_EDGES_PER_CHUNK) break;
+				}
+			}
+		}
+		if (callsEdges.length > 0) {
+				backend.ingest([], [], callsEdges);
+				log?.(`  [graph] ${callsEdges.length} cross-file call edge(s)`);
+			}
+	}
+
 	// ── Git history on full runs ──────────────────────────────────────────
 	if (full && !targetPath && fs.existsSync(path.join(projectDir, ".git"))) {
 		try {
@@ -731,7 +868,7 @@ async function runIndexingLocked(
 
 	// ── Prune files that vanished from disk ───────────────────────────────
 	if (!targetPath) {
-		const previousPaths = new Set(Object.keys(manifest.fileEntries));
+		const previousPaths = new Set([...Object.keys(manifest.fileEntries), ...preMigrationPaths]);
 		const removed = [...previousPaths].filter((rel) => !currentRelPaths.has(rel));
 		if (removed.length > 0) {
 			backend.deleteByFiles(removed);
@@ -766,4 +903,72 @@ function cceignoreMatchesFile(relPosix: string, patterns: string[]): boolean {
 		if (matchesAny(parts.slice(0, i).join("/"), true, patterns)) return true;
 	}
 	return false;
+}
+
+// ── R7 helpers: import resolution + call-graph vocabulary ─────────────────
+
+/** Cap per chunk for calls edges: a prior, not a faithful call graph. */
+const CALLS_EDGES_PER_CHUNK = 8;
+/** Max unique identifiers kept per chunk (first occurrences win). */
+const IDENTIFIERS_PER_CHUNK = 60;
+
+/** Words that name a chunk never worth a calls edge. */
+const CALL_GRAPH_STOPLIST = new Set([
+	"const", "let", "var", "function", "class", "return", "string", "number", "boolean", "object",
+	"void", "null", "undefined", "true", "false", "this", "import", "export", "default", "type",
+	"interface", "extends", "implements", "constructor", "static", "readonly", "public", "private",
+	"protected", "async", "await", "Promise", "Object", "Array", "String", "Number", "Boolean",
+	"Math", "JSON", "Error", "console", "process", "require", "module", "exports", "Map", "Set",
+	"Date", "Symbol", "Buffer", "path", "fs", "os", "unknown", "never", "text", "params", "options",
+	"value", "values", "result", "results", "data", "content", "item", "items", "name", "file", "files",
+	"line", "lines", "index", "length", "score", "query", "chunk", "chunks",
+]);
+
+/** Unique identifier-ish words in a chunk, capped (first occurrences win). */
+function extractIdentifiers(content: string): string[] {
+	const seen = new Set<string>();
+	const re = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(content)) !== null && seen.size < IDENTIFIERS_PER_CHUNK) {
+		const w = m[0];
+		if (w.length >= 3 && !CALL_GRAPH_STOPLIST.has(w)) seen.add(w);
+	}
+	return [...seen];
+}
+
+/**
+ * Resolve a relative import specifier against the set of indexed files.
+ * Handles extensionless specs ("./chunker"), .js to .ts rewrites (TypeScript
+ * emits .js specifiers), and directory index files. Returns null for bare
+ * package imports and unresolvable specs.
+ */
+function resolveImportPath(spec: string, importerRel: string, knownFiles: Set<string>): string | null {
+	if (!spec.startsWith(".") && !spec.startsWith("/")) return null;
+	const dir = importerRel.includes("/") ? importerRel.slice(0, importerRel.lastIndexOf("/")) : "";
+	const joined = spec.startsWith("/") ? spec.slice(1) : `${dir}/${spec}`;
+	const stack = joined.split("/");
+	const outStack: string[] = [];
+	for (const part of stack) {
+		if (part === "" || part === ".") continue;
+		if (part === "..") outStack.pop();
+		else outStack.push(part);
+	}
+	const base = outStack.join("/");
+	if (base === "") return null;
+	const candidates = [base];
+	const lower = base.toLowerCase();
+	if (lower.endsWith(".js")) {
+		candidates.push(base.slice(0, -3) + ".ts", base.slice(0, -3) + ".tsx");
+	} else if (lower.endsWith(".mjs") || lower.endsWith(".cjs")) {
+		candidates.push(base.slice(0, -4) + ".ts");
+	} else if (!/\.[a-z]+$/i.test(base)) {
+		candidates.push(base + ".ts", base + ".tsx", base + ".mts", base + ".js");
+	}
+	for (const c of candidates) {
+		if (knownFiles.has(c)) return c;
+	}
+	for (const ext of ["/index.ts", "/index.tsx", "/index.js"]) {
+		if (knownFiles.has(base + ext)) return base + ext;
+	}
+	return null;
 }

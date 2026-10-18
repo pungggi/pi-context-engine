@@ -33,24 +33,41 @@ before the changes lets us prove each improvement instead of guessing.
 
 | ID | Title | Phase | Priority | Effort | Status |
 |----|-------|-------|----------|--------|--------|
-| R4 | Labeled retrieval eval harness | 0 | P0 | M | Not started |
-| R1 | Contextual chunk headers | 1 | P0 | M | Not started |
-| R2 | BM25 phrases, column weights, symbol matches | 1 | P0 | S | Not started |
-| R3 | Query-aware compression | 1 | P0 | M | Not started |
-| R5 | Multi-path retrieval with symbol path | 2 | P1 | M | Not started |
-| R6 | Small-to-big context expansion | 2 | P1 | L | Not started |
-| R7 | Graph context packs + centrality prior | 2 | P1 | M | Not started |
-| R8 | Query-confidence signal + optional elaboration | 2 | P1 | M | Not started |
-| R9 | Refine suggestions in search results | 2 | P1 | S | Not started |
-| R10 | Opt-in local reranker | 3 | P2 | M | Not started |
-| R11 | Code-specialized embedder option | 3 | P2 | S | Not started |
-| R12 | AST density chunking (split-merge) | 3 | P2 | L | Not started |
-| R13 | Linked memory (A-MEM style) | 3 | P2 | M | Not started |
+| R4 | Labeled retrieval eval harness | 0 | P0 | M | Done (2026-10-18) |
+| R1 | Contextual chunk headers | 1 | P0 | M | Done (2026-10-18) |
+| R2 | BM25 phrases, column weights, symbol matches | 1 | P0 | S | Done (2026-10-18) |
+| R3 | Query-aware compression | 1 | P0 | M | Done (2026-10-18) |
+| R5 | Multi-path retrieval with symbol path | 2 | P1 | M | Done (2026-10-18) |
+| R6 | Small-to-big context expansion | 2 | P1 | L | Done (2026-10-18) |
+| R7 | Graph context packs + centrality prior | 2 | P1 | M | Done (2026-10-18) |
+| R8 | Query-confidence signal + optional elaboration | 2 | P1 | M | Done (2026-10-18) |
+| R9 | Refine suggestions in search results | 2 | P1 | S | Done (2026-10-18) |
+| R10 | Opt-in local reranker | 3 | P2 | M | Done (2026-10-18, default off) |
+| R11 | Code-specialized embedder option | 3 | P2 | S | Done (2026-10-18) |
+| R12 | AST density chunking (split-merge) | 3 | P2 | L | Done (2026-10-18, flag only — lost A/B) |
+| R13 | Linked memory (A-MEM style) | 3 | P2 | M | Done (2026-10-18) |
 
 **Blocked by nothing right now:** only R4 (phase 0). Everything else waits on
 R4's baseline so its impact can be measured.
 
 **Status history**
+- 2026-10-18: all items R1-R13 implemented and measured. Eval (fake
+  embedder, 76 queries): R@10 .910-.936, nDCG .813-.825, distraction
+  ~.695-.699 across the run series (gate green at every step; final
+  2026-10-18 run: 214 tests, 24 files). Notable outcomes:
+  - R10 reranker shipped default-off; real-model eval not run (model
+    repo gated/offline for jina, layout broken for the unixcoder ONNX
+    port); pipeline ordering covered by stub tests.
+  - R11 measured: jina-code beats MiniLM on every quality metric
+    (R@10 .899 vs .827, nDCG .813 vs .744, nl R@10 .700 vs .433) at
+    ~2x CPU latency; MiniLM stays the default, README carries the table.
+  - R12 ast-density measured and REJECTED as default: R@10 .818 vs
+    .936 legacy (trivia tiling dilutes fixed-size result sets). Ships
+    behind `indexer.chunking: ast-density` with byte-exact concat
+    property and tests; default stays `legacy`.
+  - R13 linked memory: schema v4 (decision_links + tags/files columns),
+    auto-link (top-3, L2 <= 0.85, inbound cap 8), explicit `related_to`
+    annotations, links surfaced in session_recall.
 - 2026-10-17: plan created from the research note. Implementation delayed by
   owner decision. All items set to **Not started**.
 

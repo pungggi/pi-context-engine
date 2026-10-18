@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { openDatabase, type SqliteHandle } from "../sqlite.js";
 import { batchedParams } from "../utils.js";
+import { parseContextHeaderUnit } from "../indexer/context-header.js";
 import type { Chunk, ChunkType } from "../types.js";
 
 const MAX_CONTENT_CHARS = 5_000;
@@ -144,6 +145,12 @@ export class VectorStore {
 		};
 		if (row.modified_ts != null) chunk.metadata["modified_ts"] = row.modified_ts;
 		if (distance !== undefined) chunk.metadata["_distance"] = distance;
+		// Restore `unit` from the R1 context header line so served chunks carry
+		// their symbol (refine hints filter siblings by it; the header is the
+		// single source of truth for indexed content). No header → no unit,
+		// same as before.
+		const unit = parseContextHeaderUnit(chunk.content);
+		if (unit) chunk.metadata["unit"] = unit;
 		return chunk;
 	}
 
@@ -321,6 +328,21 @@ export class VectorStore {
 					`SELECT id, content, chunk_type, file_path, start_line, end_line, language, modified_ts FROM chunks WHERE id IN (${placeholders})`,
 				)
 				.all(...chunkIds) as Record<string, unknown>[];
+			return rows.map((r) => this.rowToChunk(r));
+		} catch {
+			return [];
+		}
+	}
+
+	/** R5: chunks of one file in source order (file-hint retrieval path). */
+	byFile(filePath: string, limit = 10): Chunk[] {
+		try {
+			const rows = this.db
+				.prepare(
+					`SELECT id, content, chunk_type, file_path, start_line, end_line, language, modified_ts
+					 FROM chunks WHERE file_path = ? ORDER BY start_line ASC LIMIT ?`,
+				)
+				.all(filePath, limit) as Record<string, unknown>[];
 			return rows.map((r) => this.rowToChunk(r));
 		} catch {
 			return [];

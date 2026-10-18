@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import { atomicWriteText } from "../utils.js";
 
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 interface ManifestData {
 	__schema_version?: number;
@@ -16,7 +16,7 @@ interface ManifestData {
 
 export class Manifest {
 	private entries: Record<string, string> = {};
-	private schemaVersion: number = CURRENT_SCHEMA_VERSION;
+	private schemaVersionValue: number = CURRENT_SCHEMA_VERSION;
 	private lastGitShaValue: string | null = null;
 	private embeddingDimValue: number | null = null;
 
@@ -26,13 +26,13 @@ export class Manifest {
 				const loaded = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as ManifestData;
 				if (loaded && typeof loaded === "object") {
 					if ("__schema_version" in loaded) {
-						this.schemaVersion = loaded.__schema_version ?? 1;
+						this.schemaVersionValue = loaded.__schema_version ?? 1;
 						this.entries = loaded.files ?? {};
 						this.lastGitShaValue = loaded.last_git_sha ?? null;
 						this.embeddingDimValue = loaded.embedding_dim ?? null;
 					} else {
 						// Old plain-dict format (pre-v0.2) — treat as version 1.
-						this.schemaVersion = 1;
+						this.schemaVersionValue = 1;
 						this.entries = loaded as unknown as Record<string, string>;
 					}
 				}
@@ -47,6 +47,10 @@ export class Manifest {
 	}
 	set lastGitSha(value: string | null) {
 		this.lastGitShaValue = value;
+	}
+	/** Format version the on-disk manifest was written with (drives migrations). */
+	get schemaVersion(): number {
+		return this.schemaVersionValue;
 	}
 	get embeddingDim(): number | null {
 		return this.embeddingDimValue;

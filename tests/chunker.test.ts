@@ -109,4 +109,37 @@ describe("Chunker", () => {
 		const ids = chunks.map((c) => c.id);
 		expect(new Set(ids).size).toBe(ids.length);
 	});
+
+	it("chunks generator functions (generator_function_declaration)", () => {
+		// Bug found by the R4 eval: `function*` produced NO chunk at all, so
+		// the definition was invisible to every retrieval path.
+		const source = [
+			"export function* batchedParams<T>(items: readonly T[], size = 500): Generator<T[]> {",
+			"  for (let i = 0; i < items.length; i += size) {",
+			"    yield items.slice(i, i + size);",
+			"  }",
+			"}",
+			"",
+			"export function plain(): number {",
+			"  return 1;",
+			"}",
+		].join("\n");
+		const chunks = new Chunker().chunk(source, "gen.ts", "typescript");
+		const generator = chunks.find((c) => c.content.includes("batchedParams"));
+		expect(generator).toBeDefined();
+		expect(generator!.metadata["unit"]).toBe("batchedParams");
+		expect(chunks.find((c) => c.content.includes("plain"))).toBeDefined();
+	});
+
+	it("chunks generator methods inside classes", () => {
+		const source = [
+			"class Stream {",
+			"  *lines() {",
+			"    yield 1;",
+			"  }",
+			"}",
+		].join("\n");
+		const chunks = new Chunker().chunk(source, "gen-method.ts", "typescript");
+		expect(chunks.some((c) => c.content.includes("*lines"))).toBe(true);
+	});
 });

@@ -69,6 +69,7 @@ RULES:
 - A "\`expand_chunk\`" reference list means results were cut by the token budget - expand only the ones you actually need, never every entry
 - Confidence below ~0.5 usually means the index has nothing better; rephrase rather than trusting a weak hit
 - Results come from the index, not the live file: before editing, open the file with \`read\` to see its current state
+- A \`[query confidence: low|medium - ...]\` line at the end means the RETRIEVER itself judged the query weak (top score, retrieval-path agreement, file margin). Act on its hints instead of re-reading files: name a file or symbol, or drop vague terms. \`high\` confidence is reported by silence, not a line
 
 ### Before editing code
 

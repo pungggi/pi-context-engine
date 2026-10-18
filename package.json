@@ -1,83 +1,85 @@
 {
-	"name": "pi-context-engine",
-	"version": "0.1.4",
-	"description": "Semantic code context for pi: tree-sitter index + hybrid vector/BM25 retrieval + cross-session memory, all local. Port of code-context-engine (MIT, elara-labs) as a native pi extension.",
-	"keywords": [
-		"pi-package",
-		"pi-extension",
-		"context-engine",
-		"code-search",
-		"semantic-search",
-		"vector-search",
-		"tree-sitter",
-		"token-savings",
-		"memory"
-	],
-	"license": "MIT",
-	"type": "module",
-	"main": "src/extension.ts",
-	"files": [
-		"src",
-		"docs",
-		"README.md",
-		"LICENSE"
-	],
-	"scripts": {
-		"test": "vitest run",
-		"test:watch": "vitest watch",
-		"typecheck": "tsc --noEmit",
-		"check": "npm run typecheck && npm run test",
-		"smoke:env": "node scripts/smoke-env.mjs",
-		"smoke:loader": "node scripts/smoke-loader.mjs",
-		"smoke:real-world": "tsx scripts/smoke-real-world.mjs",
-		"prepublishOnly": "node -e \"if(!process.env.CI)throw new Error('publish via release.yml CI: push a v* tag. Manual npm publish is blocked to guarantee provenance + version sync.')\""
-	},
-	"pi": {
-		"extensions": [
-			"./src/extension.ts"
-		]
-	},
-	"engines": {
-		"node": ">=22.0.0"
-	},
-	"allowScripts": {
-		"better-sqlite3": true
-	},
-	"dependencies": {
-		"better-sqlite3": "^13.0.3",
-		"chokidar": "^5.0.0",
-		"sqlite-vec": "^0.1.9",
-		"tree-sitter-wasms": "^0.1.13",
-		"web-tree-sitter": "^0.22.6",
-		"yaml": "^2.9.1"
-	},
-	"optionalDependencies": {
-		"@huggingface/transformers": "^4.3.1"
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*",
-		"typebox": "*"
-	},
-	"devDependencies": {
-		"@earendil-works/pi-ai": ">=0.80.0",
-		"@earendil-works/pi-coding-agent": ">=0.99.2",
-		"@types/node": "^22.0.0",
-		"typebox": "^1.0.0",
-		"typescript": "^5.9.0",
-		"vitest": "^3.1.0"
-	},
-	"publishConfig": {
-		"access": "public",
-		"provenance": true
-	},
-	"author": "alessandro@pungitore.ch",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/pungggi/pi-context-engine.git"
-	},
-	"bugs": {
-		"url": "https://github.com/pungggi/pi-context-engine/issues"
-	},
-	"homepage": "https://github.com/pungggi/pi-context-engine#readme"
+  "name": "pi-context-engine",
+  "version": "0.2.0",
+  "description": "Semantic code context for pi: tree-sitter index + hybrid vector/BM25 retrieval + cross-session memory, all local. Port of code-context-engine (MIT, elara-labs) as a native pi extension.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "context-engine",
+    "code-search",
+    "semantic-search",
+    "vector-search",
+    "tree-sitter",
+    "token-savings",
+    "memory"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "src/extension.ts",
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run test",
+    "smoke:env": "node scripts/smoke-env.mjs",
+    "smoke:loader": "node scripts/smoke-loader.mjs",
+    "smoke:real-world": "tsx scripts/smoke-real-world.mjs",
+    "eval": "tsx scripts/eval-retrieval.mts",
+    "prepublishOnly": "node -e \"if(!process.env.CI)throw new Error('publish via release.yml CI: push a v* tag. Manual npm publish is blocked to guarantee provenance + version sync.')\""
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "allowScripts": {
+    "better-sqlite3": true
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "chokidar": "^5.0.0",
+    "sqlite-vec": "^0.1.9",
+    "tree-sitter-wasms": "^0.1.13",
+    "web-tree-sitter": "^0.22.6",
+    "yaml": "^2.9.1"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.3.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0",
+    "@earendil-works/pi-coding-agent": ">=0.99.2",
+    "@types/node": "^22.0.0",
+    "typebox": "^1.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0",
+    "vitest": "^3.1.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "author": "alessandro@pungitore.ch",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pungggi/pi-context-engine.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pungggi/pi-context-engine/issues"
+  },
+  "homepage": "https://github.com/pungggi/pi-context-engine#readme"
 }

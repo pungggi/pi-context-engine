@@ -15,12 +15,12 @@ function withMemory<T>(fn: (memory: MemoryDb, dir: string) => Promise<T> | T): P
 }
 
 describe("MemoryDb", () => {
-	it("bootstraps the v3 schema idempotently", async () => {
+	it("bootstraps the v4 schema idempotently", async () => {
 		await withMemory(async (memory, dir) => {
-			expect(memory.schemaVersion()).toBe(3);
+			expect(memory.schemaVersion()).toBe(4);
 			memory.close();
 			const reopened = new MemoryDb(memoryDbPath(dir));
-			expect(reopened.schemaVersion()).toBe(3);
+			expect(reopened.schemaVersion()).toBe(4);
 			reopened.close();
 		});
 	});

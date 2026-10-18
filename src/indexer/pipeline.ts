@@ -402,7 +402,8 @@ async function runIndexingLocked(
 	options: { full?: boolean; targetPath?: string | null; callbacks?: IndexCallbacks },
 	runtime?: { backend: LocalBackend; embedder: Embedder },
 ): Promise<IndexResult> {
-	const { full = false, targetPath = null, callbacks = {} } = options;
+	let { full = false, targetPath = null } = options;
+	const { callbacks = {} } = options;
 	const { log, progress, phase } = callbacks;
 
 	const ownsBackend = runtime === undefined;
@@ -425,19 +426,29 @@ async function runIndexingLocked(
 	// can still delete their indexed chunks instead of orphaning them.
 	const preMigrationPaths = Object.keys(manifest.fileEntries);
 
-	if (backend.metricRebuilt) {
-		manifest.clearEntries();
-		log?.("  [migration] vector index rebuilt (cosine metric) — reindexing all files");
-	}
-
-	// Index-format migrations (e.g. v3 added R1 context headers) change how
-	// chunk content is built WITHOUT changing the file on disk, so the content
-	// hash alone would leave a stale, header-less index behind forever.
-	if (manifest.schemaVersion !== CURRENT_SCHEMA_VERSION) {
+	// Refuse unrecognized index formats outright (no compat reading): a
+	// manifest we can't recognize — pre-versioning, corrupt, or a future
+	// format — wipes every store and rebuilds from source below. The same gate
+	// covers format changes (e.g. v3 added R1 context headers) that alter chunk
+	// content WITHOUT changing the file on disk, which the content hash alone
+	// would never catch.
+	if (manifest.needsStoreReset) {
 		log?.(
-			`  [migration] index format v${manifest.schemaVersion} → v${CURRENT_SCHEMA_VERSION} — reindexing all files`,
+			`  [rebuild] index format v${manifest.schemaVersion} → v${CURRENT_SCHEMA_VERSION} — wiping stores, reindexing all files`,
 		);
+		backend.clear();
 		manifest.clearEntries();
+		// The wipe dropped the git-history chunks too; without resetting the
+		// pointer the next full run would only fetch NEW commits and the old
+		// ones would never come back.
+		manifest.lastGitSha = null;
+		// A wipe must rebuild everything in THIS run — a targeted run would
+		// leave the index empty except for the one target file.
+		if (targetPath !== null) {
+			log?.("  [rebuild] escalating targeted run to full reindex after store reset");
+			targetPath = null;
+		}
+		full = true;
 	}
 
 	const ignoreSet = new Set(config.indexerIgnore);
@@ -591,6 +602,9 @@ async function runIndexingLocked(
 				`  [migration] embedding dim changed (${manifest.embeddingDim} → ${emb.dimension}, backend=${emb.backendName}) — forcing full reindex`,
 			);
 			manifest.clearEntries();
+			// The dim swap dropped stored vectors (git history included); reset
+			// the pointer so the next full run re-fetches those commits too.
+			manifest.lastGitSha = null;
 		}
 	}
 

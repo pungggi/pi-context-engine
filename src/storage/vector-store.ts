@@ -27,18 +27,12 @@ type Sqlite = SqliteHandle;
 export class VectorStore {
 	private db: Sqlite;
 	private dim: number | null = null;
-	/** Set when a legacy L2 vec table was wiped — pipeline forces a full reindex. */
-	metricRebuilt = false;
 	constructor(dbPath: string) {
 		fs.mkdirSync(dbPath, { recursive: true });
 		// Without sqlite-vec the store still keeps chunk metadata; search()
 		// returns [] and retrieval continues FTS-only.
 		this.db = openDatabase(path.join(dbPath, "vectors.db")).db;
 		this.ensureTables();
-	}
-
-	private get vecAvailable(): boolean {
-		return this.dim !== null || this.vecTableExists();
 	}
 
 	private vecTableExists(): boolean {
@@ -61,10 +55,6 @@ export class VectorStore {
 				modified_ts REAL
 			)
 		`);
-		const cols = (this.db.pragma("table_info(chunks)") as { name: string }[]).map((c) => c.name);
-		if (!cols.includes("modified_ts")) {
-			this.db.exec("ALTER TABLE chunks ADD COLUMN modified_ts REAL");
-		}
 		this.db.exec("CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path)");
 		this.db.exec(`
 			CREATE TABLE IF NOT EXISTS chunk_compressions (
@@ -75,25 +65,19 @@ export class VectorStore {
 			)
 		`);
 
-		const row = this.db
-			.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_vec'")
-			.get() as { sql: string | null } | undefined;
-		if (row) {
-			if (!(row.sql ?? "").includes("distance_metric=cosine")) {
-				this.db.exec("DROP TABLE IF EXISTS chunks_vec");
-				this.db.exec("DELETE FROM chunks");
-				this.db.exec("DELETE FROM chunk_compressions");
-				this.metricRebuilt = true;
-			} else {
-				const r = this.db.prepare("SELECT rowid FROM chunks_vec LIMIT 1").get() as
-					| { rowid: number }
-					| undefined;
-				if (r) {
-					const len = this.db
-						.prepare("SELECT vec_length(embedding) AS len FROM chunks_vec LIMIT 1")
-						.get() as { len: number };
-					this.dim = len.len;
-				}
+		if (this.vecTableExists()) {
+			// The table exists — read its dimension. There is no migration path
+			// for tables this package did not write (older metric/column shapes):
+			// an unrecognized shape cannot occur from our own DDL, and foreign
+			// stores are unsupported by design.
+			const r = this.db.prepare("SELECT rowid FROM chunks_vec LIMIT 1").get() as
+				| { rowid: number }
+				| undefined;
+			if (r) {
+				const len = this.db
+					.prepare("SELECT vec_length(embedding) AS len FROM chunks_vec LIMIT 1")
+					.get() as { len: number };
+				this.dim = len.len;
 			}
 		}
 	}

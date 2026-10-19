@@ -48,8 +48,9 @@ jobs:
       - name: Cache embedding model
         uses: actions/cache@v6
         with:
-          # Model files are platform-independent (ONNX + tokenizer): one cache
-          # key shared across the OS matrix, `~` expands via homedir on Windows.
+          # Model files are platform-independent (ONNX + tokenizer), so one key
+          # fits all; GitHub partitions cache entries per OS, each runner simply
+          # gets its own under this key. `~` expands via homedir on Windows.
           path: ~/.pi-context-engine/models
           key: pce-embedding-model-v1
       - run: npm run smoke:loader

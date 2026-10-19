@@ -10,13 +10,23 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # Node 20 is intentionally excluded: better-sqlite3 12+ and the pi
         # runtime both assume Node 22+ APIs. Node 22 is the current LTS.
         node: [22.x]
+        # Windows is a first-class target (primary dev machine, better-sqlite3
+        # native builds, path handling) — upstream lesson from issue #130:
+        # don't let Windows-only failures go untested.
+        os: [ubuntu-latest, windows-latest]
+    # windows-latest defaults to PowerShell; steps below use bash pipelines
+    # (tee/grep). Runners ship Git Bash — pin it on every OS so the steps are
+    # byte-identical across the matrix.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -38,6 +48,8 @@ jobs:
       - name: Cache embedding model
         uses: actions/cache@v6
         with:
+          # Model files are platform-independent (ONNX + tokenizer): one cache
+          # key shared across the OS matrix, `~` expands via homedir on Windows.
           path: ~/.pi-context-engine/models
           key: pce-embedding-model-v1
       - run: npm run smoke:loader

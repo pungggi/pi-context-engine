@@ -1,6 +1,8 @@
 /**
- * Per-project memory.db — port of upstream `memory/db.py` (MIT), schema v3
+ * Per-project memory.db — port of upstream `memory/db.py` (MIT), schema v4
  * (minus `migrated_files`, which only served upstream's session-file import).
+ * Schema is enforced idempotently on every open (no version-step migrations),
+ * so databases from any earlier release converge to the current shape in place.
  * Synchronous better-sqlite3; vec tables degrade to FTS-only when the
  * sqlite-vec extension can't load.
  */
@@ -27,7 +29,7 @@ export const BUCKETS = [
 export type Bucket = (typeof BUCKETS)[number];
 
 const SCHEMA_V1 = `
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   project TEXT NOT NULL,
   started_at_epoch INTEGER NOT NULL,
@@ -40,9 +42,9 @@ CREATE TABLE sessions (
   rollup_summary TEXT,
   rollup_summary_at_epoch INTEGER
 );
-CREATE INDEX idx_sessions_started ON sessions(started_at_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at_epoch DESC);
 
-CREATE TABLE prompts (
+CREATE TABLE IF NOT EXISTS prompts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   prompt_number INTEGER NOT NULL,
@@ -51,16 +53,16 @@ CREATE TABLE prompts (
   created_at TEXT NOT NULL,
   UNIQUE(session_id, prompt_number)
 );
-CREATE INDEX idx_prompts_session ON prompts(session_id, prompt_number);
+CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id, prompt_number);
 
-CREATE TABLE tool_event_payloads (
+CREATE TABLE IF NOT EXISTS tool_event_payloads (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   raw_input TEXT NOT NULL,
   raw_output TEXT,
   size_bytes INTEGER NOT NULL
 );
 
-CREATE TABLE tool_events (
+CREATE TABLE IF NOT EXISTS tool_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   prompt_number INTEGER NOT NULL,
@@ -70,9 +72,9 @@ CREATE TABLE tool_events (
   created_at_epoch INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE INDEX idx_events_session_turn ON tool_events(session_id, prompt_number);
+CREATE INDEX IF NOT EXISTS idx_events_session_turn ON tool_events(session_id, prompt_number);
 
-CREATE TABLE turn_summaries (
+CREATE TABLE IF NOT EXISTS turn_summaries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   prompt_number INTEGER NOT NULL,
@@ -82,7 +84,7 @@ CREATE TABLE turn_summaries (
   UNIQUE(session_id, prompt_number)
 );
 
-CREATE TABLE decisions (
+CREATE TABLE IF NOT EXISTS decisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
   decision TEXT NOT NULL,
@@ -91,10 +93,10 @@ CREATE TABLE decisions (
   created_at_epoch INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE INDEX idx_decisions_created ON decisions(created_at_epoch DESC);
-CREATE INDEX idx_decisions_source ON decisions(source);
+CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_decisions_source ON decisions(source);
 
-CREATE TABLE code_areas (
+CREATE TABLE IF NOT EXISTS code_areas (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
   file_path TEXT NOT NULL,
@@ -102,9 +104,9 @@ CREATE TABLE code_areas (
   source TEXT NOT NULL CHECK(source IN ('manual','migrated','auto')) DEFAULT 'manual',
   created_at_epoch INTEGER NOT NULL
 );
-CREATE INDEX idx_code_areas_file ON code_areas(file_path);
+CREATE INDEX IF NOT EXISTS idx_code_areas_file ON code_areas(file_path);
 
-CREATE TABLE pending_compressions (
+CREATE TABLE IF NOT EXISTS pending_compressions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL CHECK(kind IN ('turn','session_rollup')),
   session_id TEXT NOT NULL,
@@ -115,44 +117,44 @@ CREATE TABLE pending_compressions (
   UNIQUE(kind, session_id, prompt_number)
 );
 
-CREATE VIRTUAL TABLE prompts_fts USING fts5(prompt_text, content='prompts', content_rowid='id');
-CREATE VIRTUAL TABLE decisions_fts USING fts5(decision, reason, content='decisions', content_rowid='id');
-CREATE VIRTUAL TABLE turn_summaries_fts USING fts5(summary, content='turn_summaries', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(prompt_text, content='prompts', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(decision, reason, content='decisions', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_fts USING fts5(summary, content='turn_summaries', content_rowid='id');
 
-CREATE TRIGGER prompts_ai AFTER INSERT ON prompts BEGIN
+CREATE TRIGGER IF NOT EXISTS prompts_ai AFTER INSERT ON prompts BEGIN
   INSERT INTO prompts_fts(rowid, prompt_text) VALUES (new.id, new.prompt_text);
 END;
-CREATE TRIGGER prompts_ad AFTER DELETE ON prompts BEGIN
+CREATE TRIGGER IF NOT EXISTS prompts_ad AFTER DELETE ON prompts BEGIN
   INSERT INTO prompts_fts(prompts_fts, rowid, prompt_text) VALUES('delete', old.id, old.prompt_text);
 END;
-CREATE TRIGGER prompts_au AFTER UPDATE ON prompts BEGIN
+CREATE TRIGGER IF NOT EXISTS prompts_au AFTER UPDATE ON prompts BEGIN
   INSERT INTO prompts_fts(prompts_fts, rowid, prompt_text) VALUES('delete', old.id, old.prompt_text);
   INSERT INTO prompts_fts(rowid, prompt_text) VALUES (new.id, new.prompt_text);
 END;
 
-CREATE TRIGGER decisions_ai AFTER INSERT ON decisions BEGIN
+CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
   INSERT INTO decisions_fts(rowid, decision, reason) VALUES (new.id, new.decision, new.reason);
 END;
-CREATE TRIGGER decisions_ad AFTER DELETE ON decisions BEGIN
+CREATE TRIGGER IF NOT EXISTS decisions_ad AFTER DELETE ON decisions BEGIN
   INSERT INTO decisions_fts(decisions_fts, rowid, decision, reason) VALUES('delete', old.id, old.decision, old.reason);
 END;
-CREATE TRIGGER decisions_au AFTER UPDATE ON decisions BEGIN
+CREATE TRIGGER IF NOT EXISTS decisions_au AFTER UPDATE ON decisions BEGIN
   INSERT INTO decisions_fts(decisions_fts, rowid, decision, reason) VALUES('delete', old.id, old.decision, old.reason);
   INSERT INTO decisions_fts(rowid, decision, reason) VALUES (new.id, new.decision, new.reason);
 END;
 
-CREATE TRIGGER turn_summaries_ai AFTER INSERT ON turn_summaries BEGIN
+CREATE TRIGGER IF NOT EXISTS turn_summaries_ai AFTER INSERT ON turn_summaries BEGIN
   INSERT INTO turn_summaries_fts(rowid, summary) VALUES (new.id, new.summary);
 END;
-CREATE TRIGGER turn_summaries_ad AFTER DELETE ON turn_summaries BEGIN
+CREATE TRIGGER IF NOT EXISTS turn_summaries_ad AFTER DELETE ON turn_summaries BEGIN
   INSERT INTO turn_summaries_fts(turn_summaries_fts, rowid, summary) VALUES('delete', old.id, old.summary);
 END;
-CREATE TRIGGER turn_summaries_au AFTER UPDATE ON turn_summaries BEGIN
+CREATE TRIGGER IF NOT EXISTS turn_summaries_au AFTER UPDATE ON turn_summaries BEGIN
   INSERT INTO turn_summaries_fts(turn_summaries_fts, rowid, summary) VALUES('delete', old.id, old.summary);
   INSERT INTO turn_summaries_fts(rowid, summary) VALUES (new.id, new.summary);
 END;
 
-CREATE TABLE schema_versions (
+CREATE TABLE IF NOT EXISTS schema_versions (
   version INTEGER PRIMARY KEY,
   applied_at_epoch INTEGER NOT NULL
 );
@@ -213,47 +215,31 @@ export class MemoryDb {
 	}
 
 	private ensureSchema(): void {
-		const bootstrap = this.db
-			.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_versions'")
-			.get();
-		if (!bootstrap) {
-			const run = this.db.transaction(() => {
-				this.db.exec(SCHEMA_V1);
-				if (this.hasVec) {
-					this.db.exec(this.vecTableStmts(VEC_DIM));
-					this.db.exec(VEC_TRIGGERS);
-				}
-				this.db.exec(SCHEMA_V3);
-				this.applyV4Columns();
-				this.db.exec(SCHEMA_V4);
-				this.db
-					.prepare("INSERT INTO schema_versions (version, applied_at_epoch) VALUES (?, ?)")
-					.run(this.hasVec ? CURRENT_VERSION : 1, epochSeconds());
-			});
-			run();
-			return;
-		}
-		const current = this.schemaVersion();
-		if (current >= CURRENT_VERSION) return;
+		// Shape enforcement instead of a version ladder: every statement below
+		// is idempotent, so a database from ANY earlier release converges to the
+		// current schema on open without version bookkeeping or stepwise
+		// migrations. Vec tables are created whenever sqlite-vec is available
+		// (and skipped when it isn't), which subsumes the old "created without
+		// vec, upgrade later" version dance.
 		const run = this.db.transaction(() => {
-			if (current < 2 && this.hasVec) {
+			this.db.exec(SCHEMA_V1);
+			this.applyV4Columns();
+			this.db.exec(SCHEMA_V3);
+			this.db.exec(SCHEMA_V4);
+			if (this.hasVec) {
 				this.db.exec(this.vecTableStmts(VEC_DIM));
 				this.db.exec(VEC_TRIGGERS);
 			}
-			if (current < 3) this.db.exec(SCHEMA_V3);
-			if (current < 4) {
-				this.applyV4Columns();
-				this.db.exec(SCHEMA_V4);
-			}
-			if (current < 2 && !this.hasVec) return; // vec step still pending
+			// Informational stamp only — nothing branches on it anymore.
 			this.db
-				.prepare("INSERT INTO schema_versions (version, applied_at_epoch) VALUES (?, ?)")
+				.prepare("INSERT OR REPLACE INTO schema_versions (version, applied_at_epoch) VALUES (?, ?)")
 				.run(CURRENT_VERSION, epochSeconds());
 		});
 		run();
 	}
 
-	/** v4 adds `decisions.tags` / `decisions.files` (JSON arrays); ALTER is guarded so re-runs and partial states stay safe. */
+	/** `decisions.tags` / `decisions.files` (JSON arrays) on databases created
+	 * before R13; guarded so re-runs and partial states stay safe. */
 	private applyV4Columns(): void {
 		const cols = new Set(
 			(this.db.prepare("PRAGMA table_info(decisions)").all() as { name: string }[]).map((c) => c.name),

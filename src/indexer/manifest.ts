@@ -17,29 +17,47 @@ interface ManifestData {
 export class Manifest {
 	private entries: Record<string, string> = {};
 	private schemaVersionValue: number = CURRENT_SCHEMA_VERSION;
+	/** Set when an existing manifest was unreadable or not in the recognized
+	 * format — the pipeline wipes the index stores so no stale rows survive. */
+	private storeResetNeeded = false;
 	private lastGitShaValue: string | null = null;
 	private embeddingDimValue: number | null = null;
 
 	constructor(private readonly manifestPath: string) {
-		if (fs.existsSync(manifestPath)) {
-			try {
-				const loaded = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as ManifestData;
-				if (loaded && typeof loaded === "object") {
-					if ("__schema_version" in loaded) {
-						this.schemaVersionValue = loaded.__schema_version ?? 1;
-						this.entries = loaded.files ?? {};
-						this.lastGitShaValue = loaded.last_git_sha ?? null;
-						this.embeddingDimValue = loaded.embedding_dim ?? null;
-					} else {
-						// Old plain-dict format (pre-v0.2) — treat as version 1.
-						this.schemaVersionValue = 1;
-						this.entries = loaded as unknown as Record<string, string>;
-					}
-				}
-			} catch {
-				this.entries = {};
+		if (!fs.existsSync(manifestPath)) return;
+		// An existing manifest must prove it is in the recognized versioned
+		// format; until it does, it is treated as foreign (version 0) and the
+		// pipeline wipes the stores before rebuilding. No compat parsing of
+		// pre-versioning shapes.
+		let recognized = false;
+		try {
+			const loaded = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as ManifestData;
+			const version = loaded && typeof loaded === "object" ? loaded.__schema_version : undefined;
+			const files = loaded && typeof loaded === "object" ? loaded.files : undefined;
+			if (
+				typeof version === "number" &&
+				version > 0 &&
+				files !== null &&
+				typeof files === "object" &&
+				!Array.isArray(files)
+			) {
+				recognized = true;
+				this.schemaVersionValue = version;
+				this.entries = files ?? {};
+				this.lastGitShaValue = loaded.last_git_sha ?? null;
+				this.embeddingDimValue = loaded.embedding_dim ?? null;
 			}
+		} catch {
+			// corrupt JSON — falls through to the reset below
 		}
+		if (!recognized) this.schemaVersionValue = 0;
+		this.storeResetNeeded = !recognized || this.schemaVersionValue !== CURRENT_SCHEMA_VERSION;
+	}
+
+	/** True when the on-disk manifest was unusable/foreign and the index stores
+	 * must be wiped before this run repopulates them. */
+	get needsStoreReset(): boolean {
+		return this.storeResetNeeded;
 	}
 
 	get lastGitSha(): string | null {

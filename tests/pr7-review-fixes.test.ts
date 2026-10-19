@@ -105,12 +105,14 @@ describe("PR #7: migration clearEntries no longer orphans deleted files", () => 
 		// File vanishes from disk BEFORE the run that migrates the index format.
 		fs.rmSync(path.join(projectDir, "src/gone.ts"));
 
-		// Simulate a format migration: stale schemaVersion makes the pipeline
-		// clearEntries() before re-walking, exactly like a real format bump.
+		// Simulate an install still on the previous index format (v2, the last
+		// one this package wrote before context headers): the version gate must
+		// wipe the stores (so gone.ts's chunks cannot survive) and reindex from
+		// source.
 		const storageRoot = (engine as unknown as { config: Config }).config.storagePath;
 		const manifestPath = path.join(projectStorageDir(storageRoot, projectDir), "manifest.json");
-		const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as { schemaVersion?: number };
-		const bumped = { ...parsed, schemaVersion: (parsed.schemaVersion ?? 1) - 1 };
+		const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as { __schema_version?: number };
+		const bumped = { ...parsed, __schema_version: (parsed.__schema_version ?? 1) - 1 };
 		fs.writeFileSync(manifestPath, JSON.stringify(bumped));
 
 		await engine.reindex({});

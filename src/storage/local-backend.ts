@@ -20,10 +20,6 @@ export class LocalBackend {
 		this.graphStore = new GraphStore(path.join(basePath, "graph"));
 	}
 
-	get metricRebuilt(): boolean {
-		return this.vectorStore.metricRebuilt;
-	}
-
 	ingest(chunks: Chunk[], nodes: GraphNode[], edges: GraphEdge[]): void {
 		this.vectorStore.ingest(chunks);
 		this.ftsStore.ingest(chunks);

@@ -10,19 +10,35 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # Node 20 is intentionally excluded: better-sqlite3 12+ and the pi
         # runtime both assume Node 22+ APIs. Node 22 is the current LTS.
         node: [22.x]
+        # Windows is a first-class target (primary dev machine, better-sqlite3
+        # native builds, path handling) — upstream lesson from issue #130:
+        # don't let Windows-only failures go untested.
+        os: [ubuntu-latest, windows-latest]
+    # windows-latest defaults to PowerShell; steps below use bash pipelines
+    # (tee/grep). Runners ship Git Bash — pin it on every OS so the steps are
+    # byte-identical across the matrix.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # npm >= 11 on every OS (same rule as release.yml). Node 22's bundled
+      # npm 10 auto-runs `node-gyp rebuild` for any package with a binding.gyp
+      # — on windows-latest that phantom build dies on VS detection (node-gyp
+      # 11.5 cannot parse VS 18). better-sqlite3 ships bundled prebuilds and
+      # needs no build; npm 11 skips the auto-gyp entirely.
+      - run: npm install -g npm@latest
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
@@ -38,6 +54,9 @@ jobs:
       - name: Cache embedding model
         uses: actions/cache@v6
         with:
+          # Model files are platform-independent (ONNX + tokenizer), so one key
+          # fits all; GitHub partitions cache entries per OS, each runner simply
+          # gets its own under this key. `~` expands via homedir on Windows.
           path: ~/.pi-context-engine/models
           key: pce-embedding-model-v1
       - run: npm run smoke:loader

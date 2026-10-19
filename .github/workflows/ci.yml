@@ -33,6 +33,12 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # npm >= 11 on every OS (same rule as release.yml). Node 22's bundled
+      # npm 10 auto-runs `node-gyp rebuild` for any package with a binding.gyp
+      # — on windows-latest that phantom build dies on VS detection (node-gyp
+      # 11.5 cannot parse VS 18). better-sqlite3 ships bundled prebuilds and
+      # needs no build; npm 11 skips the auto-gyp entirely.
+      - run: npm install -g npm@latest
       - run: npm ci
       - run: npm run typecheck
       - run: npm test

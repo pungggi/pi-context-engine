@@ -93,6 +93,8 @@ export interface Config {
 	indexerIgnore: string[];
 	/** Prepend the R1 context header (path/lang/unit/imports) to chunk content. */
 	indexerContextHeaders: boolean;
+	/** Run an incremental reindex in the background shortly after session start. */
+	indexerAutoIndex: boolean;
 	indexerRedactSecrets: boolean;
 	memoryRedactPii: boolean;
 	pricingModel: string;
@@ -125,6 +127,7 @@ export function defaultConfig(): Config {
 		indexerChunkBudgetChars: 1200,
 		indexerIgnore: [...DEFAULT_IGNORE],
 		indexerContextHeaders: true,
+		indexerAutoIndex: true,
 		indexerRedactSecrets: true,
 		memoryRedactPii: true,
 		pricingModel: "opus",
@@ -158,6 +161,7 @@ const MAPPING: Record<string, keyof Config> = {
 	"indexer.chunk_budget_chars": "indexerChunkBudgetChars",
 	"indexer.ignore": "indexerIgnore",
 	"indexer.context_headers": "indexerContextHeaders",
+	"indexer.auto_index": "indexerAutoIndex",
 	"indexer.redact_secrets": "indexerRedactSecrets",
 	"memory.redact_pii": "memoryRedactPii",
 	"storage.path": "storagePath",

@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Config } from "../config.js";
-import { projectStorageDir, sha256Hex } from "../utils.js";
+import { projectStorageDir, sha256Hex, yieldToEventLoop } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
 import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
@@ -594,319 +594,338 @@ async function runIndexingLocked(
 		return { embedder: holders.embedder, cache: holders.cache };
 	};
 
-	// Dimension migration: a backend swap invalidates every stored vector.
-	if (fileList.length > 0 && manifest.embeddingDim !== null && manifest.hasEntries) {
-		const { embedder: emb } = await ensureEmbedder();
-		if (manifest.embeddingDim !== emb.dimension) {
-			log?.(
-				`  [migration] embedding dim changed (${manifest.embeddingDim} → ${emb.dimension}, backend=${emb.backendName}) — forcing full reindex`,
-			);
-			manifest.clearEntries();
-			// The dim swap dropped stored vectors (git history included); reset
-			// the pointer so the next full run re-fetches those commits too.
-			manifest.lastGitSha = null;
-		}
-	}
+	// Everything after this point can reject (embed failures, backend
+	// crashes, IO). The finally at the end of the function releases the
+	// cache/backend handles on every path: an open handle wedges re-runs
+	// and tests (on Windows an open handle makes the storage directory
+	// undeletable, which is how this was caught).
+	try {
 
-	const currentRelPaths = new Set<string>();
-	const totalBatches = Math.max(1, Math.ceil(fileList.length / BATCH));
-	let announced = false;
-	let totalCacheHits = 0;
-	let totalCacheMisses = 0;
-
-	for (let batchIndex = 0; batchIndex < fileList.length; batchIndex += BATCH) {
-		const batchPaths = fileList.slice(batchIndex, batchIndex + BATCH);
-		const toChunk: { filePath: string; relPath: string; content: string; contentHash: string; language: string }[] = [];
-
-		for (const filePath of batchPaths) {
-			const relPath = path.relative(projectDir, filePath).replace(/\\/g, "/");
-			currentRelPaths.add(relPath);
-			let content = safeRead(filePath);
-			if (content === null) {
-				result.skippedFiles.push(relPath);
-				log?.(`  [skip] ${relPath} (binary or unreadable)`);
-				continue;
+		// Dimension migration: a backend swap invalidates every stored vector.
+		if (fileList.length > 0 && manifest.embeddingDim !== null && manifest.hasEntries) {
+			const { embedder: emb } = await ensureEmbedder();
+			if (manifest.embeddingDim !== emb.dimension) {
+				log?.(
+					`  [migration] embedding dim changed (${manifest.embeddingDim} → ${emb.dimension}, backend=${emb.backendName}) — forcing full reindex`,
+				);
+				manifest.clearEntries();
+				// The dim swap dropped stored vectors (git history included); reset
+				// the pointer so the next full run re-fetches those commits too.
+				manifest.lastGitSha = null;
 			}
-			if (config.indexerRedactSecrets) {
-				const redacted = redactSecrets(content);
-				if (redacted.labels.length > 0) {
-					content = redacted.text;
-					log?.(`  [redact] ${relPath} (${redacted.labels.length} secret(s))`);
-				}
-			}
-			const contentHash = sha256Hex(content);
-			if (!full && !manifest.hasChanged(relPath, contentHash)) {
-				log?.(`  [skip] ${relPath} (unchanged)`);
-				continue;
-			}
-			toChunk.push({
-				filePath,
-				relPath,
-				content,
-				contentHash,
-				language: LANGUAGE_MAP[path.extname(filePath).toLowerCase()] ?? "plaintext",
-			});
 		}
 
-		const batchChunks: Chunk[] = [];
-		const batchNodes: GraphNode[] = [];
-		const batchEdges: GraphEdge[] = [];
-		const batchFilesToReplace: string[] = [];
-		const batchManifestUpdates: [string, string][] = [];
-		const batchIndexed: string[] = [];
+		const currentRelPaths = new Set<string>();
+		const totalBatches = Math.max(1, Math.ceil(fileList.length / BATCH));
+		let announced = false;
+		let totalCacheHits = 0;
+		let totalCacheMisses = 0;
 
-		for (const item of toChunk) {
-			changedRelPaths.add(item.relPath);
-			let chunks: Chunk[] = [];
-			let importedModules: string[] = [];
-			let importSpecs: string[] = [];
-			try {
-				if (isAstLanguage(item.language)) {
-					const out = chunker.chunkWithImports(item.content, item.relPath, item.language, {
-							chunking: config.indexerChunking,
-							budgetChars: config.indexerChunkBudgetChars,
-						});
-					chunks = out.chunks;
-					importedModules = out.imports;
-					importSpecs = out.importSpecs;
+		for (let batchIndex = 0; batchIndex < fileList.length; batchIndex += BATCH) {
+			// Cooperative yield: the loops below do sync I/O, tree-sitter parsing
+			// and ONNX inference on the main thread. Without a breather per unit
+			// of work the pi UI starves for the whole run (bench-event-loop.mts:
+			// ~0.5-0.9 s event-loop stalls per batch before this).
+			await yieldToEventLoop();
+			const batchPaths = fileList.slice(batchIndex, batchIndex + BATCH);
+			const toChunk: { filePath: string; relPath: string; content: string; contentHash: string; language: string }[] = [];
+
+			for (const filePath of batchPaths) {
+				await yieldToEventLoop();
+				const relPath = path.relative(projectDir, filePath).replace(/\\/g, "/");
+				currentRelPaths.add(relPath);
+				let content = safeRead(filePath);
+				if (content === null) {
+					result.skippedFiles.push(relPath);
+					log?.(`  [skip] ${relPath} (binary or unreadable)`);
+					continue;
 				}
-				if (chunks.length === 0) {
-					// Fallback: module-level chunk (upstream _fallback_chunk).
-					chunks = [
-						{
-							id: sha256Hex(`${item.relPath}:module`).slice(0, 16),
-							content: item.content,
-							chunkType: "module",
-							filePath: item.relPath,
-							startLine: 1,
-							endLine: Math.max(1, item.content.trim().split("\n").length),
-							language: item.language,
-							metadata: {},
-							embedding: null,
-							confidenceScore: 0,
-							compressedContent: null,
-						},
-					];
+				if (config.indexerRedactSecrets) {
+					const redacted = redactSecrets(content);
+					if (redacted.labels.length > 0) {
+						content = redacted.text;
+						log?.(`  [redact] ${relPath} (${redacted.labels.length} secret(s))`);
+					}
 				}
-			} catch (err) {
-				result.errors.push(`Chunking failed for ${item.relPath}: ${(err as Error).message}`);
-				continue;
+				const contentHash = sha256Hex(content);
+				if (!full && !manifest.hasChanged(relPath, contentHash)) {
+					log?.(`  [skip] ${relPath} (unchanged)`);
+					continue;
+				}
+				toChunk.push({
+					filePath,
+					relPath,
+					content,
+					contentHash,
+					language: LANGUAGE_MAP[path.extname(filePath).toLowerCase()] ?? "plaintext",
+				});
 			}
 
-			// Stamp mtime so the recency weight has real signal.
-			let mtime: number | null = null;
-			try {
-				mtime = fs.statSync(item.filePath).mtimeMs / 1000;
-			} catch {
-				mtime = null;
-			}
-			if (mtime !== null) for (const c of chunks) c.metadata["modified_ts"] = mtime;
+			const batchChunks: Chunk[] = [];
+			const batchNodes: GraphNode[] = [];
+			const batchEdges: GraphEdge[] = [];
+			const batchFilesToReplace: string[] = [];
+			const batchManifestUpdates: [string, string][] = [];
+			const batchIndexed: string[] = [];
 
-			batchFilesToReplace.push(item.relPath);
-			const fileNodeId = `file_${item.relPath}`;
-			batchNodes.push({
-				id: fileNodeId,
-				nodeType: "file",
-				name: path.basename(item.filePath),
-				filePath: item.relPath,
-				properties: {},
-			});
-			for (const spec of importSpecs) {
-				// R7: resolve relative specifiers to a real indexed file. Before this,
-				// edges pointed at `module_<spec>` nodes that were never created, so
-				// every imports-edge JOIN silently produced nothing and
-				// related_context / getRelatedFilePaths were dead code. Bare package
-				// imports ("react", "node:fs") stay out: they resolve to nothing in
-				// the index and would only add noise.
-				const resolved = resolveImportPath(spec, item.relPath, knownFiles);
-				if (resolved) {
-					batchEdges.push({
-						sourceId: fileNodeId,
-						targetId: `file_${resolved}`,
-						edgeType: "imports",
-						properties: {},
-					});
+			for (const item of toChunk) {
+				await yieldToEventLoop();
+				changedRelPaths.add(item.relPath);
+				let chunks: Chunk[] = [];
+				let importedModules: string[] = [];
+				let importSpecs: string[] = [];
+				try {
+					if (isAstLanguage(item.language)) {
+						const out = chunker.chunkWithImports(item.content, item.relPath, item.language, {
+								chunking: config.indexerChunking,
+								budgetChars: config.indexerChunkBudgetChars,
+							});
+						chunks = out.chunks;
+						importedModules = out.imports;
+						importSpecs = out.importSpecs;
+					}
+					if (chunks.length === 0) {
+						// Fallback: module-level chunk (upstream _fallback_chunk).
+						chunks = [
+							{
+								id: sha256Hex(`${item.relPath}:module`).slice(0, 16),
+								content: item.content,
+								chunkType: "module",
+								filePath: item.relPath,
+								startLine: 1,
+								endLine: Math.max(1, item.content.trim().split("\n").length),
+								language: item.language,
+								metadata: {},
+								embedding: null,
+								confidenceScore: 0,
+								compressedContent: null,
+							},
+						];
+					}
+				} catch (err) {
+					result.errors.push(`Chunking failed for ${item.relPath}: ${(err as Error).message}`);
+					continue;
 				}
-			}
-			for (const chunk of chunks) {
-				const nodeName =
-					(typeof chunk.metadata["unit"] === "string" && chunk.metadata["unit"]) ||
-					(chunk.content.includes("(") ? chunk.content.split("(")[0]!.split(":").pop()!.trim() : chunk.id);
+
+				// Stamp mtime so the recency weight has real signal.
+				let mtime: number | null = null;
+				try {
+					mtime = fs.statSync(item.filePath).mtimeMs / 1000;
+				} catch {
+					mtime = null;
+				}
+				if (mtime !== null) for (const c of chunks) c.metadata["modified_ts"] = mtime;
+
+				batchFilesToReplace.push(item.relPath);
+				const fileNodeId = `file_${item.relPath}`;
 				batchNodes.push({
-					id: chunk.id,
-					nodeType: CHUNK_TO_NODE_TYPE[chunk.chunkType] ?? "module",
-					name: nodeName,
+					id: fileNodeId,
+					nodeType: "file",
+					name: path.basename(item.filePath),
 					filePath: item.relPath,
 					properties: {},
 				});
-				batchEdges.push({
-					sourceId: fileNodeId,
-					targetId: chunk.id,
-					edgeType: "defines",
-					properties: {},
-				});
-				// R7 calls-graph collection (raw content, before the context header
-				// prepends file paths and `defines:` lists that would pollute the
-				// identifier set).
-				const unit = typeof chunk.metadata["unit"] === "string" ? chunk.metadata["unit"] : "";
-				if (chunk.chunkType === "function" || chunk.chunkType === "class") {
-					const short = unit.includes(".") ? unit.slice(unit.lastIndexOf(".") + 1) : unit;
-					if (short.length >= 3 && !CALL_GRAPH_STOPLIST.has(short)) {
-						let owners = symbolOwners.get(short);
-						if (!owners) symbolOwners.set(short, (owners = []));
-						owners.push({ id: chunk.id, filePath: item.relPath });
+				for (const spec of importSpecs) {
+					// R7: resolve relative specifiers to a real indexed file. Before this,
+					// edges pointed at `module_<spec>` nodes that were never created, so
+					// every imports-edge JOIN silently produced nothing and
+					// related_context / getRelatedFilePaths were dead code. Bare package
+					// imports ("react", "node:fs") stay out: they resolve to nothing in
+					// the index and would only add noise.
+					const resolved = resolveImportPath(spec, item.relPath, knownFiles);
+					if (resolved) {
+						batchEdges.push({
+							sourceId: fileNodeId,
+							targetId: `file_${resolved}`,
+							edgeType: "imports",
+							properties: {},
+						});
 					}
 				}
-				if (chunk.chunkType !== "module") {
-					runChunks.push({
+				for (const chunk of chunks) {
+					const nodeName =
+						(typeof chunk.metadata["unit"] === "string" && chunk.metadata["unit"]) ||
+						(chunk.content.includes("(") ? chunk.content.split("(")[0]!.split(":").pop()!.trim() : chunk.id);
+					batchNodes.push({
 						id: chunk.id,
+						nodeType: CHUNK_TO_NODE_TYPE[chunk.chunkType] ?? "module",
+						name: nodeName,
 						filePath: item.relPath,
-						identifiers: extractIdentifiers(chunk.content),
+						properties: {},
+					});
+					batchEdges.push({
+						sourceId: fileNodeId,
+						targetId: chunk.id,
+						edgeType: "defines",
+						properties: {},
+					});
+					// R7 calls-graph collection (raw content, before the context header
+					// prepends file paths and `defines:` lists that would pollute the
+					// identifier set).
+					const unit = typeof chunk.metadata["unit"] === "string" ? chunk.metadata["unit"] : "";
+					if (chunk.chunkType === "function" || chunk.chunkType === "class") {
+						const short = unit.includes(".") ? unit.slice(unit.lastIndexOf(".") + 1) : unit;
+						if (short.length >= 3 && !CALL_GRAPH_STOPLIST.has(short)) {
+							let owners = symbolOwners.get(short);
+							if (!owners) symbolOwners.set(short, (owners = []));
+							owners.push({ id: chunk.id, filePath: item.relPath });
+						}
+					}
+					if (chunk.chunkType !== "module") {
+						runChunks.push({
+							id: chunk.id,
+							filePath: item.relPath,
+							identifiers: extractIdentifiers(chunk.content),
+						});
+					}
+				}
+				// R1 context headers go on LAST: graph node names above derive from raw
+				// content, and every downstream consumer (embed, FTS, compression,
+				// expand_chunk) reads `chunk.content`, so one prepend covers them all.
+				if (config.indexerContextHeaders) {
+					for (const chunk of chunks) applyContextHeaderToChunk(chunk, importedModules);
+				}
+				batchChunks.push(...chunks);
+				batchManifestUpdates.push([item.relPath, item.contentHash]);
+				batchIndexed.push(item.relPath);
+			}
+
+			progress?.(Math.min(batchIndex + batchPaths.length, fileList.length), fileList.length);
+
+			if (batchChunks.length > 0) {
+				const { embedder: emb, cache: cch } = await ensureEmbedder();
+				if (phase && !announced) {
+					phase(`Embedding ${batchChunks.length.toLocaleString()} chunks${totalBatches > 1 ? ` (batch ${Math.floor(batchIndex / BATCH) + 1}/${totalBatches})` : ""}…`);
+					announced = true;
+				}
+				const stats = await embedChunks(batchChunks, emb, cch);
+				totalCacheHits += stats.hits;
+				totalCacheMisses += stats.misses;
+				// Per-batch deletes happen AFTER embed succeeds, so an embed failure
+				// can never wipe previously-indexed rows.
+				backend.deleteByFiles(batchFilesToReplace);
+				backend.ingest(batchChunks, batchNodes, batchEdges);
+				for (const [rel, hash] of batchManifestUpdates) manifest.update(rel, hash);
+				result.indexedFiles.push(...batchIndexed);
+				result.totalChunks += batchChunks.length;
+			} else if (batchFilesToReplace.length > 0) {
+				backend.deleteByFiles(batchFilesToReplace);
+				for (const [rel, hash] of batchManifestUpdates) manifest.update(rel, hash);
+				result.indexedFiles.push(...batchIndexed);
+			}
+			result.skippedFiles.push(...toChunk.filter((t) => !batchIndexed.includes(t.relPath)).map((t) => t.relPath));
+		}
+
+		// ── R7: emit chunk→chunk calls edges ──────────────────────────────────
+		// Runs AFTER all batches so the symbol table is complete regardless of
+		// batch order. Cross-file only: intra-file structure is already covered
+		// by file/defines edges. Capped per chunk — a retrieval prior, not a
+		// faithful call graph.
+		{
+			// PR #7 review fix (incremental call graph): derive over ALL indexed
+			// files, not just this run's changes. deleteByFiles(changed) removes
+			// call edges touching changed chunk nodes in BOTH directions, so a
+			// run-only derivation silently dropped (a) changed files' calls into
+			// unchanged files and (b) unchanged callers' edges into changed files.
+			// Re-deriving from every indexed file recreates exactly the deleted
+			// edges; unchanged→unchanged duplicates collapse on the edge PK
+			// (INSERT OR REPLACE).
+			const callsEdges: GraphEdge[] = [];
+			const derivationSources = [...runChunks];
+			const changedThisRun = changedRelPaths;
+			for (const rel of Object.keys(manifest.fileEntries)) {
+				if (changedThisRun.has(rel)) continue;
+				for (const stored of backend.chunksByFile(rel, 500)) {
+					if (stored.chunkType === "module") continue;
+					derivationSources.push({
+						id: stored.id,
+						filePath: rel,
+						// Stored content carries the R1 context header; strip it so
+						// header tokens cannot pollute the identifier set.
+						identifiers: extractIdentifiers(stripContextHeader(stored.content)),
 					});
 				}
 			}
-			// R1 context headers go on LAST: graph node names above derive from raw
-			// content, and every downstream consumer (embed, FTS, compression,
-			// expand_chunk) reads `chunk.content`, so one prepend covers them all.
-			if (config.indexerContextHeaders) {
-				for (const chunk of chunks) applyContextHeaderToChunk(chunk, importedModules);
+			// Symbol owners over all files: run chunks first (fresh), then graph
+			// nodes of files that did not change (they are still valid).
+			for (const node of backend.listSymbolNodes()) {
+				if (changedThisRun.has(node.filePath)) continue;
+				const short = node.name.includes(".") ? node.name.slice(node.name.lastIndexOf(".") + 1) : node.name;
+				if (short.length < 3 || CALL_GRAPH_STOPLIST.has(short)) continue;
+				let owners = symbolOwners.get(short);
+				if (!owners) symbolOwners.set(short, (owners = []));
+				owners.push({ id: node.id, filePath: node.filePath });
 			}
-			batchChunks.push(...chunks);
-			batchManifestUpdates.push([item.relPath, item.contentHash]);
-			batchIndexed.push(item.relPath);
-		}
-
-		progress?.(Math.min(batchIndex + batchPaths.length, fileList.length), fileList.length);
-
-		if (batchChunks.length > 0) {
-			const { embedder: emb, cache: cch } = await ensureEmbedder();
-			if (phase && !announced) {
-				phase(`Embedding ${batchChunks.length.toLocaleString()} chunks${totalBatches > 1 ? ` (batch ${Math.floor(batchIndex / BATCH) + 1}/${totalBatches})` : ""}…`);
-				announced = true;
-			}
-			const stats = await embedChunks(batchChunks, emb, cch);
-			totalCacheHits += stats.hits;
-			totalCacheMisses += stats.misses;
-			// Per-batch deletes happen AFTER embed succeeds, so an embed failure
-			// can never wipe previously-indexed rows.
-			backend.deleteByFiles(batchFilesToReplace);
-			backend.ingest(batchChunks, batchNodes, batchEdges);
-			for (const [rel, hash] of batchManifestUpdates) manifest.update(rel, hash);
-			result.indexedFiles.push(...batchIndexed);
-			result.totalChunks += batchChunks.length;
-		} else if (batchFilesToReplace.length > 0) {
-			backend.deleteByFiles(batchFilesToReplace);
-			for (const [rel, hash] of batchManifestUpdates) manifest.update(rel, hash);
-			result.indexedFiles.push(...batchIndexed);
-		}
-		result.skippedFiles.push(...toChunk.filter((t) => !batchIndexed.includes(t.relPath)).map((t) => t.relPath));
-	}
-
-	// ── R7: emit chunk→chunk calls edges ──────────────────────────────────
-	// Runs AFTER all batches so the symbol table is complete regardless of
-	// batch order. Cross-file only: intra-file structure is already covered
-	// by file/defines edges. Capped per chunk — a retrieval prior, not a
-	// faithful call graph.
-	{
-		// PR #7 review fix (incremental call graph): derive over ALL indexed
-		// files, not just this run's changes. deleteByFiles(changed) removes
-		// call edges touching changed chunk nodes in BOTH directions, so a
-		// run-only derivation silently dropped (a) changed files' calls into
-		// unchanged files and (b) unchanged callers' edges into changed files.
-		// Re-deriving from every indexed file recreates exactly the deleted
-		// edges; unchanged→unchanged duplicates collapse on the edge PK
-		// (INSERT OR REPLACE).
-		const callsEdges: GraphEdge[] = [];
-		const derivationSources = [...runChunks];
-		const changedThisRun = changedRelPaths;
-		for (const rel of Object.keys(manifest.fileEntries)) {
-			if (changedThisRun.has(rel)) continue;
-			for (const stored of backend.chunksByFile(rel, 500)) {
-				if (stored.chunkType === "module") continue;
-				derivationSources.push({
-					id: stored.id,
-					filePath: rel,
-					// Stored content carries the R1 context header; strip it so
-					// header tokens cannot pollute the identifier set.
-					identifiers: extractIdentifiers(stripContextHeader(stored.content)),
-				});
-			}
-		}
-		// Symbol owners over all files: run chunks first (fresh), then graph
-		// nodes of files that did not change (they are still valid).
-		for (const node of backend.listSymbolNodes()) {
-			if (changedThisRun.has(node.filePath)) continue;
-			const short = node.name.includes(".") ? node.name.slice(node.name.lastIndexOf(".") + 1) : node.name;
-			if (short.length < 3 || CALL_GRAPH_STOPLIST.has(short)) continue;
-			let owners = symbolOwners.get(short);
-			if (!owners) symbolOwners.set(short, (owners = []));
-			owners.push({ id: node.id, filePath: node.filePath });
-		}
-		for (const src of derivationSources) {
-			let out = 0;
-			for (const ident of src.identifiers) {
-				if (out >= CALLS_EDGES_PER_CHUNK) break;
-				for (const owner of symbolOwners.get(ident) ?? []) {
-					if (owner.filePath === src.filePath) continue;
-					callsEdges.push({ sourceId: src.id, targetId: owner.id, edgeType: "calls", properties: {} });
-					out += 1;
+			for (const src of derivationSources) {
+				let out = 0;
+				for (const ident of src.identifiers) {
 					if (out >= CALLS_EDGES_PER_CHUNK) break;
+					for (const owner of symbolOwners.get(ident) ?? []) {
+						if (owner.filePath === src.filePath) continue;
+						callsEdges.push({ sourceId: src.id, targetId: owner.id, edgeType: "calls", properties: {} });
+						out += 1;
+						if (out >= CALLS_EDGES_PER_CHUNK) break;
+					}
+				}
+			}
+			if (callsEdges.length > 0) {
+					backend.ingest([], [], callsEdges);
+					log?.(`  [graph] ${callsEdges.length} cross-file call edge(s)`);
+				}
+		}
+
+		// ── Git history on full runs ──────────────────────────────────────────
+		if (full && !targetPath && fs.existsSync(path.join(projectDir, ".git"))) {
+			try {
+				const git = await indexCommits(projectDir, manifest.lastGitSha);
+				if (git.chunks.length > 0) {
+					const { embedder: emb, cache: cch } = await ensureEmbedder();
+					phase?.(`Embedding ${git.chunks.length} git commits…`);
+					const stats = await embedChunks(git.chunks, emb, cch);
+					totalCacheHits += stats.hits;
+					totalCacheMisses += stats.misses;
+					backend.ingest(git.chunks, git.nodes, git.edges);
+					result.totalChunks += git.chunks.length;
+					if (git.headSha) manifest.lastGitSha = git.headSha;
+					log?.(`  [git] ${git.chunks.length} commit(s) indexed`);
+				}
+			} catch (err) {
+				result.errors.push(`git history indexing failed: ${(err as Error).message}`);
+			}
+		}
+
+		// ── Prune files that vanished from disk ───────────────────────────────
+		if (!targetPath) {
+			const previousPaths = new Set([...Object.keys(manifest.fileEntries), ...preMigrationPaths]);
+			const removed = [...previousPaths].filter((rel) => !currentRelPaths.has(rel));
+			if (removed.length > 0) {
+				backend.deleteByFiles(removed);
+				for (const rel of removed) {
+					manifest.remove(rel);
+					result.deletedFiles.push(rel);
+					log?.(`  [delete] ${rel} (no longer on disk)`);
 				}
 			}
 		}
-		if (callsEdges.length > 0) {
-				backend.ingest([], [], callsEdges);
-				log?.(`  [graph] ${callsEdges.length} cross-file call edge(s)`);
-			}
-	}
 
-	// ── Git history on full runs ──────────────────────────────────────────
-	if (full && !targetPath && fs.existsSync(path.join(projectDir, ".git"))) {
-		try {
-			const git = await indexCommits(projectDir, manifest.lastGitSha);
-			if (git.chunks.length > 0) {
-				const { embedder: emb, cache: cch } = await ensureEmbedder();
-				phase?.(`Embedding ${git.chunks.length} git commits…`);
-				const stats = await embedChunks(git.chunks, emb, cch);
-				totalCacheHits += stats.hits;
-				totalCacheMisses += stats.misses;
-				backend.ingest(git.chunks, git.nodes, git.edges);
-				result.totalChunks += git.chunks.length;
-				if (git.headSha) manifest.lastGitSha = git.headSha;
-				log?.(`  [git] ${git.chunks.length} commit(s) indexed`);
-			}
-		} catch (err) {
-			result.errors.push(`git history indexing failed: ${(err as Error).message}`);
+		if (holders.cache) {
+			result.cacheHits = holders.cache.hitCount;
+			result.cacheMisses = holders.cache.missCount;
+		} else {
+			result.cacheHits = totalCacheHits;
+			result.cacheMisses = totalCacheMisses;
 		}
-	}
 
-	// ── Prune files that vanished from disk ───────────────────────────────
-	if (!targetPath) {
-		const previousPaths = new Set([...Object.keys(manifest.fileEntries), ...preMigrationPaths]);
-		const removed = [...previousPaths].filter((rel) => !currentRelPaths.has(rel));
-		if (removed.length > 0) {
-			backend.deleteByFiles(removed);
-			for (const rel of removed) {
-				manifest.remove(rel);
-				result.deletedFiles.push(rel);
-				log?.(`  [delete] ${rel} (no longer on disk)`);
-			}
-		}
+		if (holders.embedder) manifest.embeddingDim = holders.embedder.dimension;
+		manifest.save();
+		return result;
+	} finally {
+		// Release handles on EVERY path: a mid-run rejection (embed failure,
+		// backend crash) must not leak them. Success-path bookkeeping above
+		// reads the live counters before this closes the cache.
+		if (holders.cache) holders.cache.close();
+		if (ownsBackend) backend.close();
 	}
-
-	if (holders.cache) {
-		result.cacheHits = holders.cache.hitCount;
-		result.cacheMisses = holders.cache.missCount;
-		holders.cache.close();
-	} else {
-		result.cacheHits = totalCacheHits;
-		result.cacheMisses = totalCacheMisses;
-	}
-
-	if (holders.embedder) manifest.embeddingDim = holders.embedder.dimension;
-	manifest.save();
-	if (ownsBackend) backend.close();
-	return result;
 }
 
 /** Directory patterns need re-checking against every ancestor for single files. */

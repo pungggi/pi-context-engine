@@ -16,12 +16,61 @@ import { applyContextSearchGuidance } from "./guidance.js";
 /** Tools whose payloads are worth capturing for session timelines. */
 const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
 
+/**
+ * Delay before the session-start auto-index kicks in: long enough that pi's
+ * initial render, skill loading and the user's first keystrokes win the event
+ * loop, short enough that the index is warm before the agent needs it.
+ */
+const AUTO_INDEX_DELAY_MS = 2000;
+
 export default function contextEngineExtension(pi: ExtensionAPI) {
 	let engine: ContextEngine | null = null;
 	let currentCwd = process.cwd();
 	let promptNumber = 0;
 	let lazyIndexStarted = false;
 	let bootstrapSent = false;
+	let autoIndexTimer: NodeJS.Timeout | null = null;
+	let indexInFlight = false;
+
+	/**
+	 * Kick the one-shot background index (session-start auto-index and the
+	 * first-search lazy path share this). Never stacks: `lazyIndexStarted`
+	 * guards re-entry, `indexInFlight` lets context_search say "still
+	 * building" instead of re-kicking, and `engine.autoIndexOnce()` is
+	 * itself one-shot per engine instance.
+	 */
+	const kickBackgroundIndex = (eng: ContextEngine, notify?: (msg: string, level: "info" | "warning") => void) => {
+		lazyIndexStarted = true;
+		indexInFlight = true;
+		void eng
+			.autoIndexOnce()
+			.then((result) => {
+				if (!result || !notify || engine !== eng) return; // session moved on
+				if (result.errors.length > 0) {
+					notify(`Context index: background index hit ${result.errors.length} error(s)`, "warning");
+				} else if (result.indexed > 0) {
+					notify(`Context index updated: ${result.indexed} file(s), ${result.chunks} chunk(s)`, "info");
+				}
+			})
+			.catch((err: unknown) => {
+				// Backend init, model download and embedding failures REJECT the
+				// reindex (result.errors only covers per-file errors), so without
+				// this branch a failed startup index would die silently and leave
+				// the lazy path burned on an empty index. Free the lazy path so a
+				// later search retries (autoIndexOnce un-consumes its one-shot),
+				// and surface the failure when we have a notify channel.
+				if (engine === eng) {
+					lazyIndexStarted = false;
+					if (notify) {
+						const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
+						notify(`Context index: background indexing failed — run /context-index for details (${detail})`, "warning");
+					}
+				}
+			})
+			.finally(() => {
+				indexInFlight = false;
+			});
+	};
 
 	const getEngine = (cwd?: string): ContextEngine => {
 		const dir = cwd ?? currentCwd;
@@ -68,15 +117,29 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			if (!query) return text("Query cannot be empty.");
 			if (query.length > 10_000) return text("Query too long (max 10000 characters).");
 
-			// Lazy index on first search: kick off in the background and tell the
+			// Empty index: a background build may already be running (session-start
+			// auto-index or an earlier search). Never stack a second run; tell the
 			// caller to retry instead of blocking for a multi-minute first index.
-			if (eng.chunkCount() === 0 && !lazyIndexStarted) {
-				lazyIndexStarted = true;
-				void eng.reindex({}).catch(() => undefined);
-				return text(
-					`Index for ${eng.projectName} is empty — indexing started in the background. ` +
-						"Retry this search in a few seconds, or run /context-index for a synchronous index.",
-				);
+			// `indexer.auto_index: false` disables this lazy kick too — one switch
+			// for all automatic indexing.
+			if (eng.chunkCount() === 0) {
+				if (indexInFlight) {
+					return text(
+						`Index for ${eng.projectName} is still building in the background — retry this search in a few seconds.`,
+					);
+				}
+				if (!eng.config.indexerAutoIndex) {
+					return text(
+						`Index for ${eng.projectName} is empty and indexer.auto_index is off — run /context-index (or call reindex) to build it.`,
+					);
+				}
+				if (!lazyIndexStarted) {
+					kickBackgroundIndex(eng);
+					return text(
+						`Index for ${eng.projectName} is empty — indexing started in the background. ` +
+							"Retry this search in a few seconds, or run /context-index for a synchronous index.",
+					);
+				}
 			}
 
 			const result = await eng.search(query, { topK: params.top_k, maxTokens: params.max_tokens });
@@ -309,6 +372,39 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		engine.startBackgroundWork();
 		lazyIndexStarted = false;
 		bootstrapSent = false;
+		if (autoIndexTimer) {
+			clearTimeout(autoIndexTimer);
+			autoIndexTimer = null;
+		}
+		// Auto-index (config `indexer.auto_index`): kick an incremental reindex
+		// shortly after the session is ready, so the agent never discovers an
+		// empty or stale index mid-task. Incremental runs are cheap when nothing
+		// changed (walk + hash only); the pipeline lock serializes this with a
+		// manual /context-index or a lazy search-triggered run. Errors surface as
+		// a notification, never as a session failure.
+		if (engine.config.indexerAutoIndex) {
+			const eng = engine;
+			autoIndexTimer = setTimeout(() => {
+				autoIndexTimer = null;
+				if (lazyIndexStarted) return; // a search already kicked a background index
+				if (engine !== eng) {
+					// getEngine switched projects mid-delay (a tool ran with a
+					// different cwd): index the LIVE engine instead of the retired
+					// one, so the new project still gets its warmup instead of
+					// waiting for an unlucky lazy kick.
+					if (engine) {
+						kickBackgroundIndex(engine, (msg, level) => {
+							if (ctx.hasUI) ctx.ui.notify(msg, level);
+						});
+					}
+					return;
+				}
+				kickBackgroundIndex(eng, (msg, level) => {
+					if (ctx.hasUI) ctx.ui.notify(msg, level);
+				});
+			}, AUTO_INDEX_DELAY_MS);
+			autoIndexTimer.unref?.();
+		}
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -355,6 +451,10 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (autoIndexTimer) {
+			clearTimeout(autoIndexTimer);
+			autoIndexTimer = null;
+		}
 		await engine?.shutdown().catch(() => undefined);
 		engine = null;
 	});

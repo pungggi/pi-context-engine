@@ -75,6 +75,22 @@ describe("autoIndexOnce", () => {
 		expect(manual.indexed).toBe(0);
 	});
 
+	it("un-consumes its one-shot when the run rejects, so a later kick can retry", async () => {
+		const { engine } = await harness();
+		// Break embedding AFTER engine construction: embed failures propagate
+		// as rejections (unlike per-file errors, which land in result.errors),
+		// so a naive one-shot would burn itself on an index that never filled.
+		const internals = engine as unknown as { embedderInstance: { embedTexts: () => Promise<number[][]> } };
+		internals.embedderInstance.embedTexts = async () => {
+			throw new Error("model download failed");
+		};
+
+		await expect(engine.autoIndexOnce()).rejects.toThrow("model download failed");
+		// The failed run must not have consumed the one-shot: the retry re-runs
+		// (and rejects again) instead of returning null on an empty index.
+		await expect(engine.autoIndexOnce()).rejects.toThrow("model download failed");
+	});
+
 	it("is a no-op (null, nothing indexed) when indexer.auto_index is off", async () => {
 		const { engine } = await harness({ autoIndex: false });
 
@@ -139,22 +155,27 @@ describe("indexing yields to the event loop", () => {
 
 		let turns = 0;
 		let ticking = true;
+		// Self-rescheduling ticker: counts macrotask turns until the run
+		// settles. Every yieldToEventLoop in the pipeline queues an immediate,
+		// which gives the ticker another turn — so "turns" tracks how many
+		// interleaves the indexing actually granted.
 		const tick = () => {
-			if (!ticking) return;
 			turns++;
-			setImmediate(tick);
+			if (ticking) setImmediate(tick);
 		};
 
 		const reindex = engine.reindex({}).finally(() => {
 			ticking = false;
 		});
-		await new Promise<void>((resolve) => setImmediate(() => { tick(); resolve(); }));
-		ticking = false;
+		setImmediate(tick);
 		const result = await reindex;
 
 		expect(result.errors).toEqual([]);
-		// Without the cooperative yields the whole run completes inside one
-		// macrotask and turns stays 0.
-		expect(turns).toBeGreaterThan(0);
+		// The single batch-top yield would produce ~2 turns no matter how many
+		// files ran. Cooperative yielding must interleave at least once per FILE
+		// (per-file and per-chunk yields), so require strictly more turns than
+		// indexed files — removing any per-file/per-chunk/embed yield drops
+		// turns below this and fails.
+		expect(turns).toBeGreaterThan(result.indexed);
 	});
 });

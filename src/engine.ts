@@ -341,9 +341,11 @@ export class ContextEngine {
 	 * One-shot background incremental index, kicked at session start by the
 	 * extension (config `indexer.auto_index`, default true). Returns null when
 	 * disabled or when this engine already ran (or skipped) its auto-index, so
-	 * callers never stack a second background run. The pipeline lock in
-	 * runIndexing serializes this with a manual /context-index or a lazy
-	 * search-triggered run, so races are safe — just wasteful, which the
+	 * callers never stack a second background run. A REJECTED run (backend
+	 * init, model download, embedding crash) un-consumes the one-shot so the
+	 * next kick retries — the index is still empty, after all. The pipeline
+	 * lock in runIndexing serializes this with a manual /context-index or a
+	 * lazy search-triggered run, so races are safe — just wasteful, which the
 	 * one-shot guard prevents.
 	 */
 	async autoIndexOnce(): Promise<{
@@ -355,7 +357,12 @@ export class ContextEngine {
 	} | null> {
 		if (!this.config.indexerAutoIndex || this.autoIndexDone) return null;
 		this.autoIndexDone = true;
-		return this.reindex({});
+		try {
+			return await this.reindex({});
+		} catch (err) {
+			this.autoIndexDone = false;
+			throw err;
+		}
 	}
 
 	// ── Memory writes ─────────────────────────────────────────────────────

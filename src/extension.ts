@@ -52,7 +52,21 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 					notify(`Context index updated: ${result.indexed} file(s), ${result.chunks} chunk(s)`, "info");
 				}
 			})
-			.catch(() => undefined)
+			.catch((err: unknown) => {
+				// Backend init, model download and embedding failures REJECT the
+				// reindex (result.errors only covers per-file errors), so without
+				// this branch a failed startup index would die silently and leave
+				// the lazy path burned on an empty index. Free the lazy path so a
+				// later search retries (autoIndexOnce un-consumes its one-shot),
+				// and surface the failure when we have a notify channel.
+				if (engine === eng) {
+					lazyIndexStarted = false;
+					if (notify) {
+						const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
+						notify(`Context index: background indexing failed — run /context-index for details (${detail})`, "warning");
+					}
+				}
+			})
 			.finally(() => {
 				indexInFlight = false;
 			});
@@ -373,6 +387,18 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			autoIndexTimer = setTimeout(() => {
 				autoIndexTimer = null;
 				if (lazyIndexStarted) return; // a search already kicked a background index
+				if (engine !== eng) {
+					// getEngine switched projects mid-delay (a tool ran with a
+					// different cwd): index the LIVE engine instead of the retired
+					// one, so the new project still gets its warmup instead of
+					// waiting for an unlucky lazy kick.
+					if (engine) {
+						kickBackgroundIndex(engine, (msg, level) => {
+							if (ctx.hasUI) ctx.ui.notify(msg, level);
+						});
+					}
+					return;
+				}
 				kickBackgroundIndex(eng, (msg, level) => {
 					if (ctx.hasUI) ctx.ui.notify(msg, level);
 				});

@@ -7,7 +7,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { sha256Hex } from "../utils.js";
+import { sha256Hex, yieldToEventLoop } from "../utils.js";
 
 export const DEFAULT_LOCAL_MODEL = "Xenova/all-MiniLM-L6-v2";
 /** R11: code-trained local embedder, measured in README (not a default — see eval table). */
@@ -37,6 +37,14 @@ function resolveModelCacheDir(): string {
 export function transformersCacheDir(): string {
 	return resolveModelCacheDir();
 }
+
+/**
+ * Texts per embed() call in LocalBackend. ONNX inference and tokenization run
+ * on the main thread, so this bounds one synchronous block: 64 texts measured
+ * at ~0.5-0.9 s per call (a visible TUI freeze, see
+ * scripts/bench-event-loop.mts); 16 lands around ~100 ms per block.
+ */
+const LOCAL_SUB_BATCH = 16;
 
 interface TransformersModule {
 	pipeline: (
@@ -135,14 +143,18 @@ export class LocalBackend implements EmbeddingBackend {
 		this.dimension = probe[0]!.length;
 	}
 
-	async embedTexts(texts: string[], _batchSize = 64): Promise<number[][]> {
+	async embedTexts(texts: string[], _batchSize?: number): Promise<number[][]> {
 		const embed = await this.getPipeline();
 		if (texts.length === 0) return [];
 		if (texts.length === 1) return embed(texts);
 		const out: number[][] = [];
-		for (let i = 0; i < texts.length; i += 64) {
-			const batch = await embed(texts.slice(i, i + 64));
+		for (let i = 0; i < texts.length; i += LOCAL_SUB_BATCH) {
+			const batch = await embed(texts.slice(i, i + LOCAL_SUB_BATCH));
 			out.push(...batch);
+			// Cooperative yield: one embed() call blocks the main thread for the
+			// whole sub-batch (tokenization + native ONNX run), so without this
+			// the UI starves for the whole indexing run.
+			if (i + LOCAL_SUB_BATCH < texts.length) await yieldToEventLoop();
 		}
 		return out;
 	}

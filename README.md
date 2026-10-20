@@ -88,6 +88,19 @@ and the index lifecycle.
 Re-indexing only touches changed files. In the run above, a second pass over an
 unchanged repo took 237 ms.
 
+### Automatic indexing
+
+- **Auto-index at session start**: ~2 s after a session opens, an incremental
+  reindex runs in the background, so the index is warm before the agent needs
+  it. You get a notification only when something changed.
+- **Lazy fallback**: if a search still lands on an empty index, indexing kicks
+  off on the spot and the tool asks you to retry in a few seconds.
+- **One switch for both**: `indexer.auto_index: false` disables both behaviors;
+  build the index manually with `/context-index` instead.
+- **Why it matters**: incremental runs are cheap (a few hundred ms on an
+  unchanged repo), so this removes the classic cold-start failure of searching
+  an empty index, without ever blocking the UI.
+
 ## Requirements
 
 - **Node 22+** on macOS, Linux or Windows.
@@ -153,6 +166,7 @@ indexer:
   context_headers: true  # prepend `// file: ... | unit: ... | imports: ...` to chunk text
   chunking: legacy        # legacy (default) | ast-density — cAST-style budgeted split-merge (experimental)
   chunk_budget_chars: 1200 # non-whitespace budget per ast-density chunk
+  auto_index: true        # incremental background reindex shortly after session start
 memory:
   redact_pii: true
 pricing:

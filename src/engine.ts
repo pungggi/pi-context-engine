@@ -166,6 +166,7 @@ export class ContextEngine {
 	private searchesSinceDecision = 0;
 	private hasRecordedDecision = false;
 	private vecBackfillStarted = false;
+	private autoIndexDone = false;
 
 	constructor(options: EngineOptions) {
 		this.projectDir = fs.realpathSync(path.resolve(options.projectDir));
@@ -334,6 +335,27 @@ export class ContextEngine {
 			skipped: result.skippedFiles.length,
 			errors: result.errors,
 		};
+	}
+
+	/**
+	 * One-shot background incremental index, kicked at session start by the
+	 * extension (config `indexer.auto_index`, default true). Returns null when
+	 * disabled or when this engine already ran (or skipped) its auto-index, so
+	 * callers never stack a second background run. The pipeline lock in
+	 * runIndexing serializes this with a manual /context-index or a lazy
+	 * search-triggered run, so races are safe — just wasteful, which the
+	 * one-shot guard prevents.
+	 */
+	async autoIndexOnce(): Promise<{
+		indexed: number;
+		chunks: number;
+		deleted: number;
+		skipped: number;
+		errors: string[];
+	} | null> {
+		if (!this.config.indexerAutoIndex || this.autoIndexDone) return null;
+		this.autoIndexDone = true;
+		return this.reindex({});
 	}
 
 	// ── Memory writes ─────────────────────────────────────────────────────
@@ -1252,7 +1274,9 @@ export class ContextEngine {
 		lines.push(
 			chunks > 0
 				? `${chunks.toLocaleString()} chunks indexed and searchable via context_search.`
-				: "Index is empty — run /context-index (or call reindex) to build it.",
+				: this.config.indexerAutoIndex
+					? "Index is empty — a background index starts automatically at session start (indexer.auto_index); retry context_search shortly."
+					: "Index is empty — run /context-index (or call reindex) to build it.",
 		);
 		return lines.join("\n");
 	}

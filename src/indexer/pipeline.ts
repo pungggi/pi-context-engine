@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Config } from "../config.js";
-import { projectStorageDir, sha256Hex } from "../utils.js";
+import { projectStorageDir, sha256Hex, yieldToEventLoop } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
 import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
@@ -615,10 +615,16 @@ async function runIndexingLocked(
 	let totalCacheMisses = 0;
 
 	for (let batchIndex = 0; batchIndex < fileList.length; batchIndex += BATCH) {
+		// Cooperative yield: the loops below do sync I/O, tree-sitter parsing
+		// and ONNX inference on the main thread. Without a breather per unit
+		// of work the pi UI starves for the whole run (bench-event-loop.mts:
+		// ~0.5-0.9 s event-loop stalls per batch before this).
+		await yieldToEventLoop();
 		const batchPaths = fileList.slice(batchIndex, batchIndex + BATCH);
 		const toChunk: { filePath: string; relPath: string; content: string; contentHash: string; language: string }[] = [];
 
 		for (const filePath of batchPaths) {
+			await yieldToEventLoop();
 			const relPath = path.relative(projectDir, filePath).replace(/\\/g, "/");
 			currentRelPaths.add(relPath);
 			let content = safeRead(filePath);
@@ -656,6 +662,7 @@ async function runIndexingLocked(
 		const batchIndexed: string[] = [];
 
 		for (const item of toChunk) {
+			await yieldToEventLoop();
 			changedRelPaths.add(item.relPath);
 			let chunks: Chunk[] = [];
 			let importedModules: string[] = [];

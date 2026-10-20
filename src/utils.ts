@@ -80,6 +80,19 @@ export function epochSeconds(): number {
 }
 
 /**
+ * Cooperative macrotask yield for long-running indexing work. ONNX
+ * inference, tokenization and tree-sitter parsing all run on the main
+ * thread, so a long stretch of synchronous work starves pi's UI loop
+ * (measured by scripts/bench-event-loop.mts: ~0.5-0.9 s stalls per 64-text
+ * embed batch). setImmediate keeps the yield cheap — same loop turn's check
+ * phase — while still letting pending timers and I/O (keystrokes, renders)
+ * run between units of work.
+ */
+export function yieldToEventLoop(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
  * Fractional seconds. Session-capture ordering needs sub-second resolution:
  * several decisions are commonly recorded within the same wall-clock second,
  * and `getRecentDecisions` sorts by this value.

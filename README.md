@@ -95,8 +95,13 @@ unchanged repo took 237 ms.
   it. You get a notification only when something changed.
 - **Lazy fallback**: if a search still lands on an empty index, indexing kicks
   off on the spot and the tool asks you to retry in a few seconds.
-- **One switch for both**: `indexer.auto_index: false` disables both behaviors;
-  build the index manually with `/context-index` instead.
+- **Live reindex while you work**: a recursive file watcher re-indexes on
+  edits, saves and branch switches (debounced, so a `git checkout` collapses
+  into one run). The agent's own edits are searchable right away instead of
+  after the next session.
+- **Switches**: `indexer.auto_index: false` disables the session-start and
+  lazy kicks; `indexer.watch: false` disables the file watcher. Use
+  `/context-index` for manual builds.
 - **Why it matters**: incremental runs are cheap (a few hundred ms on an
   unchanged repo), so this removes the classic cold-start failure of searching
   an empty index, without ever blocking the UI.
@@ -167,6 +172,7 @@ indexer:
   chunking: legacy        # legacy (default) | ast-density — cAST-style budgeted split-merge (experimental)
   chunk_budget_chars: 1200 # non-whitespace budget per ast-density chunk
   auto_index: true        # incremental background reindex shortly after session start
+  watch: true             # reindex on file changes while the session runs (debounced, incremental)
 memory:
   redact_pii: true
 pricing:

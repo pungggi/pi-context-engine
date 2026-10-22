@@ -95,6 +95,12 @@ export interface Config {
 	indexerContextHeaders: boolean;
 	/** Run an incremental reindex in the background shortly after session start. */
 	indexerAutoIndex: boolean;
+	/**
+	 * Watch the project tree while a session runs and reindex on changes
+	 * (debounced, incremental). Independent of `indexerAutoIndex`, which only
+	 * gates the session-start kick.
+	 */
+	indexerWatch: boolean;
 	indexerRedactSecrets: boolean;
 	memoryRedactPii: boolean;
 	pricingModel: string;
@@ -128,6 +134,7 @@ export function defaultConfig(): Config {
 		indexerIgnore: [...DEFAULT_IGNORE],
 		indexerContextHeaders: true,
 		indexerAutoIndex: true,
+		indexerWatch: true,
 		indexerRedactSecrets: true,
 		memoryRedactPii: true,
 		pricingModel: "opus",
@@ -162,6 +169,7 @@ const MAPPING: Record<string, keyof Config> = {
 	"indexer.ignore": "indexerIgnore",
 	"indexer.context_headers": "indexerContextHeaders",
 	"indexer.auto_index": "indexerAutoIndex",
+	"indexer.watch": "indexerWatch",
 	"indexer.redact_secrets": "indexerRedactSecrets",
 	"memory.redact_pii": "memoryRedactPii",
 	"storage.path": "storagePath",

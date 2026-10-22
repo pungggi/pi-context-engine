@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ContextEngine, isPceConfig } from "./engine.js";
 import { applyContextSearchGuidance } from "./guidance.js";
+import { ProjectWatcher } from "./indexer/watcher.js";
 
 /** Tools whose payloads are worth capturing for session timelines. */
 const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
@@ -31,6 +32,83 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	let bootstrapSent = false;
 	let autoIndexTimer: NodeJS.Timeout | null = null;
 	let indexInFlight = false;
+
+	/**
+	 * File watcher (config `indexer.watch`, default true): a debounced change
+	 * signal over the project tree. Unlike the session-start auto-index this
+	 * is re-kickable — one kick per settled change burst, for the whole
+	 * session. Owned by this closure, like `autoIndexTimer`: engine instances
+	 * are replaced per `session_start` without a shutdown event.
+	 */
+	let watcher: ProjectWatcher | null = null;
+	let watcherKickPending = false;
+	let watcherNotify: ((msg: string, level: "info" | "warning") => void) | undefined;
+
+	/**
+	 * Watcher-triggered incremental reindex. Unlike `kickBackgroundIndex` this
+	 * calls `reindex()` directly — the watcher must re-fire all session, not
+	 * consume a one-shot. Shares `indexInFlight` with the other kicks so runs
+	 * never stack; a change that arrives mid-run coalesces into exactly one
+	 * trailing kick, so edits made *while indexing* still land. Successful
+	 * runs stay silent (the user's own edit caused them); only failures
+	 * surface a notification.
+	 */
+	const kickWatcherIndex = (eng: ContextEngine, notify?: (msg: string, level: "info" | "warning") => void) => {
+		if (engine !== eng) return; // session moved on
+		if (indexInFlight) {
+			watcherKickPending = true;
+			return;
+		}
+		indexInFlight = true;
+		void eng
+			.reindex({})
+			.catch((err: unknown) => {
+				if (engine === eng && notify) {
+					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
+					notify(`Context index: watcher reindex failed (${detail})`, "warning");
+				}
+			})
+			.finally(() => {
+				indexInFlight = false;
+				drainWatcherKick();
+			});
+	};
+
+	/** Deliver a watcher change that arrived while a background run was in flight. */
+	const drainWatcherKick = () => {
+		if (!watcherKickPending) return;
+		watcherKickPending = false;
+		if (engine && watcher) kickWatcherIndex(engine, watcherNotify);
+	};
+
+	const stopWatcher = () => {
+		watcher?.stop();
+		watcher = null;
+		watcherKickPending = false;
+	};
+
+	/**
+	 * (Re)point the file watcher at the live engine's project dir. Idempotent
+	 * per dir (called from every `getEngine`), so a mid-session project switch
+	 * re-arms the watcher exactly like the auto-index timer re-points its kick.
+	 */
+	const attachWatcher = (eng: ContextEngine) => {
+		if (watcher && watcher.dir === eng.projectDir) return;
+		stopWatcher();
+		if (!eng.config.indexerWatch) return;
+		const w = new ProjectWatcher(eng.projectDir, {
+			onChange: () => {
+				if (engine) kickWatcherIndex(engine, watcherNotify);
+			},
+			onError: (err) => {
+				// E.g. Linux inotify exhaustion: degrade to session-start/lazy
+				// indexing and say so once. Never crash the session.
+				stopWatcher();
+				watcherNotify?.(`Context index: file watcher disabled (${err.message.slice(0, 100)}) — back to session-start indexing only`, "warning");
+			},
+		});
+		if (w.start()) watcher = w;
+	};
 
 	/**
 	 * Kick the one-shot background index (session-start auto-index and the
@@ -69,6 +147,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			})
 			.finally(() => {
 				indexInFlight = false;
+				drainWatcherKick(); // a watcher change may have landed mid-run
 			});
 	};
 
@@ -82,6 +161,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		// Always track the live engine so `session_shutdown` closes it even when
 		// a tool ran before `session_start` (tests, mid-reload edge cases).
 		engine = new ContextEngine({ projectDir: dir });
+		attachWatcher(engine);
 		return engine;
 	};
 
@@ -372,6 +452,12 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		engine.startBackgroundWork();
 		lazyIndexStarted = false;
 		bootstrapSent = false;
+		watcherNotify = ctx.hasUI ? (msg, level) => ctx.ui.notify(msg, level) : undefined;
+		// (Re)arm the file watcher for this session: fresh notify channel, and
+		// config may have changed since the last session. No-op when
+		// `indexer.watch` is off.
+		stopWatcher();
+		attachWatcher(engine);
 		if (autoIndexTimer) {
 			clearTimeout(autoIndexTimer);
 			autoIndexTimer = null;
@@ -455,6 +541,8 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			clearTimeout(autoIndexTimer);
 			autoIndexTimer = null;
 		}
+		stopWatcher();
+		watcherNotify = undefined;
 		await engine?.shutdown().catch(() => undefined);
 		engine = null;
 	});

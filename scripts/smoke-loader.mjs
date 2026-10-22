@@ -159,8 +159,22 @@ if (problems.length === 0) {
 		} catch (err) {
 			problems.push(`session_shutdown threw: ${err}`);
 		}
-		fs.rmSync(fixture, { recursive: true, force: true });
-		fs.rmSync(storageRoot, { recursive: true, force: true });
+		// Windows transient EBUSY: an sqlite file can still be locked for a few
+		// ms after close (defender/indexer grabbing the fresh file), so retry
+		// briefly instead of failing the whole CI job on a cleanup hiccup.
+		const removeRecursive = (target) => {
+			for (let attempt = 0; ; attempt++) {
+				try {
+					fs.rmSync(target, { recursive: true, force: true });
+					return;
+				} catch (err) {
+					if (attempt >= 10 || (err.code !== "EBUSY" && err.code !== "EPERM")) throw err;
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); // sync sleep
+				}
+			}
+		};
+		removeRecursive(fixture);
+		removeRecursive(storageRoot);
 	}
 }
 

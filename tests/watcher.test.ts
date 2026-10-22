@@ -79,6 +79,80 @@ describe("ProjectWatcher", () => {
 		await waitFor(() => (kicks.mock.calls.length >= 1 ? true : null));
 	});
 
+	it("applies root-only ignore names only to the first segment (src/storage/ stays live)", async () => {
+		// Regression for PR #15 review: the pipeline indexes nested `src/storage/`
+		// (root-only names must not reject nested paths), so events under it must
+		// kick — only top-level `storage/` is noise.
+		const dir = makeTempDir("pce-watch-");
+		tempDirs.push(dir);
+		const kicks = vi.fn();
+		expect(watchDir(dir, kicks).start()).toBe(true);
+
+		writeFiles(dir, { "storage/manifest.json": "{}", "logs/app.log": "line\n" });
+		await sleep(300);
+		expect(kicks).not.toHaveBeenCalled(); // root-level: dropped
+
+		writeFiles(dir, { "src/storage/store.ts": "export const store = 1;\n" });
+		await waitFor(() => (kicks.mock.calls.length >= 1 ? true : null));
+		await sleep(250);
+		expect(kicks).toHaveBeenCalledTimes(1); // nested: kicked
+	});
+
+	it("matches ignore segments case-sensitively like the walker (src/Build/ stays live)", async () => {
+		// Regression for PR #15 review: the walker's ignoreSet.has(seg) is
+		// case-sensitive, so `src/Build/` IS indexed and must kick; only the
+		// exact lowercase `build` segment is noise.
+		const dir = makeTempDir("pce-watch-");
+		tempDirs.push(dir);
+		const kicks = vi.fn();
+		expect(watchDir(dir, kicks).start()).toBe(true);
+
+		writeFiles(dir, { "src/Build/App.ts": "export class App {}\n" });
+		await waitFor(() => (kicks.mock.calls.length >= 1 ? true : null));
+		await sleep(250);
+		expect(kicks).toHaveBeenCalledTimes(1);
+	});
+
+	it("drops events under an ignored path (in-project storage dir), preventing a self-retrigger loop", async () => {
+		// Regression for PR #15 review: manifest.save() writes on EVERY run, so
+		// with storage.path inside the checkout the storage dir must be excluded
+		// or each kick schedules the next one forever.
+		const dir = makeTempDir("pce-watch-");
+		tempDirs.push(dir);
+		const storageDir = path.join(dir, ".pce-data");
+		fs.mkdirSync(storageDir, { recursive: true });
+		const kicks = vi.fn();
+		const w = new ProjectWatcher(dir, { onChange: kicks, debounceMs: 60, ignorePaths: [storageDir] });
+		watchers.push(w);
+		expect(w.start()).toBe(true);
+
+		// Simulated post-run writes: manifest + embedding cache inside storage.
+		writeFiles(dir, {
+			".pce-data/manifest.json": "{\"files\":{}}",
+			".pce-data/embedding_cache.db": "sqlite",
+		});
+		await sleep(300);
+		expect(kicks).not.toHaveBeenCalled();
+
+		// A source edit still kicks (loop is broken only for the storage dir).
+		writeFiles(dir, { "src/a.ts": "export const a = 3;\n" });
+		await waitFor(() => (kicks.mock.calls.length >= 1 ? true : null));
+	});
+
+	it("accepts events when the filename is null instead of dropping them", async () => {
+		// A null filename cannot be filtered; dropping it would be the
+		// unrecoverable failure mode (stale index), so it must schedule a kick.
+		const dir = makeTempDir("pce-watch-");
+		tempDirs.push(dir);
+		const kicks = vi.fn();
+		const w = watchDir(dir, kicks);
+		expect(w.start()).toBe(true);
+
+		writeFiles(dir, { "src/a.ts": "export const a = 1;\n" });
+		await waitFor(() => (kicks.mock.calls.length >= 1 ? true : null));
+		expect(kicks).toHaveBeenCalledTimes(1);
+	});
+
 	it("stop() cancels the pending kick and silences later events", async () => {
 		const dir = makeTempDir("pce-watch-");
 		tempDirs.push(dir);

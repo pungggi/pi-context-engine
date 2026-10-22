@@ -8,8 +8,14 @@
  * only missed events matter. That is why the built-in suffices and neither
  * chokidar (per-file stat-confirmed events, Node >= 22.22) nor
  * @parcel/watcher (native addon, snapshot diffs) are needed.
+ *
+ * Filter semantics deliberately MIRROR the pipeline's inclusion policy
+ * (`targetExcluded` / `iterProjectFiles` in pipeline.ts), because a dropped
+ * event is the only unrecoverable failure mode: a wrongly accepted event just
+ * costs one cheap incremental run.
  */
 import fs from "node:fs";
+import path from "node:path";
 import { DEFAULT_IGNORE, ROOT_ONLY_IGNORE } from "../config.js";
 
 /**
@@ -19,14 +25,7 @@ import { DEFAULT_IGNORE, ROOT_ONLY_IGNORE } from "../config.js";
  */
 export const WATCH_DEBOUNCE_MS = 1500;
 
-/**
- * Path segments whose events are dropped before debouncing. Reuses the
- * config's ignore lists so the watcher stays quiet exactly where the
- * pipeline would not index anyway (`node_modules/`, `.git/`, build output,
- * root-only `storage`/`logs`/`tmp`). Best-effort noise reduction — a wrongly
- * accepted event costs one cheap incremental run.
- */
-const NOISE_SEGMENTS = new Set([...DEFAULT_IGNORE, ...ROOT_ONLY_IGNORE].map((s) => s.toLowerCase()));
+const ROOT_ONLY_SET = new Set(ROOT_ONLY_IGNORE);
 
 export interface ProjectWatcherOptions {
 	/** Called once per debounced change burst. Keep it cheap and sync. */
@@ -35,17 +34,36 @@ export interface ProjectWatcherOptions {
 	onError?: (err: Error) => void;
 	/** Defaults to {@link WATCH_DEBOUNCE_MS}. */
 	debounceMs?: number;
+	/**
+	 * Segment names ignored at ANY depth — defaults to `DEFAULT_IGNORE`; the
+	 * extension passes `config.indexerIgnore` so user additions apply too
+	 * (same set the walker checks via `ignoreSet.has(seg)`).
+	 */
+	ignoreSegments?: readonly string[];
+	/**
+	 * Absolute directories whose events are dropped entirely. The extension
+	 * passes the engine's storage dir when it points INSIDE the checkout:
+	 * every reindex rewrites `manifest.json` there unconditionally, so
+	 * without this exclusion a watcher kick would re-trigger itself forever
+	 * after source edits stop (PR #15 review, #12).
+	 */
+	ignorePaths?: readonly string[];
 }
 
 export class ProjectWatcher {
 	private watcher: fs.FSWatcher | null = null;
 	private debounceTimer: NodeJS.Timeout | null = null;
 	private stopped = false;
+	private watchRoot: string | null = null;
+	private readonly ignoreSet: Set<string>;
+	private ignorePaths: string[] = [];
 
 	constructor(
 		readonly dir: string,
 		private readonly options: ProjectWatcherOptions,
-	) {}
+	) {
+		this.ignoreSet = new Set(options.ignoreSegments ?? DEFAULT_IGNORE);
+	}
 
 	/** True while an OS watch handle is held. */
 	get watching(): boolean {
@@ -65,6 +83,14 @@ export class ProjectWatcher {
 			// event then reports the long name. realpathSync.native returns the
 			// canonical long path and avoids the mismatch entirely.
 			const dir = fs.realpathSync.native(this.dir);
+			this.watchRoot = dir;
+			this.ignorePaths = (this.options.ignorePaths ?? []).map((p) => {
+				try {
+					return fs.realpathSync.native(p);
+				} catch {
+					return path.resolve(p);
+				}
+			});
 			watcher = fs.watch(dir, { recursive: true }, (_event, filename) => this.onEvent(filename));
 		} catch (err) {
 			this.options.onError?.(err as Error);
@@ -85,15 +111,55 @@ export class ProjectWatcher {
 
 	private onEvent(filename: string | Buffer | null): void {
 		if (this.stopped || !this.watcher) return;
+		// No filename (happens, e.g. Linux inotify): cannot filter — a missed
+		// event is the unrecoverable failure mode, so accept and debounce it.
+		if (filename === null) {
+			this.scheduleKick();
+			return;
+		}
 		const name = Buffer.isBuffer(filename) ? filename.toString("utf-8") : filename;
-		if (name !== null && this.isNoise(name)) return;
+		if (name !== "" && this.isNoise(name)) return;
 		this.scheduleKick();
 	}
 
+	/**
+	 * Mirrors the walker's inclusion policy (see header): case-sensitive
+	 * segment match at any depth, root-only names only for the FIRST segment,
+	 * and explicit storage-dir path exclusion. Returns "noise" = drop event.
+	 */
 	private isNoise(filename: string): boolean {
-		return filename
-			.split(/[\\/]/)
-			.some((segment) => segment !== "" && NOISE_SEGMENTS.has(segment.toLowerCase()));
+		const rel = this.relativeToRoot(filename);
+		if (rel === null) return false; // absolute path outside the watch root: be conservative, kick
+		const segments = rel.split(/[\\/]/).filter((s) => s !== "");
+		if (segments.length === 0) return false;
+		// Root-only names (`storage`, `logs`, `tmp`, ...) count only at the
+		// project root — nested `src/storage/` is real source the pipeline
+		// indexes, so its events must kick (PR #15 review).
+		if (ROOT_ONLY_SET.has(segments[0]!)) return true;
+		// Case-SENSITIVE like `ignoreSet.has(seg)`: the pipeline indexes
+		// `src/Build/`, so its events must not be dropped (PR #15 review).
+		if (segments.some((s) => this.ignoreSet.has(s))) return true;
+		return this.isUnderIgnoredPath(rel);
+	}
+
+	/** Relative path from the watch root, or null when outside/unknown. */
+	private relativeToRoot(filename: string): string | null {
+		if (!path.isAbsolute(filename)) return filename;
+		const rel = path.relative(this.watchRoot ?? this.dir, filename);
+		if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+		return rel;
+	}
+
+	/** True when the event's resolved path lives under an ignored dir (e.g. an in-project storage dir). */
+	private isUnderIgnoredPath(rel: string): boolean {
+		if (this.ignorePaths.length === 0 || this.watchRoot === null) return false;
+		const abs = path.resolve(this.watchRoot, rel);
+		const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+		const absFolded = fold(abs);
+		return this.ignorePaths.some((p) => {
+			const ignored = fold(p);
+			return absFolded === ignored || absFolded.startsWith(ignored + path.sep);
+		});
 	}
 
 	private scheduleKick(): void {

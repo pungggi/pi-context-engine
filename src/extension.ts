@@ -50,8 +50,8 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	 * consume a one-shot. Shares `indexInFlight` with the other kicks so runs
 	 * never stack; a change that arrives mid-run coalesces into exactly one
 	 * trailing kick, so edits made *while indexing* still land. Successful
-	 * runs stay silent (the user's own edit caused them); only failures
-	 * surface a notification.
+	 * runs stay silent (the user's own edit caused them); failures — both
+	 * rejections AND per-file errors resolved in `result.errors` — notify.
 	 */
 	const kickWatcherIndex = (eng: ContextEngine, notify?: (msg: string, level: "info" | "warning") => void) => {
 		if (engine !== eng) return; // session moved on
@@ -62,6 +62,14 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		indexInFlight = true;
 		void eng
 			.reindex({})
+			.then((result) => {
+				// Per-file chunking/read failures RESOLVE in result.errors — mirroring
+				// kickBackgroundIndex, surface them or affected files go stale silently.
+				if (engine !== eng || !notify) return; // session moved on
+				if (result.errors.length > 0) {
+					notify(`Context index: watcher reindex hit ${result.errors.length} error(s)`, "warning");
+				}
+			})
 			.catch((err: unknown) => {
 				if (engine === eng && notify) {
 					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
@@ -96,7 +104,16 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		if (watcher && watcher.dir === eng.projectDir) return;
 		stopWatcher();
 		if (!eng.config.indexerWatch) return;
+		// An in-project storage dir (storage.path inside the checkout) is written
+		// on EVERY reindex run (manifest.save()), so its events must not be
+		// accepted — otherwise each kick schedules the next one forever.
+		const storageRel = path.relative(eng.projectDir, eng.storageBase);
+		const storageInsideProject = storageRel !== "" && !storageRel.startsWith("..") && !path.isAbsolute(storageRel);
 		const w = new ProjectWatcher(eng.projectDir, {
+			// Same sets the walker enforces: any-depth + root-only semantics,
+			// user additions to indexer.ignore included, case-sensitive.
+			ignoreSegments: eng.config.indexerIgnore,
+			ignorePaths: storageInsideProject ? [eng.storageBase] : [],
 			onChange: () => {
 				if (engine) kickWatcherIndex(engine, watcherNotify);
 			},

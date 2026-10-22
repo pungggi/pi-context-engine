@@ -366,7 +366,11 @@ export async function indexCommits(
 	return { chunks, nodes, edges, headSha };
 }
 
-/** Per-storage-dir indexing lock so watcher + manual reindex can't interleave. */
+/**
+ * Per-storage-dir indexing lock so concurrent reindex runs (auto-index kick,
+ * lazy search kick, manual /context-index; plus a future file watcher, #12)
+ * can't interleave.
+ */
 const pipelineLocks = new Map<string, Promise<unknown>>();
 
 export async function runIndexing(
@@ -531,7 +535,8 @@ async function runIndexingLocked(
 			const underScope = (p: string): boolean => (rel === "" ? true : p === rel || p.startsWith(`${rel}/`));
 			purgeIndexed(Object.keys(manifest.fileEntries).filter((p) => underScope(p) && !yielded.has(p)));
 		} else {
-			// Watcher deletion path: prune instead of erroring out.
+			// Target vanished between runs (deleted file, or a branch switch removed it):
+// prune instead of erroring out.
 			const rel = path.relative(projectDir, target).replace(/\\/g, "/");
 			if (manifest.getHash(rel) !== undefined) {
 				backend.deleteByFiles([rel]);

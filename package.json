@@ -46,7 +46,6 @@
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
-    "chokidar": "^5.0.0",
     "sqlite-vec": "^0.1.9",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6",

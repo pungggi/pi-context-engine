@@ -252,7 +252,8 @@ if (problems.length === 0) {
 				.execute("t-limit-stale", { query: "alpha" }, undefined, undefined, limitCtx);
 			if (
 				!textOf(staleSearch).includes("automatic indexing is paused") ||
-				!textOf(staleSearch).includes("may be stale")
+				!textOf(staleSearch).includes("may be stale") ||
+				!textOf(staleSearch).includes(".context-engine.yaml")
 			) {
 				problems.push(`auto file limit: stale index served without the pause note: ${textOf(staleSearch)}`);
 			}

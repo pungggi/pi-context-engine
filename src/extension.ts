@@ -43,7 +43,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	const staleIndexNote = (): string | null =>
 		automaticIndexBlock
 			? `[note: automatic indexing is paused — workspace exceeds ${automaticIndexBlock.limit.toLocaleString()} indexable files; these results may be stale. ` +
-				"Run /context-index or raise indexer.max_auto_files to refresh]"
+				`Run /context-index, or ${MAX_AUTO_FILES_HINT} to refresh]`
 			: null;
 
 	let engine: ContextEngine | null = null;

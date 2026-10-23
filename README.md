@@ -113,6 +113,9 @@ unchanged repo took 237 ms.
 - **Resume after interruption**: the manifest checkpoints completed batches,
   starting with the first batch and then at most once every five seconds. An
   interrupted build can skip completed files instead of starting from zero.
+  Migration runs (schema reset, embedding-dimension change) are exempt: their
+  manifest stays untouched on disk until the run completes, so an interrupted
+  migration resumes cleanly instead of stranding stale rows.
 - **Cold-start visibility**: the first build on an empty index announces its
   start (`building the first index…`) and always closes with a result line
   (`updated: N file(s)` or `no files to index`). This is the one background

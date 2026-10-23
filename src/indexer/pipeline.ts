@@ -469,6 +469,17 @@ async function runIndexingLocked(
 	// vanished BEFORE this run. Snapshot the paths first so the prune step
 	// can still delete their indexed chunks instead of orphaning them.
 	const preMigrationPaths = Object.keys(manifest.fileEntries);
+	// Checkpoints (below) persist the in-memory manifest mid-run. A run that
+	// wiped or invalidated existing entries must NOT do that: the on-disk
+	// manifest is what a resumed run derives its migration context from
+	// (pre-migration paths, old schema version, git pointer). Checkpointing
+	// after clearEntries() would persist the emptied state, so an interrupted
+	// migration would resume as a plain incremental run and orphan FTS/graph
+	// rows of vanished files or skip the git-history rebuild (Augment review,
+	// PR #21). Migration runs save once at the end, exactly as before
+	// checkpoints existed — losing resume progress there is fine; correctness
+	// is not.
+	let migrationRun = false;
 
 	// The automatic file budget rides on the walk we already need. No second
 	// directory scan or per-file stat pass is required. Reuse the completed
@@ -515,6 +526,7 @@ async function runIndexingLocked(
 			targetPath = null;
 		}
 		full = true;
+		migrationRun = true;
 	}
 
 	// ── Determine the file set ─────────────────────────────────────────────
@@ -674,6 +686,7 @@ async function runIndexingLocked(
 				// The dim swap dropped stored vectors (git history included); reset
 				// the pointer so the next full run re-fetches those commits too.
 				manifest.lastGitSha = null;
+				migrationRun = true;
 			}
 		}
 
@@ -684,9 +697,12 @@ async function runIndexingLocked(
 		let totalCacheMisses = 0;
 		// The first successful batch checkpoints immediately; later writes are
 		// rate-limited. An interrupted run can therefore skip completed batches
-		// without paying a manifest write for every file.
+		// without paying a manifest write for every file. Migration runs are
+		// exempt (see migrationRun above): their manifest stays untouched on
+		// disk until the run completes.
 		let lastManifestCheckpoint = 0;
 		const checkpointManifest = () => {
+			if (migrationRun) return;
 			const now = Date.now();
 			if (now - lastManifestCheckpoint < MANIFEST_CHECKPOINT_MS) return;
 			manifest.save();

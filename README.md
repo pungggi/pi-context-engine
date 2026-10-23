@@ -103,6 +103,19 @@ unchanged repo took 237 ms.
 - **Switches**: `indexer.auto_index: false` disables the session-start and
   lazy kicks; `indexer.watch: false` disables the file watcher. Use
   `/context-index` for manual builds.
+- **Large-workspace guard**: automatic indexing and the watcher pause with a
+  warning above `indexer.max_auto_files` (default 10,000). The check uses the
+  normal directory walk and stops at the first file above the limit, so it does
+  not add a full directory scan. Periodic yields keep the check responsive.
+  This prevents an accidental parent-directory
+  session from starting an unrequested multi-minute workload. `/context-index`
+  remains available as an explicit manual build.
+- **Resume after interruption**: the manifest checkpoints completed batches,
+  starting with the first batch and then at most once every five seconds. An
+  interrupted build can skip completed files instead of starting from zero.
+  Migration runs (schema reset, embedding-dimension change) are exempt: their
+  manifest stays untouched on disk until the run completes, so an interrupted
+  migration resumes cleanly instead of stranding stale rows.
 - **Cold-start visibility**: the first build on an empty index announces its
   start (`building the first index…`) and always closes with a result line
   (`updated: N file(s)` or `no files to index`). This is the one background
@@ -192,6 +205,7 @@ indexer:
   chunking: legacy        # legacy (default) | ast-density — cAST-style budgeted split-merge (experimental)
   chunk_budget_chars: 1200 # non-whitespace budget per ast-density chunk
   auto_index: true        # incremental background reindex shortly after session start
+  max_auto_files: 10000   # automatic full-project file budget; 0 disables the guard
   watch: true             # reindex on file changes while the session runs (debounced, incremental)
 memory:
   redact_pii: true

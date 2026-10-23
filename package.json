@@ -1,6 +1,6 @@
 {
   "name": "pi-context-engine",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Semantic code context for pi: tree-sitter index + hybrid vector/BM25 retrieval + cross-session memory, all local. Port of code-context-engine (MIT, elara-labs) as a native pi extension.",
   "keywords": [
     "pi-package",

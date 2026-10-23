@@ -25,11 +25,12 @@ function hashToken(token: string): number {
 
 export class FakeEmbeddingBackend implements EmbeddingBackend {
 	readonly name = "fake";
-	readonly modelName = "fake-embed";
+	readonly modelName: string;
 	dimension = DIM;
 
-	constructor(private readonly dim: number = DIM) {
+	constructor(private readonly dim: number = DIM, modelName = "fake-embed") {
 		this.dimension = dim;
+		this.modelName = modelName;
 	}
 
 	async init(): Promise<void> {

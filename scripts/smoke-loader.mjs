@@ -196,6 +196,67 @@ if (problems.length === 0) {
 		if (!announced()) problems.push(`cold-start: missing start notification — got ${JSON.stringify(notes)}`);
 		else if (!closed()) problems.push(`cold-start: missing result notification — got ${JSON.stringify(notes)}`);
 		else console.log(`cold-start: start + result notifications verified (${notes.length} total): ${notes.join(" | ")}`);
+
+		// ── Automatic workspace size guard ─────────────────────────────
+		// A full-project background run must refuse a workspace above the
+		// configured budget, warn clearly, and make lazy search explain the
+		// pause instead of immediately retrying the same expensive walk.
+		await handlers.get("session_shutdown")?.({}, {});
+		const fixture3 = fs.mkdtempSync(path.join(os.tmpdir(), "pce-fixture-limit-"));
+		const storage3 = fs.mkdtempSync(path.join(os.tmpdir(), "pce-loader-limit-"));
+		extraCleanup.push(fixture3, storage3);
+		fs.mkdirSync(path.join(fixture3, "src"), { recursive: true });
+		fs.writeFileSync(path.join(fixture3, "src", "a.txt"), "alpha\n", "utf-8");
+		fs.writeFileSync(path.join(fixture3, "src", "b.txt"), "beta\n", "utf-8");
+		fs.writeFileSync(
+			path.join(fixture3, ".context-engine.yaml"),
+			`storage:\n  path: ${storage3.replace(/\\/g, "/")}\nindexer:\n  max_auto_files: 1\n`,
+			"utf-8",
+		);
+		const limitNotes = [];
+		const limitCtx = {
+			cwd: fixture3,
+			ui: { notify: (msg, level) => limitNotes.push(`${level}: ${msg}`) },
+			mode: "cli",
+			hasUI: true,
+		};
+		await handlers.get("session_start")?.({}, limitCtx);
+		const paused = () => limitNotes.some((m) => m.includes("automatic indexing and watcher paused"));
+		const limitDeadline = Date.now() + 10_000;
+		while (Date.now() < limitDeadline && !paused()) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
+		if (!paused()) problems.push(`auto file limit: missing pause warning — got ${JSON.stringify(limitNotes)}`);
+		else {
+			const limitedSearch = await tools.get("context_search").execute(
+				"t-limit",
+				{ query: "alpha" },
+				undefined,
+				undefined,
+				limitCtx,
+			);
+			if (!textOf(limitedSearch).includes("Automatic indexing is paused")) {
+				problems.push(`auto file limit: lazy search retried or hid the pause: ${textOf(limitedSearch)}`);
+			} else console.log("auto file limit: pause warning + lazy-search explanation verified");
+		}
+
+		// The watcher has its own reindex call. Keep auto_index off so ONLY a
+		// real filesystem event can prove that this path enforces the budget too.
+		await handlers.get("session_shutdown")?.({}, {});
+		fs.writeFileSync(
+			path.join(fixture3, ".context-engine.yaml"),
+			`storage:\n  path: ${storage3.replace(/\\/g, "/")}\nindexer:\n  auto_index: false\n  max_auto_files: 1\n`,
+			"utf-8",
+		);
+		limitNotes.length = 0;
+		await handlers.get("session_start")?.({}, limitCtx);
+		fs.writeFileSync(path.join(fixture3, "src", "b.txt"), "beta changed\n", "utf-8");
+		const watcherDeadline = Date.now() + 10_000;
+		while (Date.now() < watcherDeadline && !paused()) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
+		if (!paused()) problems.push(`watcher file limit: missing pause warning — got ${JSON.stringify(limitNotes)}`);
+		else console.log("watcher file limit: filesystem trigger paused with a warning");
 	} catch (err) {
 		problems.push(`tool invocation threw: ${err.stack ?? err}`);
 	} finally {

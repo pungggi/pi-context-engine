@@ -20,7 +20,7 @@ import { SessionCapture } from "./memory/session-capture.js";
 import { drainOne, enqueueSessionRollup, enqueueTurn, type CompressionDeps } from "./memory/compressor.js";
 import { compress, expand, compressWithCounts, DEFAULT_LEVEL } from "./memory/grammar.js";
 import { cosine } from "./memory/extractive.js";
-import { runIndexing } from "./indexer/pipeline.js";
+import { AutomaticIndexFileLimitError, runIndexing } from "./indexer/pipeline.js";
 import { getModelPricing } from "./pricing.js";
 import type { Chunk } from "./types.js";
 
@@ -358,7 +358,7 @@ export class ContextEngine {
 		return this.backend.countChunks();
 	}
 
-	async reindex(options: { full?: boolean; targetPath?: string | null; onProgress?: (msg: string) => void } = {}): Promise<{
+	async reindex(options: { full?: boolean; targetPath?: string | null; automatic?: boolean; onProgress?: (msg: string) => void } = {}): Promise<{
 		indexed: number;
 		chunks: number;
 		deleted: number;
@@ -368,6 +368,10 @@ export class ContextEngine {
 		const result = await runIndexing(this.config, this.projectDir, {
 			full: options.full,
 			targetPath: options.targetPath ?? null,
+			maxAutoFiles:
+				options.automatic && !options.targetPath && this.config.indexerMaxAutoFiles > 0
+					? this.config.indexerMaxAutoFiles
+					: undefined,
 			callbacks: { phase: options.onProgress },
 			runtime: this.injectedRuntime,
 		});
@@ -393,7 +397,8 @@ export class ContextEngine {
 	 * next kick retries — the index is still empty, after all. The pipeline
 	 * lock in runIndexing serializes this with a manual /context-index or a
 	 * lazy search-triggered run, so races are safe — just wasteful, which the
-	 * one-shot guard prevents.
+	 * one-shot guard prevents. Transient rejections un-consume the one-shot;
+	 * a workspace-size refusal stays consumed because retrying cannot help.
 	 */
 	async autoIndexOnce(): Promise<{
 		indexed: number;
@@ -405,9 +410,11 @@ export class ContextEngine {
 		if (!this.config.indexerAutoIndex || this.autoIndexDone) return null;
 		this.autoIndexDone = true;
 		try {
-			return await this.reindex({});
+			return await this.reindex({ automatic: true });
 		} catch (err) {
-			this.autoIndexDone = false;
+			// A workspace-size refusal is a stable policy decision, not a
+			// transient embedding failure. Do not retry it on every lazy search.
+			if (!(err instanceof AutomaticIndexFileLimitError)) this.autoIndexDone = false;
 			throw err;
 		}
 	}

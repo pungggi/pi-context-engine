@@ -238,6 +238,30 @@ if (problems.length === 0) {
 			if (!textOf(limitedSearch).includes("Automatic indexing is paused")) {
 				problems.push(`auto file limit: lazy search retried or hid the pause: ${textOf(limitedSearch)}`);
 			} else console.log("auto file limit: pause warning + lazy-search explanation verified");
+
+			// A manual build (the reindex tool bypasses the budget) leaves the
+			// pause active over a NON-empty index: every served result must then
+			// carry the stale-note, and index_status must lead with the pause —
+			// otherwise "why is my index not updating?" stays unanswered.
+			const manual = await tools.get("reindex").execute("t-limit-manual", {}, undefined, undefined, limitCtx);
+			if (!textOf(manual).includes("Re-index complete")) {
+				problems.push(`auto file limit: manual reindex failed: ${textOf(manual)}`);
+			}
+			const staleSearch = await tools
+				.get("context_search")
+				.execute("t-limit-stale", { query: "alpha" }, undefined, undefined, limitCtx);
+			if (
+				!textOf(staleSearch).includes("automatic indexing is paused") ||
+				!textOf(staleSearch).includes("may be stale")
+			) {
+				problems.push(`auto file limit: stale index served without the pause note: ${textOf(staleSearch)}`);
+			}
+			const statusBody = textOf(
+				await tools.get("index_status").execute("t-limit-status", {}, undefined, undefined, limitCtx),
+			);
+			if (!statusBody.startsWith("Automatic indexing paused:")) {
+				problems.push(`auto file limit: index_status hides the pause: ${statusBody}`);
+			} else console.log("auto file limit: stale-note on results + pause line in index_status verified");
 		}
 
 		// The watcher has its own reindex call. Keep auto_index off so ONLY a

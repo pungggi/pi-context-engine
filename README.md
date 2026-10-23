@@ -109,7 +109,10 @@ unchanged repo took 237 ms.
   not add a full directory scan. Periodic yields keep the check responsive.
   This prevents an accidental parent-directory
   session from starting an unrequested multi-minute workload. `/context-index`
-  remains available as an explicit manual build.
+  remains available as an explicit manual build. While the pause is active,
+  every `context_search` result carries a stale-note and `/context-status`
+  leads with the pause line, so outdated results are never served silently;
+  all messages name the config file that raises the limit.
 - **Resume after interruption**: the manifest checkpoints completed batches,
   starting with the first batch and then at most once every five seconds. An
   interrupted build can skip completed files instead of starting from zero.

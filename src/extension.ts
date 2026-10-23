@@ -13,6 +13,7 @@ import path from "node:path";
 import { ContextEngine, isPceConfig } from "./engine.js";
 import { applyContextSearchGuidance } from "./guidance.js";
 import { ProjectWatcher } from "./indexer/watcher.js";
+import { AutomaticIndexFileLimitError } from "./indexer/pipeline.js";
 
 /** Tools whose payloads are worth capturing for session timelines. */
 const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
@@ -32,6 +33,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	let bootstrapSent = false;
 	let autoIndexTimer: NodeJS.Timeout | null = null;
 	let indexInFlight = false;
+	let automaticIndexBlock: AutomaticIndexFileLimitError | null = null;
 
 	/**
 	 * File watcher (config `indexer.watch`, default true): a debounced change
@@ -46,22 +48,23 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 
 	/**
 	 * Watcher-triggered incremental reindex. Unlike `kickBackgroundIndex` this
-	 * calls `reindex()` directly — the watcher must re-fire all session, not
-	 * consume a one-shot. Shares `indexInFlight` with the other kicks so runs
+	 * calls `reindex({ automatic: true })` directly — the watcher must re-fire
+	 * all session, not consume a one-shot. The automatic flag enforces the same
+	 * workspace file budget as session-start indexing. Shares `indexInFlight` with the other kicks so runs
 	 * never stack; a change that arrives mid-run coalesces into exactly one
 	 * trailing kick, so edits made *while indexing* still land. Successful
 	 * runs stay silent (the user's own edit caused them); failures — both
 	 * rejections AND per-file errors resolved in `result.errors` — notify.
 	 */
 	const kickWatcherIndex = (eng: ContextEngine, notify?: (msg: string, level: "info" | "warning") => void) => {
-		if (engine !== eng) return; // session moved on
+		if (engine !== eng || automaticIndexBlock) return; // session moved on, or the workspace exceeds the auto budget
 		if (indexInFlight) {
 			watcherKickPending = true;
 			return;
 		}
 		indexInFlight = true;
 		void eng
-			.reindex({})
+			.reindex({ automatic: true })
 			.then((result) => {
 				// Per-file chunking/read failures RESOLVE in result.errors — mirroring
 				// kickBackgroundIndex, surface them or affected files go stale silently.
@@ -71,7 +74,10 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 				}
 			})
 			.catch((err: unknown) => {
-				if (engine === eng && notify) {
+				if (engine !== eng) return;
+				if (err instanceof AutomaticIndexFileLimitError) {
+					pauseAutomaticIndexing(eng, err, notify);
+				} else if (notify) {
 					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
 					notify(`Context index: watcher reindex failed (${detail})`, "warning");
 				}
@@ -93,6 +99,24 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		watcher?.stop();
 		watcher = null;
 		watcherKickPending = false;
+	};
+
+	/** A stable size refusal pauses every automatic path until the next session. */
+	const pauseAutomaticIndexing = (
+		eng: ContextEngine,
+		err: AutomaticIndexFileLimitError,
+		notify?: (msg: string, level: "info" | "warning") => void,
+	) => {
+		if (engine !== eng) return;
+		automaticIndexBlock = err;
+		lazyIndexStarted = true; // a lazy search must not immediately retry the same refusal
+		stopWatcher();
+		notify?.(
+			`Context index: automatic indexing${eng.config.indexerWatch ? " and watcher" : ""} paused. ` +
+				`Workspace exceeds ${err.limit.toLocaleString()} indexable files. ` +
+				"Run /context-index to index anyway, or raise indexer.max_auto_files.",
+			"warning",
+		);
 	};
 
 	/**
@@ -135,6 +159,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	 * itself one-shot per engine instance.
 	 */
 	const kickBackgroundIndex = (eng: ContextEngine, notify?: (msg: string, level: "info" | "warning") => void) => {
+		if (engine !== eng || automaticIndexBlock) return;
 		lazyIndexStarted = true;
 		indexInFlight = true;
 		// Cold-start visibility: the first build on an empty index is the only
@@ -167,12 +192,15 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 				// the lazy path burned on an empty index. Free the lazy path so a
 				// later search retries (autoIndexOnce un-consumes its one-shot),
 				// and surface the failure when we have a notify channel.
-				if (engine === eng) {
-					lazyIndexStarted = false;
-					if (notify) {
-						const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
-						notify(`Context index: background indexing failed — run /context-index for details (${detail})`, "warning");
-					}
+				if (engine !== eng) return;
+				if (err instanceof AutomaticIndexFileLimitError) {
+					pauseAutomaticIndexing(eng, err, notify);
+					return;
+				}
+				lazyIndexStarted = false;
+				if (notify) {
+					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
+					notify(`Context index: background indexing failed — run /context-index for details (${detail})`, "warning");
 				}
 			})
 			.finally(() => {
@@ -188,6 +216,8 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			// Best-effort: a cross-project switch must not leak sqlite handles.
 			void engine.shutdown().catch(() => undefined);
 		}
+		automaticIndexBlock = null;
+		lazyIndexStarted = false;
 		// Always track the live engine so `session_shutdown` closes it even when
 		// a tool ran before `session_start` (tests, mid-reload edge cases).
 		engine = new ContextEngine({ projectDir: dir });
@@ -233,6 +263,13 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			// `indexer.auto_index: false` disables this lazy kick too — one switch
 			// for all automatic indexing.
 			if (eng.chunkCount() === 0) {
+				if (automaticIndexBlock) {
+					return text(
+						`Automatic indexing is paused for ${eng.projectName}: the workspace exceeds ` +
+							`${automaticIndexBlock.limit.toLocaleString()} indexable files. ` +
+							"Run /context-index to index manually, or raise indexer.max_auto_files.",
+					);
+				}
 				if (indexInFlight) {
 					return text(
 						`Index for ${eng.projectName} is still building in the background — retry this search in a few seconds.`,
@@ -494,6 +531,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCwd = ctx.cwd;
+		automaticIndexBlock = null;
 		engine = new ContextEngine({ projectDir: ctx.cwd });
 		engine.startBackgroundWork();
 		lazyIndexStarted = false;
@@ -589,6 +627,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		}
 		stopWatcher();
 		watcherNotify = undefined;
+		automaticIndexBlock = null;
 		await engine?.shutdown().catch(() => undefined);
 		engine = null;
 	});

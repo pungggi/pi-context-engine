@@ -112,8 +112,23 @@ const LANGUAGE_MAP: Record<string, string> = {
 /** Skip any single file larger than this — protects from OOM on log dumps. */
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const BATCH = 50;
+const MANIFEST_CHECKPOINT_MS = 5000;
+const WALK_YIELD_FILES = 250;
+const WALK_YIELD_MS = 50;
 
 export class PathOutsideProjectError extends Error {}
+
+/** Automatic full-project runs refuse workspaces above their configured file budget. */
+export class AutomaticIndexFileLimitError extends Error {
+	constructor(
+		readonly limit: number,
+		/** Exact manifest size, or limit + 1 when the capped walk stopped early. */
+		readonly observedFiles: number,
+	) {
+		super(`Automatic indexing exceeds the ${limit}-file limit (found at least ${observedFiles})`);
+		this.name = "AutomaticIndexFileLimitError";
+	}
+}
 
 export interface IndexResult {
 	indexedFiles: string[];
@@ -233,6 +248,26 @@ function* iterProjectFiles(
 		}
 	};
 	yield* walk(walkRoot);
+}
+
+/**
+ * Collect a directory walk without starving pi's input/render loop. The file
+ * count covers cheap SSD walks; the time bound also covers slow filesystems.
+ */
+async function collectProjectFiles(files: Iterable<string>, maxAutoFiles?: number): Promise<string[]> {
+	const collected: string[] = [];
+	let lastYield = Date.now();
+	for (const filePath of files) {
+		if (maxAutoFiles !== undefined && collected.length >= maxAutoFiles) {
+			throw new AutomaticIndexFileLimitError(maxAutoFiles, collected.length + 1);
+		}
+		collected.push(filePath);
+		if (collected.length % WALK_YIELD_FILES === 0 || Date.now() - lastYield >= WALK_YIELD_MS) {
+			await yieldToEventLoop();
+			lastYield = Date.now();
+		}
+	}
+	return collected;
 }
 
 /** `{embeddings, cacheHits, cacheMisses}` for a batch, using the content cache. */
@@ -378,6 +413,8 @@ export async function runIndexing(
 	options: {
 		full?: boolean;
 		targetPath?: string | null;
+		/** Automatic full-project runs only. Stop before migrations when the workspace exceeds this budget. */
+		maxAutoFiles?: number;
 		callbacks?: IndexCallbacks;
 		/** Reuse an already-constructed backend/embedder (the long-lived server path). */
 		runtime?: { backend: LocalBackend; embedder: Embedder };
@@ -402,7 +439,7 @@ async function runIndexingLocked(
 	config: Config,
 	projectDir: string,
 	storageBase: string,
-	options: { full?: boolean; targetPath?: string | null; callbacks?: IndexCallbacks },
+	options: { full?: boolean; targetPath?: string | null; maxAutoFiles?: number; callbacks?: IndexCallbacks },
 	runtime?: { backend: LocalBackend; embedder: Embedder },
 ): Promise<IndexResult> {
 	let { full = false, targetPath = null } = options;
@@ -410,7 +447,6 @@ async function runIndexingLocked(
 	const { log, progress, phase } = callbacks;
 
 	const ownsBackend = runtime === undefined;
-	const backend = runtime?.backend ?? new LocalBackend(storageBase);
 	const chunker = new Chunker();
 	const manifest = new Manifest(path.join(storageBase, "manifest.json"));
 	const result: IndexResult = {
@@ -423,11 +459,38 @@ async function runIndexingLocked(
 		cacheMisses: 0,
 	};
 
+	const ignoreSet = new Set(config.indexerIgnore);
+	const rootIgnoreSet = new Set(ROOT_ONLY_IGNORE);
+	const cceignorePatterns = loadIgnorePatterns(projectDir);
+	if (cceignorePatterns.length > 0) log?.(`  [.cceignore] ${cceignorePatterns.length} pattern(s) loaded`);
+
 	// PR #7 review fix: migrations below call manifest.clearEntries(), which
 	// also erases the file list pruneFilesNotIn() needs to detect files that
 	// vanished BEFORE this run. Snapshot the paths first so the prune step
 	// can still delete their indexed chunks instead of orphaning them.
 	const preMigrationPaths = Object.keys(manifest.fileEntries);
+
+	// The automatic file budget rides on the walk we already need. No second
+	// directory scan or per-file stat pass is required. Reuse the completed
+	// walk below, and stop at limit + 1 before any store migration can wipe an
+	// existing index. A large manifest is an even cheaper early refusal.
+	let precheckedFileList: string[] | null = null;
+	if (options.maxAutoFiles !== undefined && targetPath === null) {
+		if (preMigrationPaths.length > options.maxAutoFiles) {
+			throw new AutomaticIndexFileLimitError(options.maxAutoFiles, preMigrationPaths.length);
+		}
+		precheckedFileList = await collectProjectFiles(
+			iterProjectFiles(projectDir, projectDir, ignoreSet, rootIgnoreSet, {
+				redactSecrets: config.indexerRedactSecrets,
+				cceignorePatterns,
+			}),
+			options.maxAutoFiles,
+		);
+	}
+
+	// Open stores only after the automatic guard has passed, so a refusal
+	// cannot leak SQLite handles on the session's long-lived process.
+	const backend = runtime?.backend ?? new LocalBackend(storageBase);
 
 	// Refuse unrecognized index formats outright (no compat reading): a
 	// manifest we can't recognize — pre-versioning, corrupt, or a future
@@ -453,11 +516,6 @@ async function runIndexingLocked(
 		}
 		full = true;
 	}
-
-	const ignoreSet = new Set(config.indexerIgnore);
-	const rootIgnoreSet = new Set(ROOT_ONLY_IGNORE);
-	const cceignorePatterns = loadIgnorePatterns(projectDir);
-	if (cceignorePatterns.length > 0) log?.(`  [.cceignore] ${cceignorePatterns.length} pattern(s) loaded`);
 
 	// ── Determine the file set ─────────────────────────────────────────────
 	/**
@@ -519,12 +577,12 @@ async function runIndexingLocked(
 				result.skippedFiles.push(rel);
 				fileList = [];
 			} else {
-				fileList = [
-					...iterProjectFiles(target, projectDir, ignoreSet, rootIgnoreSet, {
+				fileList = await collectProjectFiles(
+					iterProjectFiles(target, projectDir, ignoreSet, rootIgnoreSet, {
 						redactSecrets: config.indexerRedactSecrets,
 						cceignorePatterns,
 					}),
-				];
+				);
 			}
 			// Targeted runs skip the full-run prune below, so purge manifest
 			// entries under this subtree the walk no longer yields: newly
@@ -548,12 +606,12 @@ async function runIndexingLocked(
 			return result;
 		}
 	} else {
-		fileList = [
-			...iterProjectFiles(projectDir, projectDir, ignoreSet, rootIgnoreSet, {
+		fileList = precheckedFileList ?? (await collectProjectFiles(
+			iterProjectFiles(projectDir, projectDir, ignoreSet, rootIgnoreSet, {
 				redactSecrets: config.indexerRedactSecrets,
 				cceignorePatterns,
 			}),
-		];
+		));
 	}
 
 	// Warm up every AST grammar we're about to need (async, once).
@@ -624,6 +682,16 @@ async function runIndexingLocked(
 		let announced = false;
 		let totalCacheHits = 0;
 		let totalCacheMisses = 0;
+		// The first successful batch checkpoints immediately; later writes are
+		// rate-limited. An interrupted run can therefore skip completed batches
+		// without paying a manifest write for every file.
+		let lastManifestCheckpoint = 0;
+		const checkpointManifest = () => {
+			const now = Date.now();
+			if (now - lastManifestCheckpoint < MANIFEST_CHECKPOINT_MS) return;
+			manifest.save();
+			lastManifestCheckpoint = now;
+		};
 
 		for (let batchIndex = 0; batchIndex < fileList.length; batchIndex += BATCH) {
 			// Cooperative yield: the loops below do sync I/O, tree-sitter parsing
@@ -798,6 +866,7 @@ async function runIndexingLocked(
 
 			if (batchChunks.length > 0) {
 				const { embedder: emb, cache: cch } = await ensureEmbedder();
+				manifest.embeddingDim = emb.dimension;
 				if (phase && !announced) {
 					phase(`Embedding ${batchChunks.length.toLocaleString()} chunks${totalBatches > 1 ? ` (batch ${Math.floor(batchIndex / BATCH) + 1}/${totalBatches})` : ""}…`);
 					announced = true;
@@ -817,6 +886,7 @@ async function runIndexingLocked(
 				for (const [rel, hash] of batchManifestUpdates) manifest.update(rel, hash);
 				result.indexedFiles.push(...batchIndexed);
 			}
+			if (batchManifestUpdates.length > 0) checkpointManifest();
 			result.skippedFiles.push(...toChunk.filter((t) => !batchIndexed.includes(t.relPath)).map((t) => t.relPath));
 		}
 
@@ -884,6 +954,7 @@ async function runIndexingLocked(
 				const git = await indexCommits(projectDir, manifest.lastGitSha);
 				if (git.chunks.length > 0) {
 					const { embedder: emb, cache: cch } = await ensureEmbedder();
+					manifest.embeddingDim = emb.dimension;
 					phase?.(`Embedding ${git.chunks.length} git commits…`);
 					const stats = await embedChunks(git.chunks, emb, cch);
 					totalCacheHits += stats.hits;

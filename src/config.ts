@@ -95,6 +95,8 @@ export interface Config {
 	indexerContextHeaders: boolean;
 	/** Run an incremental reindex in the background shortly after session start. */
 	indexerAutoIndex: boolean;
+	/** Maximum files for automatic full-project indexing. Zero disables the guard; manual runs always bypass it. */
+	indexerMaxAutoFiles: number;
 	/**
 	 * Watch the project tree while a session runs and reindex on changes
 	 * (debounced, incremental). Independent of `indexerAutoIndex`, which only
@@ -134,6 +136,7 @@ export function defaultConfig(): Config {
 		indexerIgnore: [...DEFAULT_IGNORE],
 		indexerContextHeaders: true,
 		indexerAutoIndex: true,
+		indexerMaxAutoFiles: 10_000,
 		indexerWatch: true,
 		indexerRedactSecrets: true,
 		memoryRedactPii: true,
@@ -169,6 +172,7 @@ const MAPPING: Record<string, keyof Config> = {
 	"indexer.ignore": "indexerIgnore",
 	"indexer.context_headers": "indexerContextHeaders",
 	"indexer.auto_index": "indexerAutoIndex",
+	"indexer.max_auto_files": "indexerMaxAutoFiles",
 	"indexer.watch": "indexerWatch",
 	"indexer.redact_secrets": "indexerRedactSecrets",
 	"memory.redact_pii": "memoryRedactPii",
@@ -212,6 +216,11 @@ function applyDict(config: Config, data: any): void {
 				if (typeof item === "string" && !merged.includes(item)) merged.push(item);
 			}
 			config.indexerIgnore = merged;
+		} else if (attr === "indexerMaxAutoFiles") {
+			if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+				throw new Error(`config ${dotted} must be a non-negative integer`);
+			}
+			config.indexerMaxAutoFiles = value;
 		} else if (attr === "pricingInput" || attr === "pricingOutput") {
 			if (value !== null && typeof value !== "number") throw new Error(`config ${dotted} must be a number or null`);
 			(config as any)[attr] = value;

@@ -7,7 +7,7 @@ import { ContextEngine } from "../src/engine.js";
 import { defaultConfig, type Config } from "../src/config.js";
 import { LocalBackend } from "../src/storage/local-backend.js";
 import { HybridRetriever } from "../src/retrieval/retriever.js";
-import type { RerankerLike } from "../src/retrieval/reranker.js";
+import { LocalReranker, type RerankerLike } from "../src/retrieval/reranker.js";
 import { makeFakeEmbedder, makeTempDir, rmrf, writeFiles } from "./helpers.js";
 
 const dirs: string[] = [];
@@ -54,6 +54,48 @@ class ThrowingStub implements RerankerLike {
 		throw new Error("model not downloadable");
 	}
 }
+
+/** transformers.js stub for LocalReranker: counts loads, optionally fails. */
+function stubTransformers(opts: { fail?: boolean } = {}) {
+	let loads = 0;
+	const loader = async () => {
+		loads++;
+		if (opts.fail) throw new Error("network down");
+		return {
+			env: {},
+			AutoTokenizer: { from_pretrained: async () => (text: string) => ({ text }) },
+			AutoModelForSequenceClassification: {
+				from_pretrained: async () => async () => ({ logits: { data: [0] } }),
+			},
+		};
+	};
+	return { loader, loadCount: () => loads };
+}
+
+describe("LocalReranker.warm (issue #11)", () => {
+	it("loads the model once and reports ready", async () => {
+		const { loader, loadCount } = stubTransformers();
+		const reranker = new LocalReranker("fake-model", loader);
+
+		expect(await reranker.warm()).toBe(true);
+		expect(reranker.failed).toBe(false);
+		expect(reranker.loadError).toBeNull();
+		// A second warm reuses the memoized load — no double download.
+		expect(await reranker.warm()).toBe(true);
+		expect(loadCount()).toBe(1);
+	});
+
+	it("returns false and records the reason when the load fails", async () => {
+		const { loader } = stubTransformers({ fail: true });
+		const reranker = new LocalReranker("fake-model", loader);
+
+		expect(await reranker.warm()).toBe(false);
+		expect(reranker.failed).toBe(true);
+		expect(reranker.loadError).toBe("network down");
+		// Degrade-never-break: a later query is still a silent no-op.
+		expect(await reranker.rerank("q", ["doc"])).toEqual([]);
+	});
+});
 
 describe("R10: opt-in reranker", () => {
 	it("reorders the served list toward the reranker's preference", async () => {

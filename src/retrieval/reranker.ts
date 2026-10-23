@@ -56,6 +56,8 @@ export class LocalReranker implements RerankerLike {
 	private loading: Promise<LoadedReranker | null> | null = null;
 	/** Set after a load failure; every later call short-circuits to no-op. */
 	failed = false;
+	/** Why the load failed (null before any attempt). Surfaced by /context-warmup. */
+	loadError: string | null = null;
 
 	constructor(
 		readonly model: string,
@@ -88,6 +90,17 @@ export class LocalReranker implements RerankerLike {
 		}
 	}
 
+	/**
+	 * Force the model load now (issue #11, upstream warmup): downloads and
+	 * initializes the cross-encoder without needing a query. Returns false
+	 * when the load failed — the reranker then stays a silent no-op, per its
+	 * degrade-never-break design; `loadError` carries the reason.
+	 */
+	async warm(): Promise<boolean> {
+		if (this.failed) return false;
+		return (await this.ensureLoaded()) !== null;
+	}
+
 	private ensureLoaded(): Promise<LoadedReranker | null> {
 		if (this.loaded) return Promise.resolve(this.loaded);
 		if (!this.loading) {
@@ -102,8 +115,9 @@ export class LocalReranker implements RerankerLike {
 				});
 				this.loaded = { tokenizer, model };
 				return this.loaded;
-			})().catch(() => {
+			})().catch((err: unknown) => {
 				this.failed = true;
+				this.loadError = err instanceof Error ? err.message : String(err);
 				return null;
 			});
 		}

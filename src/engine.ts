@@ -125,8 +125,19 @@ export interface SessionStats {
 export interface EngineOptions {
 	projectDir: string;
 	config?: Config;
-	/** Test seam: reuse an existing backend/embedder instead of auto-detecting. */
-	runtime?: { backend: LocalBackend; embedder: Embedder };
+	/** Test seam: reuse an existing backend/embedder/reranker instead of auto-detecting. */
+	runtime?: { backend: LocalBackend; embedder: Embedder; reranker?: LocalReranker };
+}
+
+/** Issue #11 (upstream warmup): what /context-warmup resolved + cached. */
+export interface WarmupReport {
+	backend: string;
+	model: string;
+	dimension: number;
+	/** Present only when retrieval.rerank is "local". */
+	reranker?: string;
+	rerankerReady?: boolean;
+	rerankerError?: string;
 }
 
 /** R13: cheap keyword extraction for decision tags (no LLM): distinctive
@@ -150,10 +161,13 @@ export class ContextEngine {
 	readonly projectName: string;
 	readonly storageBase: string;
 	config: Config;
-	private readonly injectedRuntime: { backend: LocalBackend; embedder: Embedder } | undefined;
+	private readonly injectedRuntime:
+		| { backend: LocalBackend; embedder: Embedder; reranker?: LocalReranker }
+		| undefined;
 	private backendInstance: LocalBackend | null = null;
 	private embedderInstance: Embedder | null = null;
 	private retrieverInstance: HybridRetriever | null = null;
+	private rerankerInstance: LocalReranker | null = null;
 	private compressorInstance: Compressor | null = null;
 	private memoryInstance: MemoryDb | null = null;
 	private memoryFailed = false;
@@ -210,13 +224,46 @@ export class ContextEngine {
 			this.retrieverInstance = new HybridRetriever(this.backend, await this.getEmbedder(), {
 				expandContext: this.config.retrievalExpandContext,
 				autoElaborate: this.config.retrievalAutoElaborate,
-				reranker:
-					this.config.retrievalRerank === "local"
-						? new LocalReranker(this.config.retrievalRerankModel)
-						: null,
+				reranker: this.getReranker(),
 			});
 		}
 		return this.retrieverInstance;
+	}
+
+	/**
+	 * The opt-in local reranker, or null when reranking is off. Memoized so
+	 * /context-warmup loads the SAME instance the retriever later searches
+	 * with — the model stays warm across the command boundary.
+	 */
+	private getReranker(): LocalReranker | null {
+		if (this.config.retrievalRerank !== "local") return null;
+		this.rerankerInstance ??= this.injectedRuntime?.reranker ?? new LocalReranker(this.config.retrievalRerankModel);
+		return this.rerankerInstance;
+	}
+
+	/**
+	 * Warm the model caches (issue #11, upstream elara-labs#168): resolve +
+	 * download + dimension-probe the embedding backend, and — when the opt-in
+	 * local reranker is configured — its cross-encoder too. Unlike a reindex
+	 * on an empty or fully up-to-date repo (which never initializes the
+	 * embedder and therefore never touches the network), this guarantees the
+	 * models are cached, so the first search or index doesn't pay the fetch
+	 * inline. Ollama pulls ride the existing ensureModel() path.
+	 */
+	async warmup(): Promise<WarmupReport> {
+		const embedder = await this.getEmbedder();
+		const report: WarmupReport = {
+			backend: embedder.backendName,
+			model: embedder.modelName,
+			dimension: embedder.dimension,
+		};
+		const reranker = this.getReranker();
+		if (reranker) {
+			report.reranker = reranker.model;
+			report.rerankerReady = await reranker.warm();
+			if (!report.rerankerReady) report.rerankerError = reranker.loadError ?? "unknown error";
+		}
+		return report;
 	}
 
 	async getCompressor(): Promise<Compressor> {

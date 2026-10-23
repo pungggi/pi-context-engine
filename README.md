@@ -37,7 +37,7 @@ runs fixed queries. Run it yourself; nothing is cherry-picked.
 
 ## What you get
 
-Ten tools the agent can call, plus three slash commands.
+Ten tools the agent can call, plus four slash commands.
 
 **Search**
 - **`context_search`**: hybrid vector + BM25 retrieval with confidence scores.
@@ -56,7 +56,8 @@ Ten tools the agent can call, plus three slash commands.
 - **`index_status`**: chunk count and measured savings.
 - **`reindex`**: refresh a path or the whole project.
 
-Commands: `/context-index [--full]`, `/context-status`, `/context-savings`.
+Commands: `/context-index [--full]`, `/context-status`, `/context-savings`,
+`/context-warmup`.
 
 **Shipped guidance.** The package also injects a ~900-token guidance section
 into the system prompt while `context_search` is active: how to formulate
@@ -105,6 +106,19 @@ unchanged repo took 237 ms.
 - **Why it matters**: incremental runs are cheap (a few hundred ms on an
   unchanged repo), so this removes the classic cold-start failure of searching
   an empty index, without ever blocking the UI.
+
+### Model warmup
+
+- **`/context-warmup`** downloads the embedding model up front, no project or
+  index needed. With `retrieval.rerank: local` it also fetches the reranker
+  model; with Ollama as the backend it forces the model pull through the same
+  command.
+- **Why it matters**: the embedder initializes lazily, only when a run has
+  chunks to embed. An empty repo or an already up-to-date index never touches
+  the network, so on a fresh machine or an ephemeral container the download
+  lands inside the first search. Warming turns it into an explicit
+  provisioning step (a devcontainer `postCreateCommand`, a CI cache setup),
+  keeping first searches fast.
 
 ## Requirements
 

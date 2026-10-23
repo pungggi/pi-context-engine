@@ -461,6 +461,22 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("context-warmup", {
+		description: "Pre-download the embedding (and opt-in reranker) model so the first search doesn't fetch inline",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify("Warming up embedding model…", "info");
+			const report = await getEngine(ctx.cwd).warmup();
+			const parts = [`${report.backend} ${report.model} (${report.dimension} dims)`];
+			if (report.reranker) {
+				parts.push(report.rerankerReady ? `reranker ${report.reranker} ready` : `reranker ${report.reranker} FAILED: ${report.rerankerError}`);
+			}
+			ctx.ui.notify(
+				`✓ Warmup complete: ${parts.join(" · ")}`,
+				report.reranker && !report.rerankerReady ? "warning" : "info",
+			);
+		},
+	});
+
 	/* ── Lifecycle hooks (replace upstream's curl-based hooks) ───────────── */
 
 	pi.on("session_start", async (_event, ctx) => {

@@ -267,7 +267,7 @@ bootstrapping for non-pi editors.
 
 ```bash
 npm install
-npm run check          # typecheck + 97 unit tests
+npm run check          # typecheck + 251 unit tests
 npm run smoke:env      # tree-sitter + sqlite-vec capability check
 npm run smoke:loader   # load the extension through pi's jiti loader
 npm run smoke:real-world  # index this repo with the local embedder

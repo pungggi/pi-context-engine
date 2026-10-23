@@ -132,7 +132,16 @@ describe("engine wiring: search passes the query to the compressor", () => {
 		writeFiles(projectDir, { "src/ledger/wiring.ts": bigChunk().content.split("\n").slice(1).join("\n") + "\n" });
 		const storageRoot = makeTempDir("pce-store-");
 		dirs.push(storageRoot);
-		const config: Config = { ...defaultConfig(), storagePath: storageRoot, compressionLevel: "standard" };
+		const config: Config = {
+			...defaultConfig(),
+			storagePath: storageRoot,
+			compressionLevel: "standard",
+			// Pin the compressor offline (same as the direct tests above): a
+			// machine with Ollama running flips compress() to the LLM path, whose
+			// summary/failed-summary fallback is query-independent — the assertion
+			// would then depend on the machine, not the code under test.
+			ollamaUrl: "http://127.0.0.1:1",
+		};
 		const engine = new ContextEngine({ projectDir, config });
 		const embedder = makeFakeEmbedder();
 		const backend = new LocalBackend(engine.storageBase);

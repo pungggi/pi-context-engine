@@ -137,6 +137,14 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	const kickBackgroundIndex = (eng: ContextEngine, notify?: (msg: string, level: "info" | "warning") => void) => {
 		lazyIndexStarted = true;
 		indexInFlight = true;
+		// Cold-start visibility: the first build on an empty index is the only
+		// background run that can take minutes (every file gets chunked and
+		// embedded), and it used to stay invisible until the completion line.
+		// Announce the start so a long pause reads as "indexing", not as a hung
+		// session. Warm incremental runs are NOT announced: they finish in a few
+		// hundred ms and a toast on every session start would be noise.
+		const announcedStart = eng.chunkCount() === 0 && notify !== undefined;
+		if (announcedStart) notify?.(`Context index: building the first index for ${eng.projectName}…`, "info");
 		void eng
 			.autoIndexOnce()
 			.then((result) => {
@@ -145,6 +153,11 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 					notify(`Context index: background index hit ${result.errors.length} error(s)`, "warning");
 				} else if (result.indexed > 0) {
 					notify(`Context index updated: ${result.indexed} file(s), ${result.chunks} chunk(s)`, "info");
+				} else if (announcedStart) {
+					// The start toast promised feedback — close the loop even when
+					// there is nothing to index (empty project), instead of leaving
+					// "building…" hanging without a result.
+					notify(`Context index: no files to index for ${eng.projectName}`, "info");
 				}
 			})
 			.catch((err: unknown) => {

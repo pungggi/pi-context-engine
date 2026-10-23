@@ -103,6 +103,12 @@ unchanged repo took 237 ms.
 - **Switches**: `indexer.auto_index: false` disables the session-start and
   lazy kicks; `indexer.watch: false` disables the file watcher. Use
   `/context-index` for manual builds.
+- **Cold-start visibility**: the first build on an empty index announces its
+  start (`building the first index…`) and always closes with a result line
+  (`updated: N file(s)` or `no files to index`). This is the one background
+  run that can take minutes, so a pause reads as "indexing", not as a hung
+  session. Warm incremental runs stay quiet on start: they finish in a few
+  hundred ms, and a toast per session would be noise.
 - **Why it matters**: incremental runs are cheap (a few hundred ms on an
   unchanged repo), so this removes the classic cold-start failure of searching
   an empty index, without ever blocking the UI.

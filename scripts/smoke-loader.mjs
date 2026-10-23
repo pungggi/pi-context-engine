@@ -104,6 +104,8 @@ if (problems.length === 0) {
 
 	const ctx = { cwd: fixture, ui: { notify: () => undefined }, mode: "cli", hasUI: false };
 	const textOf = (result) => result.content.map((c) => c.text).join("\n");
+	/** Second-fixture artifacts for the cold-start check, cleaned in finally. */
+	const extraCleanup = [];
 
 	try {
 		const reindex = await tools.get("reindex").execute("t1", {}, undefined, undefined, ctx);
@@ -149,6 +151,51 @@ if (problems.length === 0) {
 			if (!section) problems.push("guidance section not injected while context_search selected");
 			else if (!section.includes("/context-index")) problems.push("guidance section missing index lifecycle text");
 		}
+
+		// ── Cold-start visibility (follow-up to #11) ─────────────────────────
+		// session_start on a FRESH project (empty index) must announce the
+		// background build and close the loop with a result line — the one
+		// background run that can take minutes used to stay invisible until
+		// completion. Runs AFTER the tool tests behind an explicit shutdown, so
+		// the project switch goes through the normal lifecycle (the previous
+		// engine's sqlite handles close before the cleanup below).
+		await handlers.get("session_shutdown")?.({}, {});
+
+		const fixture2 = fs.mkdtempSync(path.join(os.tmpdir(), "pce-fixture-cold-"));
+		const storage2 = fs.mkdtempSync(path.join(os.tmpdir(), "pce-loader-cold-"));
+		extraCleanup.push(fixture2, storage2);
+		fs.mkdirSync(path.join(fixture2, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(fixture2, "src", "app.ts"),
+			"export function greet(name: string): string {\n  return `hi ${name}`;\n}\n",
+			"utf-8",
+		);
+		fs.writeFileSync(
+			path.join(fixture2, ".context-engine.yaml"),
+			`storage:\n  path: ${storage2.replace(/\\/g, "/")}\n`,
+			"utf-8",
+		);
+
+		const notes = [];
+		const coldCtx = {
+			cwd: fixture2,
+			ui: { notify: (msg, level) => notes.push(`${level}: ${msg}`) },
+			mode: "cli",
+			hasUI: true,
+		};
+		await handlers.get("session_start")?.({}, coldCtx);
+
+		// The kick fires AUTO_INDEX_DELAY_MS (2 s) after session start; poll
+		// until both lines land (model download on a cold CI cache included).
+		const announced = () => notes.some((m) => m.includes("building the first index"));
+		const closed = () => notes.some((m) => m.includes("Context index updated:") || m.includes("no files to index"));
+		const deadline = Date.now() + 120_000;
+		while (Date.now() < deadline && !(announced() && closed())) {
+			await new Promise((r) => setTimeout(r, 250));
+		}
+		if (!announced()) problems.push(`cold-start: missing start notification — got ${JSON.stringify(notes)}`);
+		else if (!closed()) problems.push(`cold-start: missing result notification — got ${JSON.stringify(notes)}`);
+		else console.log(`cold-start: start + result notifications verified (${notes.length} total): ${notes.join(" | ")}`);
 	} catch (err) {
 		problems.push(`tool invocation threw: ${err.stack ?? err}`);
 	} finally {
@@ -159,22 +206,28 @@ if (problems.length === 0) {
 		} catch (err) {
 			problems.push(`session_shutdown threw: ${err}`);
 		}
-		// Windows transient EBUSY: an sqlite file can still be locked for a few
-		// ms after close (defender/indexer grabbing the fresh file), so retry
-		// briefly instead of failing the whole CI job on a cleanup hiccup.
+		// Windows transient EBUSY/EPERM: an sqlite file can still be locked for
+		// a while after close (defender/indexer grabbing the fresh file), so
+		// retry for a few seconds instead of failing the whole CI job on a
+		// cleanup hiccup. A persistent failure lands in `problems` instead of
+		// throwing, so the report below still prints.
 		const removeRecursive = (target) => {
 			for (let attempt = 0; ; attempt++) {
 				try {
 					fs.rmSync(target, { recursive: true, force: true });
 					return;
 				} catch (err) {
-					if (attempt >= 10 || (err.code !== "EBUSY" && err.code !== "EPERM")) throw err;
-					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); // sync sleep
+					if (attempt >= 30 || (err.code !== "EBUSY" && err.code !== "EPERM")) {
+						problems.push(`cleanup failed for ${target}: ${err.code ?? err.message}`);
+						return;
+					}
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); // sync sleep
 				}
 			}
 		};
 		removeRecursive(fixture);
 		removeRecursive(storageRoot);
+		for (const dir of extraCleanup) removeRecursive(dir);
 	}
 }
 

@@ -368,8 +368,7 @@ export async function indexCommits(
 
 /**
  * Per-storage-dir indexing lock so concurrent reindex runs (auto-index kick,
- * lazy search kick, manual /context-index; plus a future file watcher, #12)
- * can't interleave.
+ * lazy search kick, file watcher, manual /context-index) can't interleave.
  */
 const pipelineLocks = new Map<string, Promise<unknown>>();
 

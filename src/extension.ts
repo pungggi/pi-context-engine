@@ -245,6 +245,20 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		return engine;
 	};
 
+	/** Human-readable byte count for the reset report (explicit user action —
+	 * the automatic guard never measures bytes by design). */
+	const formatBytes = (n: number): string => {
+		if (n < 1024) return `${n} B`;
+		const units = ["KiB", "MiB", "GiB"];
+		let v = n / 1024;
+		let u = 0;
+		while (v >= 1024 && u < units.length - 1) {
+			v /= 1024;
+			u++;
+		}
+		return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[u]}`;
+	};
+
 	const text = (body: string, details?: unknown) => ({
 		content: [{ type: "text" as const, text: body }],
 		details: details ?? {},
@@ -495,9 +509,40 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	/* ── Commands ────────────────────────────────────────────────────────── */
 
 	pi.registerCommand("context-index", {
-		description: "Build or refresh the semantic code index: /context-index [--full]",
+		description: "Build or refresh the semantic code index: /context-index [--full] [--reset]",
 		handler: async (args, ctx) => {
 			const eng = getEngine(ctx.cwd);
+			// --reset: delete the index through the engine (handles closed first, so
+			// it works while THIS session runs — manual deletion hits locked-file
+			// errors). Memory, sessions and savings survive. No auto-rebuild: the
+			// next search or /context-index decides, so an oversized workspace is
+			// not ambushed with a multi-minute build it just escaped.
+			if (args.includes("--reset")) {
+				if (indexInFlight) {
+					ctx.ui.notify(
+						"Context index: indexing is in progress — run /context-index --reset again once it finishes.",
+						"warning",
+					);
+					return;
+				}
+				const report = await eng.resetIndex();
+				// Free the lazy kick so the next search can rebuild (guarded by the
+				// same file budget as every automatic run).
+				lazyIndexStarted = false;
+				if (report.errors.length > 0) {
+					ctx.ui.notify(
+						`⚠ Index reset incomplete: ${report.errors.length} target(s) locked (${report.errors[0]}). Close other sessions on this project and run /context-index --reset again.`,
+						"warning",
+					);
+				} else {
+					ctx.ui.notify(
+						`✓ Index deleted: ${report.deletedFiles} file(s), ${formatBytes(report.freedBytes)} freed — memory, sessions and savings kept. ` +
+							"Run /context-index to build a fresh index.",
+						"info",
+					);
+				}
+				return;
+			}
 			const full = args.includes("--full");
 			ctx.ui.notify(full ? "Re-indexing everything…" : "Indexing (incremental)…", "info");
 			const result = await eng.reindex({ full });

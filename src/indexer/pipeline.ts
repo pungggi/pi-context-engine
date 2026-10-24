@@ -407,6 +407,15 @@ export async function indexCommits(
  */
 const pipelineLocks = new Map<string, Promise<unknown>>();
 
+/**
+ * Resolve once no indexing run for this storage dir is in flight. The reset
+ * path uses this so it never deletes files a running pipeline is writing.
+ */
+export async function waitForPipelineIdle(storageBase: string): Promise<void> {
+	const tail = pipelineLocks.get(storageBase);
+	if (tail) await tail.catch(() => undefined);
+}
+
 export async function runIndexing(
 	config: Config,
 	projectDirInput: string,
@@ -416,8 +425,9 @@ export async function runIndexing(
 		/** Automatic full-project runs only. Stop before migrations when the workspace exceeds this budget. */
 		maxAutoFiles?: number;
 		callbacks?: IndexCallbacks;
-		/** Reuse an already-constructed backend/embedder (the long-lived server path). */
-		runtime?: { backend: LocalBackend; embedder: Embedder };
+		/** Reuse an already-constructed backend/embedder (the long-lived server path);
+		 * a null backend falls through to a fresh LocalBackend (used by resetIndex). */
+		runtime?: { backend?: LocalBackend | null; embedder: Embedder };
 	} = {},
 ): Promise<IndexResult> {
 	const projectDir = fs.realpathSync(path.resolve(projectDirInput));
@@ -440,13 +450,16 @@ async function runIndexingLocked(
 	projectDir: string,
 	storageBase: string,
 	options: { full?: boolean; targetPath?: string | null; maxAutoFiles?: number; callbacks?: IndexCallbacks },
-	runtime?: { backend: LocalBackend; embedder: Embedder },
+	runtime?: { backend?: LocalBackend | null; embedder: Embedder },
 ): Promise<IndexResult> {
 	let { full = false, targetPath = null } = options;
 	const { callbacks = {} } = options;
 	const { log, progress, phase } = callbacks;
 
-	const ownsBackend = runtime === undefined;
+	// The caller only owns the backend it actually passed in; a null backend
+	// (resetIndex dropped its closed handle) means the pipeline built its own
+	// and must close it — otherwise its sqlite handles leak until exit.
+	const ownsBackend = !runtime?.backend;
 	const chunker = new Chunker();
 	const manifest = new Manifest(path.join(storageBase, "manifest.json"));
 	const result: IndexResult = {

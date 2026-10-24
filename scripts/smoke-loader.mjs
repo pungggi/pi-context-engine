@@ -60,11 +60,15 @@ if (typeof factory !== "function") throw new Error(`default export is not a func
 
 const tools = new Map();
 const commands = [];
+const commandSpecs = new Map();
 const events = new Set();
 const handlers = new Map();
 const fakePi = {
 	registerTool: (tool) => tools.set(tool.name, tool),
-	registerCommand: (name) => commands.push(name),
+	registerCommand: (name, spec) => {
+		commands.push(name);
+		commandSpecs.set(name, spec);
+	},
 	on: (event, handler) => {
 		events.add(event);
 		handlers.set(event, handler);
@@ -282,6 +286,86 @@ if (problems.length === 0) {
 		}
 		if (!paused()) problems.push(`watcher file limit: missing pause warning — got ${JSON.stringify(limitNotes)}`);
 		else console.log("watcher file limit: filesystem trigger paused with a warning");
+
+		// ── /context-index --reset: in-session index deletion ────────────
+		// Manual deletion of ~/.pi-context-engine/projects/<slug> fails with
+		// EPERM while a session holds sqlite handles. The reset command must
+		// delete the index DURING a live session, keep memory/sessions, and let
+		// the next search rebuild via the (re-armed) lazy kick.
+		await handlers.get("session_shutdown")?.({}, {});
+		const fixture4 = fs.mkdtempSync(path.join(os.tmpdir(), "pce-fixture-reset-"));
+		const storage4 = fs.mkdtempSync(path.join(os.tmpdir(), "pce-loader-reset-"));
+		extraCleanup.push(fixture4, storage4);
+		fs.mkdirSync(path.join(fixture4, "src"), { recursive: true });
+		fs.writeFileSync(path.join(fixture4, "src", "a.txt"), "reset alpha beacon\n", "utf-8");
+		fs.writeFileSync(
+			fixture4 + path.sep + ".context-engine.yaml",
+			`storage:\n  path: ${storage4.replace(/\\/g, "/")}\n`,
+			"utf-8",
+		);
+		const resetNotes = [];
+		const resetCtx = {
+			cwd: fixture4,
+			ui: { notify: (msg, level) => resetNotes.push(`${level}: ${msg}`) },
+			mode: "cli",
+			hasUI: true,
+		};
+		await handlers.get("session_start")?.({}, resetCtx);
+		const resetBuilt = () => resetNotes.some((m) => m.includes("Context index updated:"));
+		const resetBuildDeadline = Date.now() + 120_000;
+		while (Date.now() < resetBuildDeadline && !resetBuilt()) {
+			await new Promise((r) => setTimeout(r, 250));
+		}
+		if (!resetBuilt()) {
+			problems.push(`reset: first index never finished — ${JSON.stringify(resetNotes)}`);
+		} else {
+			// A decision makes memory.db exist, and a first search persists
+			// stats.json — so the probe can prove user history survives the reset.
+			await tools
+				.get("record_decision")
+				.execute("t-reset-dec", { decision: "reset keeps memory", reason: "smoke probe" }, undefined, undefined, resetCtx);
+			await tools
+				.get("context_search")
+				.execute("t-reset-warm", { query: "alpha beacon" }, undefined, undefined, resetCtx);
+			const contextIndexSpec = commandSpecs.get("context-index");
+			if (typeof contextIndexSpec?.handler !== "function") {
+				problems.push("reset: /context-index command spec not captured");
+			} else {
+				await contextIndexSpec.handler(["--reset"], resetCtx);
+				const deletedNote = resetNotes.find((m) => m.includes("Index deleted:"));
+				if (!deletedNote || !deletedNote.includes("freed")) {
+					problems.push(`reset: missing freed-bytes report — ${JSON.stringify(resetNotes)}`);
+				}
+				// Index artifacts gone, user history alive.
+				const entries = () => fs.readdirSync(storage4, { recursive: true }).map(String);
+				const has = (name) => entries().some((p) => p.split(/[\\/]/).pop() === name);
+				if (has("manifest.json")) problems.push("reset: manifest.json survived the reset");
+				if (has("vectors")) problems.push("reset: vectors store survived the reset");
+				if (has("graph.db")) problems.push("reset: graph store survived the reset");
+				if (has("graph.db-shm") || has("graph.db-wal")) problems.push("reset: graph sqlite sidecars survived the reset");
+				if (has("embedding_cache.db")) problems.push("reset: embedding cache survived the reset");
+				if (!has("memory.db")) problems.push("reset: memory.db did not survive the reset");
+				if (!has("stats.json")) problems.push("reset: stats.json did not survive the reset");
+				// The lazy kick re-arms: the next search rebuilds in the background.
+				const afterReset = await tools
+					.get("context_search")
+					.execute("t-reset-search", { query: "alpha beacon" }, undefined, undefined, resetCtx);
+				if (!textOf(afterReset).includes("indexing started in the background")) {
+					problems.push(`reset: lazy kick did not re-arm — ${textOf(afterReset)}`);
+				} else {
+					const rebuildDeadline = Date.now() + 120_000;
+					while (Date.now() < rebuildDeadline && !resetNotes.some((m, i) => i > resetNotes.indexOf(deletedNote) && m.includes("Context index updated:"))) {
+						await new Promise((r) => setTimeout(r, 250));
+					}
+					const rebuiltSearch = await tools
+						.get("context_search")
+						.execute("t-reset-search2", { query: "alpha beacon" }, undefined, undefined, resetCtx);
+					if (!textOf(rebuiltSearch).includes("a.txt")) {
+						problems.push(`reset: rebuilt index missed a.txt — ${textOf(rebuiltSearch)}`);
+					} else console.log("reset: deleted (freed report), memory kept, lazy rebuild verified");
+				}
+			}
+		}
 	} catch (err) {
 		problems.push(`tool invocation threw: ${err.stack ?? err}`);
 	} finally {

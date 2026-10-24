@@ -56,7 +56,7 @@ Ten tools the agent can call, plus four slash commands.
 - **`index_status`**: chunk count and measured savings.
 - **`reindex`**: refresh a path or the whole project.
 
-Commands: `/context-index [--full]`, `/context-status`, `/context-savings`,
+Commands: `/context-index [--full] [--reset]`, `/context-status`, `/context-savings`,
 `/context-warmup`.
 
 **Shipped guidance.** The package also injects a ~900-token guidance section
@@ -119,6 +119,14 @@ unchanged repo took 237 ms.
   Migration runs (schema reset, embedding-dimension change) are exempt: their
   manifest stays untouched on disk until the run completes, so an interrupted
   migration resumes cleanly instead of stranding stale rows.
+- **One-command reset**: `/context-index --reset` deletes the index through the
+  engine while the session is running: sqlite handles are closed first, so it
+  succeeds where manual deletion of the storage directory fails with locked
+  file errors (EPERM on Windows). The report shows how many files and bytes
+  were freed, and memory, sessions, and the savings ledger survive. The
+  embedding cache is deleted too, so a rebuild re-embeds from scratch. The
+  next search rebuilds via the lazy kick, guarded by the same file budget as
+  every automatic run.
 - **Cold-start visibility**: the first build on an empty index announces its
   start (`building the first index…`) and always closes with a result line
   (`updated: N file(s)` or `no files to index`). This is the one background

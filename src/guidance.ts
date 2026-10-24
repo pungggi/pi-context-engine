@@ -100,6 +100,7 @@ If the first search misses:
 - If a search says the index is empty, a background index is already running - retry shortly, or run \`/context-index\` for a synchronous build
 - After large refactors, \`reindex\` (or \`/context-index\`) keeps results current; \`index_status\` reports freshness and measured token savings
 - Incremental re-index only re-reads changed files, so it is cheap
+- To wipe the index (stale or corrupted results), \`/context-index --reset\` deletes it safely mid-session - memory and sessions survive; the next search rebuilds
 `;
 
 /**

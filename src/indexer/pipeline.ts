@@ -408,12 +408,19 @@ export async function indexCommits(
 const pipelineLocks = new Map<string, Promise<unknown>>();
 
 /**
- * Resolve once no indexing run for this storage dir is in flight. The reset
- * path uses this so it never deletes files a running pipeline is writing.
+ * Queue work behind every indexing run already registered for this storage
+ * dir, and keep later runs queued until the work finishes. Reset uses this
+ * instead of a one-shot idle wait: a reindex queued during that wait must not
+ * open the stores while deletion is in progress.
  */
-export async function waitForPipelineIdle(storageBase: string): Promise<void> {
-	const tail = pipelineLocks.get(storageBase);
-	if (tail) await tail.catch(() => undefined);
+export async function withPipelineLock<T>(storageBase: string, work: () => T | Promise<T>): Promise<T> {
+	const previous = pipelineLocks.get(storageBase) ?? Promise.resolve();
+	const current = previous.then(() => work());
+	pipelineLocks.set(
+		storageBase,
+		current.catch(() => undefined),
+	);
+	return current;
 }
 
 export async function runIndexing(
@@ -434,15 +441,9 @@ export async function runIndexing(
 	const storageBase = projectStorageDir(config.storagePath, projectDir);
 	fs.mkdirSync(storageBase, { recursive: true });
 
-	const previous = pipelineLocks.get(storageBase) ?? Promise.resolve();
-	const current = previous.then(() =>
+	return withPipelineLock(storageBase, () =>
 		runIndexingLocked(config, projectDir, storageBase, options, options.runtime),
 	);
-	pipelineLocks.set(
-		storageBase,
-		current.catch(() => undefined),
-	);
-	return current;
 }
 
 async function runIndexingLocked(

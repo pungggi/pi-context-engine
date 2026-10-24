@@ -525,6 +525,12 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 					);
 					return;
 				}
+				// Reset also cancels the delayed startup kick. Otherwise its timer
+				// would rebuild the index immediately after the explicit delete.
+				if (autoIndexTimer) {
+					clearTimeout(autoIndexTimer);
+					autoIndexTimer = null;
+				}
 				const report = await eng.resetIndex();
 				// Free the lazy kick so the next search can rebuild (guarded by the
 				// same file budget as every automatic run).

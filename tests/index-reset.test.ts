@@ -107,6 +107,51 @@ describe("engine.resetIndex", () => {
 		expect(result.inline.length + result.overflow.length).toBeGreaterThan(0);
 	});
 
+	it("queues reset between an active run and a later reindex without closed-handle races", async () => {
+		const { engine, storageBase } = harness({ repo: { "src/a.txt": "alpha\n" } });
+		const embedder = (engine as unknown as { embedderInstance: Embedder }).embedderInstance;
+		const originalEmbed = embedder.embedTexts.bind(embedder);
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let calls = 0;
+		let secondManifestAtEmbed: boolean | null = null;
+		embedder.embedTexts = async (texts, batchSize) => {
+			calls++;
+			if (calls === 1) {
+				markFirstStarted();
+				await firstGate;
+			} else if (calls === 2) {
+				// The later run must start after reset deleted the old manifest,
+				// not while reset is closing/deleting the stores it uses.
+				secondManifestAtEmbed = fs.existsSync(path.join(storageBase, "manifest.json"));
+			}
+			return originalEmbed(texts, batchSize);
+		};
+
+		const first = engine.reindex({});
+		await firstStarted;
+		const reset = engine.resetIndex();
+		// This run is registered after reset. It must execute after the reset,
+		// and must observe the mutated (now null) injected backend.
+		const second = engine.reindex({});
+		releaseFirst();
+		const [firstResult, report, secondResult] = await Promise.all([first, reset, second]);
+
+		expect(firstResult.errors).toEqual([]);
+		expect(report.errors).toEqual([]);
+		expect(report.deletedFiles).toBeGreaterThan(0);
+		expect(secondResult.errors).toEqual([]);
+		expect(secondResult.indexed).toBe(1);
+		expect(secondManifestAtEmbed).toBe(false);
+		expect(engine.chunkCount()).toBeGreaterThan(0);
+	});
+
 	it("re-unconsumes the automatic one-shot so a reset workspace is auto-rebuildable", async () => {
 		const { engine } = harness({ repo: { "src/a.txt": "alpha\n" } });
 		const run1 = await engine.autoIndexOnce();

@@ -201,6 +201,39 @@ if (problems.length === 0) {
 		else if (!closed()) problems.push(`cold-start: missing result notification — got ${JSON.stringify(notes)}`);
 		else console.log(`cold-start: start + result notifications verified (${notes.length} total): ${notes.join(" | ")}`);
 
+		// ── Reset cancels the delayed startup kick ────────────────────────
+		// A reset during the two-second startup window is an explicit delete,
+		// not a request for the timer to recreate the index a moment later.
+		await handlers.get("session_shutdown")?.({}, {});
+		const fixtureTimer = fs.mkdtempSync(path.join(os.tmpdir(), "pce-fixture-reset-timer-"));
+		const storageTimer = fs.mkdtempSync(path.join(os.tmpdir(), "pce-loader-reset-timer-"));
+		extraCleanup.push(fixtureTimer, storageTimer);
+		fs.mkdirSync(path.join(fixtureTimer, "src"), { recursive: true });
+		fs.writeFileSync(path.join(fixtureTimer, "src", "a.txt"), "timer reset probe\n", "utf-8");
+		fs.writeFileSync(
+			path.join(fixtureTimer, ".context-engine.yaml"),
+			`storage:\n  path: ${storageTimer.replace(/\\/g, "/")}\n`,
+			"utf-8",
+		);
+		const timerNotes = [];
+		const timerCtx = {
+			cwd: fixtureTimer,
+			ui: { notify: (msg, level) => timerNotes.push(`${level}: ${msg}`) },
+			mode: "cli",
+			hasUI: true,
+		};
+		await handlers.get("session_start")?.({}, timerCtx);
+		const timerCommand = commandSpecs.get("context-index");
+		if (typeof timerCommand?.handler !== "function") {
+			problems.push("reset timer: /context-index command spec not captured");
+		} else {
+			await timerCommand.handler(["--reset"], timerCtx);
+			await new Promise((r) => setTimeout(r, 2500));
+			if (timerNotes.some((m) => m.includes("building the first index") || m.includes("Context index updated:"))) {
+				problems.push(`reset timer: startup kick rebuilt after reset — ${JSON.stringify(timerNotes)}`);
+			} else console.log("reset timer: delayed startup kick cancelled by reset");
+		}
+
 		// ── Automatic workspace size guard ─────────────────────────────
 		// A full-project background run must refuse a workspace above the
 		// configured budget, warn clearly, and make lazy search explain the

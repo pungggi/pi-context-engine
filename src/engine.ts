@@ -20,7 +20,7 @@ import { SessionCapture } from "./memory/session-capture.js";
 import { drainOne, enqueueSessionRollup, enqueueTurn, type CompressionDeps } from "./memory/compressor.js";
 import { compress, expand, compressWithCounts, DEFAULT_LEVEL } from "./memory/grammar.js";
 import { cosine } from "./memory/extractive.js";
-import { AutomaticIndexFileLimitError, runIndexing, waitForPipelineIdle } from "./indexer/pipeline.js";
+import { AutomaticIndexFileLimitError, runIndexing, withPipelineLock } from "./indexer/pipeline.js";
 import { getModelPricing } from "./pricing.js";
 import type { Chunk } from "./types.js";
 
@@ -366,12 +366,16 @@ export class ContextEngine {
 	 * user history, not index state. Handles are closed BEFORE deletion:
 	 * Windows refuses to delete files with open sqlite handles, which is why
 	 * manually deleting the storage dir fails while a session is running.
-	 * Waits for an in-flight pipeline run first so it never races a reindex.
+	 * Queues behind in-flight and queued pipeline runs, and holds the same lock
+	 * during deletion so a later reindex cannot race the reset.
 	 * Errors are reported per target (e.g. another session holding a handle)
 	 * instead of failing the whole reset.
 	 */
 	async resetIndex(): Promise<{ deletedFiles: number; freedBytes: number; errors: string[] }> {
-		await waitForPipelineIdle(this.storageBase);
+		return withPipelineLock(this.storageBase, () => this.resetIndexLocked());
+	}
+
+	private async resetIndexLocked(): Promise<{ deletedFiles: number; freedBytes: number; errors: string[] }> {
 		try {
 			this.backendInstance?.close();
 		} catch {
@@ -379,11 +383,11 @@ export class ContextEngine {
 		}
 		this.backendInstance = null;
 		this.retrieverInstance = null;
-		// The injected backend was just closed — drop it from the injected
-		// runtime so the next pipeline run opens a fresh one (a null backend
-		// falls through to the pipeline's own construction). Embedder and
-		// reranker survive: they hold no files.
-		if (this.injectedRuntime) this.injectedRuntime = { ...this.injectedRuntime, backend: null };
+		// Mutate the runtime object rather than replacing it: reindex calls that
+		// were queued behind this reset captured the same object and must see the
+		// closed backend dropped before they execute. Embedder and reranker
+		// survive: they hold no files.
+		if (this.injectedRuntime) this.injectedRuntime.backend = null;
 		// A reset index may be rebuilt by the next automatic kick.
 		this.autoIndexDone = false;
 		let deletedFiles = 0;

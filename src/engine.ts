@@ -20,7 +20,7 @@ import { SessionCapture } from "./memory/session-capture.js";
 import { drainOne, enqueueSessionRollup, enqueueTurn, type CompressionDeps } from "./memory/compressor.js";
 import { compress, expand, compressWithCounts, DEFAULT_LEVEL } from "./memory/grammar.js";
 import { cosine } from "./memory/extractive.js";
-import { AutomaticIndexFileLimitError, runIndexing } from "./indexer/pipeline.js";
+import { AutomaticIndexFileLimitError, runIndexing, withPipelineLock } from "./indexer/pipeline.js";
 import { getModelPricing } from "./pricing.js";
 import type { Chunk } from "./types.js";
 
@@ -125,8 +125,10 @@ export interface SessionStats {
 export interface EngineOptions {
 	projectDir: string;
 	config?: Config;
-	/** Test seam: reuse an existing backend/embedder/reranker instead of auto-detecting. */
-	runtime?: { backend: LocalBackend; embedder: Embedder; reranker?: LocalReranker };
+	/** Test seam: reuse an existing backend/embedder/reranker instead of
+	 * auto-detecting. `backend` may be nulled by resetIndex — the pipeline
+	 * then constructs a fresh one. */
+	runtime?: { backend?: LocalBackend | null; embedder: Embedder; reranker?: LocalReranker };
 }
 
 /** Issue #11 (upstream warmup): what /context-warmup resolved + cached. */
@@ -161,8 +163,8 @@ export class ContextEngine {
 	readonly projectName: string;
 	readonly storageBase: string;
 	config: Config;
-	private readonly injectedRuntime:
-		| { backend: LocalBackend; embedder: Embedder; reranker?: LocalReranker }
+	private injectedRuntime:
+		| { backend?: LocalBackend | null; embedder: Embedder; reranker?: LocalReranker }
 		| undefined;
 	private backendInstance: LocalBackend | null = null;
 	private embedderInstance: Embedder | null = null;
@@ -188,7 +190,7 @@ export class ContextEngine {
 		this.config = options.config ?? loadConfigForProject(this.projectDir);
 		this.injectedRuntime = options.runtime;
 		if (options.runtime) {
-			this.backendInstance = options.runtime.backend;
+			this.backendInstance = options.runtime.backend ?? null;
 			this.embedderInstance = options.runtime.embedder;
 		}
 		this.storageBase = projectStorageDir(this.config.storagePath, this.projectDir);
@@ -356,6 +358,93 @@ export class ContextEngine {
 
 	chunkCount(): number {
 		return this.backend.countChunks();
+	}
+
+	/**
+	 * Delete this project's index (manifest, vector/FTS/graph stores, embedding
+	 * cache) while keeping memory, sessions and the savings ledger — those are
+	 * user history, not index state. Handles are closed BEFORE deletion:
+	 * Windows refuses to delete files with open sqlite handles, which is why
+	 * manually deleting the storage dir fails while a session is running.
+	 * Queues behind in-flight and queued pipeline runs, and holds the same lock
+	 * during deletion so a later reindex cannot race the reset.
+	 * Errors are reported per target (e.g. another session holding a handle)
+	 * instead of failing the whole reset.
+	 */
+	async resetIndex(): Promise<{ deletedFiles: number; freedBytes: number; errors: string[] }> {
+		return withPipelineLock(this.storageBase, () => this.resetIndexLocked());
+	}
+
+	private async resetIndexLocked(): Promise<{ deletedFiles: number; freedBytes: number; errors: string[] }> {
+		try {
+			this.backendInstance?.close();
+		} catch {
+			// already closed
+		}
+		this.backendInstance = null;
+		this.retrieverInstance = null;
+		// Mutate the runtime object rather than replacing it: reindex calls that
+		// were queued behind this reset captured the same object and must see the
+		// closed backend dropped before they execute. Embedder and reranker
+		// survive: they hold no files.
+		if (this.injectedRuntime) this.injectedRuntime.backend = null;
+		// A reset index may be rebuilt by the next automatic kick.
+		this.autoIndexDone = false;
+		let deletedFiles = 0;
+		let freedBytes = 0;
+		const errors: string[] = [];
+		const countAndDelete = (target: string): void => {
+			let stat: fs.Stats;
+			try {
+				stat = fs.statSync(target);
+			} catch {
+				return; // not there — nothing to free
+			}
+			let files = 0;
+			let bytes = 0;
+			const measure = (p: string, s: fs.Stats): void => {
+				if (s.isDirectory()) {
+					for (const entry of fs.readdirSync(p)) {
+						const child = path.join(p, entry);
+						try {
+							measure(child, fs.statSync(child));
+						} catch {
+							// raced away between readdir and stat
+						}
+					}
+					return;
+				}
+				files++;
+				bytes += s.size;
+			};
+			try {
+				measure(target, stat);
+				fs.rmSync(target, { recursive: true, force: true });
+				// Only report bytes actually released; a locked target must not
+				// inflate the success report when rmSync fails.
+				deletedFiles += files;
+				freedBytes += bytes;
+			} catch (err) {
+				// Locked file (another session?) — report instead of failing the reset.
+				errors.push(`${path.relative(this.storageBase, target) || path.basename(target)}: ${(err as Error).message.slice(0, 80)}`);
+			}
+		};
+		const graphDb = path.join(this.storageBase, "graph.db");
+		const embeddingCache = path.join(this.storageBase, "embedding_cache.db");
+		for (const target of [
+			path.join(this.storageBase, "manifest.json"),
+			path.join(this.storageBase, "vectors"),
+			path.join(this.storageBase, "fts"),
+			graphDb,
+			`${graphDb}-shm`,
+			`${graphDb}-wal`,
+			embeddingCache,
+			`${embeddingCache}-shm`,
+			`${embeddingCache}-wal`,
+		]) {
+			countAndDelete(target);
+		}
+		return { deletedFiles, freedBytes, errors };
 	}
 
 	async reindex(options: { full?: boolean; targetPath?: string | null; automatic?: boolean; onProgress?: (msg: string) => void } = {}): Promise<{

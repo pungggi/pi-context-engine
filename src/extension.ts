@@ -26,6 +26,26 @@ const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find",
 const AUTO_INDEX_DELAY_MS = 2000;
 
 export default function contextEngineExtension(pi: ExtensionAPI) {
+	const MAX_AUTO_FILES_HINT =
+		"raise indexer.max_auto_files (~/.pi-context-engine/config.yaml or the project's .context-engine.yaml)";
+
+	/** One-line pause notice for /context-status and the index_status tool: the
+	 * most likely question there is "why is my index not updating?" */
+	const pauseNotice = (): string | null =>
+		automaticIndexBlock
+			? `Automatic indexing paused: workspace exceeds ${automaticIndexBlock.limit.toLocaleString()} indexable files — the index may be stale. ` +
+				`Run /context-index, or ${MAX_AUTO_FILES_HINT}.`
+			: null;
+
+	/** Bracket note appended to every context_search result while the pause is
+	 * active and a (possibly outdated) index is served. Without it the agent
+	 * cannot tell fresh results from stale ones. */
+	const staleIndexNote = (): string | null =>
+		automaticIndexBlock
+			? `[note: automatic indexing is paused — workspace exceeds ${automaticIndexBlock.limit.toLocaleString()} indexable files; these results may be stale. ` +
+				`Run /context-index, or ${MAX_AUTO_FILES_HINT} to refresh]`
+			: null;
+
 	let engine: ContextEngine | null = null;
 	let currentCwd = process.cwd();
 	let promptNumber = 0;
@@ -114,7 +134,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		notify?.(
 			`Context index: automatic indexing${eng.config.indexerWatch ? " and watcher" : ""} paused. ` +
 				`Workspace exceeds ${err.limit.toLocaleString()} indexable files. ` +
-				"Run /context-index to index anyway, or raise indexer.max_auto_files.",
+				`Run /context-index to index anyway, or ${MAX_AUTO_FILES_HINT}.`,
 			"warning",
 		);
 	};
@@ -267,7 +287,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 					return text(
 						`Automatic indexing is paused for ${eng.projectName}: the workspace exceeds ` +
 							`${automaticIndexBlock.limit.toLocaleString()} indexable files. ` +
-							"Run /context-index to index manually, or raise indexer.max_auto_files.",
+							`Run /context-index to index manually, or ${MAX_AUTO_FILES_HINT}.`,
 					);
 				}
 				if (indexInFlight) {
@@ -293,6 +313,8 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			let body = result.body;
 			const nudge = eng.buildNudge();
 			if (nudge) body += nudge;
+			const stale = staleIndexNote();
+			if (stale) body += `\n${stale}`;
 			if (result.droppedLowValue > 0) {
 				body +=
 					"\n[note: lower-confidence results omitted — lower retrieval.marginal_ratio or retrieval.confidence_threshold to include them]";
@@ -431,7 +453,9 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		description: "Check index health, chunk count, and token savings for this project.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return text(await getEngine(ctx.cwd).statusText());
+			const status = await getEngine(ctx.cwd).statusText();
+			const pause = pauseNotice();
+			return text(pause ? `${pause}\n${status}` : status);
 		},
 	});
 
@@ -488,7 +512,9 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	pi.registerCommand("context-status", {
 		description: "Show index health and token savings for this project",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify(await getEngine(ctx.cwd).statusText(), "info");
+			const status = await getEngine(ctx.cwd).statusText();
+			const pause = pauseNotice();
+			ctx.ui.notify(pause ? `${pause}\n${status}` : status, "info");
 		},
 	});
 

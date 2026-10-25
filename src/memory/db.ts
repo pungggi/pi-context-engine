@@ -571,6 +571,168 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_vec USING vec0(embedding float
 		return out;
 	}
 
+	// ── Read-only views (dashboard) ───────────────────────────────────────
+	// These never write and never touch the savings ledger — they exist so the
+	// web dashboard can render history without going through the text renderers
+	// (which record progressive_disclosure savings as a side effect).
+
+	/** Recent sessions, newest first, with prompt/turn counts. */
+	listSessions(limit = 50): {
+		id: string;
+		project: string;
+		started_at: string;
+		ended_at: string | null;
+		status: string;
+		promptCount: number;
+		rollup: string | null;
+	}[] {
+		try {
+			const rows = this.db
+				.prepare(
+					`SELECT s.id, s.project, s.started_at, s.ended_at, s.status, s.rollup_summary,
+						(SELECT COUNT(*) FROM prompts p WHERE p.session_id = s.id) AS prompt_count
+					 FROM sessions s ORDER BY s.started_at_epoch DESC LIMIT ?`,
+				)
+				.all(Math.max(1, Math.min(limit, 500))) as {
+				id: string;
+				project: string;
+				started_at: string;
+				ended_at: string | null;
+				status: string;
+				rollup_summary: string | null;
+				prompt_count: number | null;
+			}[];
+			return rows.map((r) => ({
+				id: r.id,
+				project: r.project,
+				started_at: r.started_at,
+				ended_at: r.ended_at,
+				status: r.status,
+				promptCount: Number(r.prompt_count ?? 0),
+				rollup: r.rollup_summary,
+			}));
+		} catch {
+			return [];
+		}
+	}
+
+	/** Turn summaries + tool-event activity for one session, in turn order. */
+	sessionDetail(
+		sessionId: string,
+		turnLimit = 200,
+	): {
+		turns: { promptNumber: number; tier: string; summary: string }[];
+		events: { id: number; tool: string; promptNumber: number; createdAt: string; hasPayload: boolean }[];
+	} {
+		const empty = { turns: [], events: [] as { id: number; tool: string; promptNumber: number; createdAt: string; hasPayload: boolean }[] };
+		try {
+			const turns = this.db
+				.prepare(
+					"SELECT prompt_number, tier, summary FROM turn_summaries WHERE session_id = ? ORDER BY prompt_number ASC LIMIT ?",
+				)
+				.all(sessionId, Math.max(1, Math.min(turnLimit, 500))) as {
+				prompt_number: number;
+				tier: string;
+				summary: string;
+			}[];
+			const events = this.db
+				.prepare(
+					`SELECT te.id, te.tool_name, te.prompt_number, te.created_at, (te.payload_id IS NOT NULL) AS has_payload
+					 FROM tool_events te WHERE te.session_id = ? ORDER BY te.id ASC LIMIT ?`,
+				)
+				.all(sessionId, Math.max(1, Math.min(turnLimit * 20, 2000))) as {
+				id: number;
+				tool_name: string;
+				prompt_number: number;
+				created_at: string;
+				has_payload: number;
+			}[];
+			return {
+				turns: turns.map((t) => ({ promptNumber: t.prompt_number, tier: t.tier, summary: t.summary })),
+				events: events.map((e) => ({
+					id: e.id,
+					tool: e.tool_name,
+					promptNumber: e.prompt_number,
+					createdAt: e.created_at,
+					hasPayload: Number(e.has_payload) === 1,
+				})),
+			};
+		} catch {
+			return empty;
+		}
+	}
+
+	/** Recent decisions, newest first. */
+	listDecisions(limit = 100): { id: number; decision: string; reason: string; source: string; createdAt: string }[] {
+		try {
+			const rows = this.db
+				.prepare("SELECT id, decision, reason, source, created_at FROM decisions ORDER BY created_at_epoch DESC LIMIT ?")
+				.all(Math.max(1, Math.min(limit, 500))) as {
+				id: number;
+				decision: string;
+				reason: string;
+				source: string;
+				created_at: string;
+			}[];
+			return rows.map((r) => ({ id: r.id, decision: r.decision, reason: r.reason, source: r.source, createdAt: r.created_at }));
+		} catch {
+			return [];
+		}
+	}
+
+	/** Recent code areas, newest first. */
+	listCodeAreas(limit = 100): { id: number; filePath: string; description: string; source: string; createdAt: string }[] {
+		try {
+			const rows = this.db
+				.prepare("SELECT id, file_path, description, source, created_at FROM code_areas ORDER BY created_at_epoch DESC LIMIT ?")
+				.all(Math.max(1, Math.min(limit, 500))) as {
+				id: number;
+				file_path: string;
+				description: string;
+				source: string;
+				created_at: string;
+			}[];
+			return rows.map((r) => ({ id: r.id, filePath: r.file_path, description: r.description, source: r.source, createdAt: r.created_at }));
+		} catch {
+			return [];
+		}
+	}
+
+	/** Raw savings events, newest first. */
+	recentSavings(limit = 200): { bucket: string; baseline: number; served: number; ts: number }[] {
+		try {
+			const rows = this.db
+				.prepare("SELECT bucket, baseline, served, ts FROM savings_log ORDER BY ts DESC, id DESC LIMIT ?")
+				.all(Math.max(1, Math.min(limit, 2000))) as { bucket: string; baseline: number; served: number; ts: number }[];
+			return rows.map((r) => ({ bucket: r.bucket, baseline: r.baseline, served: r.served, ts: r.ts }));
+		} catch {
+			return [];
+		}
+	}
+
+	/** Savings per local calendar day (oldest → newest) for trend charts. */
+	savingsByDay(days = 30): { day: string; baseline: number; served: number }[] {
+		const out: { day: string; baseline: number; served: number }[] = [];
+		try {
+			const cutoff = epochSeconds() - Math.max(1, Math.min(days, 365)) * 86400;
+			const rows = this.db
+				.prepare("SELECT ts, baseline, served FROM savings_log WHERE ts >= ? ORDER BY ts ASC")
+				.all(cutoff) as { ts: number; baseline: number; served: number }[];
+			const byDay = new Map<string, { baseline: number; served: number }>();
+			for (const r of rows) {
+				const day = new Date(r.ts * 1000).toISOString().slice(0, 10);
+				const acc = byDay.get(day) ?? { baseline: 0, served: 0 };
+				acc.baseline += r.baseline;
+				acc.served += r.served;
+				byDay.set(day, acc);
+			}
+			for (const [day, v] of [...byDay.entries()].sort()) out.push({ day, ...v });
+		} catch {
+			// empty series
+		}
+		return out;
+	}
+
 	// ── Retention ─────────────────────────────────────────────────────────
 
 	pruneOldPayloads(days = 30): { payloadsPruned: number; bytesFreedEstimate: number } {

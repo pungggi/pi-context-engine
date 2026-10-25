@@ -10,10 +10,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { ContextEngine, isPceConfig } from "./engine.js";
 import { applyContextSearchGuidance } from "./guidance.js";
 import { ProjectWatcher } from "./indexer/watcher.js";
 import { AutomaticIndexFileLimitError } from "./indexer/pipeline.js";
+import { DashboardServer } from "./dashboard/server.js";
 
 /** Tools whose payloads are worth capturing for session timelines. */
 const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
@@ -65,6 +67,14 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	let watcher: ProjectWatcher | null = null;
 	let watcherKickPending = false;
 	let watcherNotify: ((msg: string, level: "info" | "warning") => void) | undefined;
+
+	/**
+	 * Read-only web dashboard (config `dashboard.port`, 0 = free port). Owned
+	 * by this closure like the watcher: it must outlive individual command
+	 * invocations, reference the LIVE engine on every request (engine
+	 * instances are replaced per session), and stop on session_shutdown.
+	 */
+	let dashboard: DashboardServer | null = null;
 
 	/**
 	 * Watcher-triggered incremental reindex. Unlike `kickBackgroundIndex` this
@@ -604,6 +614,46 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("context-dashboard", {
+		description: "Open the read-only web dashboard (index health, files, sessions, memory, savings) in your browser",
+		handler: async (_args, ctx) => {
+			const openBrowser = (url: string): void => {
+				const cmd = process.platform === "win32" ? "cmd.exe" : process.platform === "darwin" ? "open" : "xdg-open";
+				const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+				try {
+					spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+				} catch {
+					// best-effort: the URL is printed either way
+				}
+			};
+			let url = dashboard?.url ?? null;
+			if (!dashboard || !url) {
+				const eng = getEngine(ctx.cwd);
+				dashboard = new DashboardServer();
+				try {
+					url = await dashboard.start({
+						engine: () => engine,
+						indexing: () => indexInFlight,
+						port: eng.config.dashboardPort,
+					});
+				} catch (err) {
+					dashboard = null;
+					ctx.ui.notify(
+						`⚠ Dashboard failed to start: ${(err as Error).message}. ` +
+							`If dashboard.port is set, another process may be using it.`,
+						"warning",
+					);
+					return;
+				}
+			}
+			openBrowser(url);
+			ctx.ui.notify(
+				`✓ Dashboard: ${url} (read-only, localhost only — stops when this session ends)`,
+				"info",
+			);
+		},
+	});
+
 	/* ── Lifecycle hooks (replace upstream's curl-based hooks) ───────────── */
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -705,6 +755,11 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		stopWatcher();
 		watcherNotify = undefined;
 		automaticIndexBlock = null;
+		if (dashboard) {
+			const d = dashboard;
+			dashboard = null;
+			await d.stop().catch(() => undefined);
+		}
 		await engine?.shutdown().catch(() => undefined);
 		engine = null;
 	});

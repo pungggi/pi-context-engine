@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import type { Config } from "../config.js";
 import { projectStorageDir, sha256Hex, yieldToEventLoop } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
+import { chunkProse, isProseLanguage } from "./prose-chunker.js";
 import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
 import { EmbeddingCache } from "./embedding-cache.js";
@@ -63,6 +64,8 @@ const LANGUAGE_MAP: Record<string, string> = {
 	".mjs": "javascript",
 	".cjs": "javascript",
 	".md": "markdown",
+	".markdown": "markdown",
+	".mdx": "markdown",
 	".php": "php",
 	".html": "html",
 	".htm": "html",
@@ -786,8 +789,15 @@ async function runIndexingLocked(
 						importedModules = out.imports;
 						importSpecs = out.importSpecs;
 					}
+					if (chunks.length === 0 && isProseLanguage(item.language)) {
+						// Prose P0: heading/paragraph sections instead of one whole-file
+						// chunk (docs/RESEARCH-COMPETITORS.md §4). Yields [] for empty
+						// files, which fall through to the legacy whole-file fallback.
+						chunks = chunkProse(item.content, item.relPath, item.language, config.indexerChunkBudgetChars);
+					}
 					if (chunks.length === 0) {
 						// Fallback: module-level chunk (upstream _fallback_chunk).
+						// Structured non-AST files (JSON, YAML, ...) still land here.
 						chunks = [
 							{
 								id: sha256Hex(`${item.relPath}:module`).slice(0, 16),
@@ -873,7 +883,10 @@ async function runIndexingLocked(
 							owners.push({ id: chunk.id, filePath: item.relPath });
 						}
 					}
-					if (chunk.chunkType !== "module") {
+					// Prose sections carry prose words, not call-graph identifiers:
+					// only chunks of parsed code feed the calls derivation, or shared
+					// vocabulary between two documents would become `calls` edges.
+					if (chunk.chunkType !== "module" && isAstLanguage(item.language)) {
 						runChunks.push({
 							id: chunk.id,
 							filePath: item.relPath,
@@ -941,6 +954,9 @@ async function runIndexingLocked(
 				if (changedThisRun.has(rel)) continue;
 				for (const stored of backend.chunksByFile(rel, 500)) {
 					if (stored.chunkType === "module") continue;
+					// Same gate as the run-only path above: prose sections are no
+					// more call-graph material when read back from storage.
+					if (!isAstLanguage(stored.language)) continue;
 					derivationSources.push({
 						id: stored.id,
 						filePath: rel,

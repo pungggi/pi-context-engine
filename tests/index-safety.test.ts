@@ -5,6 +5,7 @@ import { ContextEngine } from "../src/engine.js";
 import { LocalBackend } from "../src/storage/local-backend.js";
 import { defaultConfig, loadConfig, type Config } from "../src/config.js";
 import { AutomaticIndexFileLimitError } from "../src/indexer/pipeline.js";
+import { CURRENT_SCHEMA_VERSION } from "../src/indexer/manifest.js";
 import { Embedder } from "../src/indexer/embedder.js";
 import { FakeEmbeddingBackend, makeFakeEmbedder, makeTempDir, rmrf, writeFiles } from "./helpers.js";
 
@@ -267,7 +268,7 @@ describe("manifest checkpoints", () => {
 			__schema_version?: number;
 			files: Record<string, string>;
 		};
-		expect(finalManifest.__schema_version).toBe(3);
+		expect(finalManifest.__schema_version).toBe(CURRENT_SCHEMA_VERSION);
 		expect(Object.keys(finalManifest.files)).toHaveLength(51);
 		expect(engine.chunkCount()).toBe(51);
 	});

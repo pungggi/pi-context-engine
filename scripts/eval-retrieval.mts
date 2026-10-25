@@ -42,7 +42,7 @@ const BASELINE_PATH = path.join(EVAL_DIR, "baseline.json");
 const TOLERANCE = 0.05;
 const TOP_K = 10;
 
-type QueryKind = "identifier" | "nl" | "bug-report" | "file-name" | "cross-file";
+type QueryKind = "identifier" | "nl" | "bug-report" | "file-name" | "cross-file" | "prose";
 
 interface EvalQuery {
 	id: string;
@@ -198,7 +198,7 @@ function aggregate(scores: QueryScore[]): Metrics {
 	};
 }
 
-const KINDS: QueryKind[] = ["identifier", "nl", "bug-report", "file-name", "cross-file"];
+const KINDS: QueryKind[] = ["identifier", "nl", "bug-report", "file-name", "cross-file", "prose"];
 
 async function main(): Promise<void> {
 	const args = process.argv.slice(2);

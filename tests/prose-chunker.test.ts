@@ -79,6 +79,36 @@ describe("chunkProse: markdown sections", () => {
 		expect(sections[2]!.endLine).toBe(12);
 	});
 
+	it("detects ATX headings in CRLF files (Windows-authored docs)", () => {
+		const src = "# Top\r\n\r\nbody\r\n\r\n## Second\r\n\r\ndone\r\n";
+		const chunks = chunkProse(src, "docs/crlf.md", "markdown", BUDGET);
+		const sections = chunks.filter((c) => c.chunkType === "doc");
+		expect(sections.length).toBe(2);
+		expect(sections[1]!.metadata["unit"]).toBe("Top > Second");
+		const parent = chunks.find((c) => c.chunkType === "module")!;
+		expect(parent.content).toContain("## Second");
+	});
+
+	it("does not let a YAML literal block inside frontmatter open a fence", () => {
+		const src = "---\nexample: |\n  ~~~\n---\n\n# Real\n\nbody\n";
+		const chunks = chunkProse(src, "docs/fm-fence.md", "markdown", BUDGET);
+		const sections = chunks.filter((c) => c.chunkType === "doc");
+		// The `  ~~~` line must not swallow the heading after the frontmatter.
+		expect(sections.length).toBe(2);
+		expect(sections[1]!.metadata["unit"]).toBe("Real");
+		expect(sections[0]!.content).toContain("~~~");
+	});
+
+	it("treats an inline code span with backticks as text, not a fence", () => {
+		const src = "# Top\n\n```example```\n\n## After\n\ndone\n";
+		const chunks = chunkProse(src, "docs/inline.md", "markdown", BUDGET);
+		const sections = chunks.filter((c) => c.chunkType === "doc");
+		expect(sections.length).toBe(2);
+		expect(sections[1]!.metadata["unit"]).toBe("Top > After");
+		// The span itself is paragraph text inside the first section.
+		expect(sections[0]!.content).toContain("```example```");
+	});
+
 	it("returns the sections in source order with unique span-derived ids", () => {
 		const chunks = chunkProse(GUIDE, "docs/guide.md", "markdown", BUDGET);
 		const sections = chunks.filter((c) => c.chunkType === "doc");

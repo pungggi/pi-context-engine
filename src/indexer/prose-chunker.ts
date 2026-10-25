@@ -35,9 +35,17 @@ export function isProseLanguage(language: string): boolean {
 	return language === "markdown" || language === "plaintext";
 }
 
-const ATX = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$/;
-const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
-const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+// CR tolerance: lines are split on `\n`, so a CRLF file keeps `\r` at line
+// ends. JS `.` does not match `\r` and `$` does not forgive it, so every
+// end-anchored pattern must allow it — otherwise Windows-authored Markdown
+// silently loses all heading detection.
+const ATX = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t\r]*$/;
+// CommonMark: a backtick fence's info string may not contain backticks
+// (```` ```example``` ```` is an inline code span, not a fence), and the same
+// guard for tildes keeps ``~example~`` from opening one.
+const FENCE_OPEN_BT = /^ {0,3}(`{3,})([^`]*)$/;
+const FENCE_OPEN_TL = /^ {0,3}(~{3,})[^~]*$/;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t\r]*$/;
 
 /** A 1-based inclusive line range with its heading path (null = preamble). */
 interface Segment {
@@ -107,17 +115,20 @@ function segmentMarkdown(lines: string[]): { segments: Segment[]; headings: Head
 
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i]!;
+		// Frontmatter wins over everything below: a YAML literal block
+		// (`example: |` + `  ~~~`) must not open a fence that then swallows
+		// every heading after the closing `---`.
+		if (i <= frontmatterEnd) continue;
 		if (fence !== null) {
 			const close = line.match(FENCE_CLOSE);
 			if (close && close[1]!.startsWith(fence[0]!) && close[1]!.length >= fence.length) fence = null;
 			continue;
 		}
-		const openMatch = line.match(FENCE_OPEN);
+		const openMatch = line.match(FENCE_OPEN_BT) ?? line.match(FENCE_OPEN_TL);
 		if (openMatch) {
 			fence = openMatch[1]!;
 			continue;
 		}
-		if (i <= frontmatterEnd) continue;
 		const m = line.match(ATX);
 		if (!m) continue;
 		const level = m[1]!.length;

@@ -6,7 +6,7 @@
  * (fetch() stubbed with the captured payloads) to .pi/scratch/ so the UI can
  * be inspected without a running pi session.
  *
- * Usage: npx tsx scripts/smoke-dashboard.mts [--no-preview] [--open]
+ * Usage: npx tsx scripts/smoke-dashboard.mts [--no-preview]
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -34,8 +34,10 @@ if (!process.argv.includes("--no-preview")) {
 	for (const route of routes.slice(1)) {
 		captured[route] = await (await fetch(base + route)).json();
 	}
-	// The sessions tab auto-opens the newest session: capture its timeline so
-	// the static preview shows the detail pane populated too.
+	// Capture the exact URLs the page client requests, so the static preview
+	// serves them: the files tab asks for an explicit page size, and the
+	// sessions tab auto-opens the newest session's timeline.
+	captured["/api/files?limit=500"] = await (await fetch(`${base}/api/files?limit=500`)).json();
 	const newest = (captured["/api/sessions"] as { sessions: { id: string }[] }).sessions[0];
 	if (newest) {
 		captured[`/api/sessions/${newest.id}`] = await (

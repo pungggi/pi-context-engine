@@ -107,8 +107,11 @@ export const PAGE_HTML = `<!doctype html>
 <script>
 'use strict';
 var TABS = ['overview', 'files', 'sessions', 'memory', 'savings'];
-var state = { tab: 'overview', sessionId: null, status: null };
-var pollTimer = null;
+var state = { tab: 'overview', sessionId: null, status: null, projectDir: null, filesOffset: 0, filesMax: 0 };
+// Monotonic request generation: every load bumps it, responses from a
+// superseded load (tab switch, project-switch refetch, away-and-back) are
+// dropped. A tab-name check alone misses same-tab supersession.
+var loadToken = 0;
 
 function $(id) { return document.getElementById(id); }
 function esc(s) {
@@ -162,6 +165,15 @@ function renderStatus(st) {
   else if (st.chunks > 0) { badge.className = 'badge live'; $('state-text').textContent = 'live'; }
   else { badge.className = 'badge'; $('state-text').textContent = 'no index'; }
   $('counts').textContent = fmt(st.chunks) + ' chunks · ' + fmt(st.files) + ' files';
+  // Project switch (live engine replaced): compare full paths — basenames
+  // collide (/a/repo vs /b/repo). Drop session selection and refetch the
+  // ACTIVE tab, or project A's rows stay on screen under project B's label.
+  var projectChanged = state.projectDir !== null && state.projectDir !== st.projectDir;
+  state.projectDir = st.projectDir;
+  if (projectChanged) {
+    state.sessionId = null;
+    if (state.tab !== 'overview') { switchTab(state.tab); return; }
+  }
   if (state.tab === 'overview') renderOverview(st);
 }
 
@@ -248,23 +260,69 @@ function card(k, v, s) {
 function cfg(k, v) { return '<div>' + esc(k) + ': <b>' + v + '</b></div>'; }
 
 /* ── files ────────────────────────────────────────────────────────── */
+var FILES_PAGE = 500;
+function filesTableHtml(d) {
+  // Bar widths must compare across the WHOLE table: the list is sorted by
+  // chunk count, so page 1 row 1 is the global max. Per-page maxima would
+  // give each appended page's top file a full-width bar.
+  var max = state.filesMax;
+  return d.files.map(function (f) {
+    return '<tr><td class="path">' + esc(f.filePath) + '</td>' +
+      '<td class="num" style="width:70px">' + fmt(f.chunks) + '</td>' +
+      '<td style="width:180px">' + pctBar(f.chunks, max) + '</td></tr>';
+  }).join('');
+}
 function loadFiles() {
-  api('/api/files').then(function (d) {
+  var gen = ++loadToken;
+  state.filesOffset = 0;
+  api('/api/files?limit=' + FILES_PAGE).then(function (d) {
+    if (gen !== loadToken) return; // superseded by a newer load
     if (d.files.length === 0) { setMain('<div class="empty">No files indexed yet.</div>'); return; }
-    var max = d.files[0].chunks;
-    var rows = d.files.map(function (f) {
-      return '<tr><td class="path">' + esc(f.filePath) + '</td>' +
-        '<td class="num" style="width:70px">' + fmt(f.chunks) + '</td>' +
-        '<td style="width:180px">' + pctBar(f.chunks, max) + '</td></tr>';
-    }).join('');
+    state.filesMax = d.files[0].chunks;
     setMain('<div class="panel"><h2>' + fmt(d.total) + ' files · ' + fmt(d.chunks) + ' chunks</h2>' +
-      '<table><tr><th>File</th><th class="num">Chunks</th><th></th></tr>' + rows + '</table></div>');
-  }).catch(errPanel);
+      '<table><tr><th>File</th><th class="num">Chunks</th><th></th></tr><tbody id="files-body">' +
+      filesTableHtml(d) + '</tbody></table>' + moreFilesHtml(d) + '</div>');
+    state.filesOffset = d.offset + d.files.length;
+    var more = $('files-more');
+    if (more) more.onclick = appendFiles;
+  }).catch(function (e) { if (gen === loadToken) errPanel(e); });
+}
+function moreFilesHtml(d) {
+  var remaining = d.total - (d.offset + d.files.length);
+  if (remaining <= 0) return '';
+  var label = 'Show ' + fmt(remaining) + ' more files';
+  return '<div style="margin-top:12px"><button class="btn" id="files-more" data-label="' + label + '">' +
+         label + '</button></div>';
+}
+function appendFiles() {
+  var gen = ++loadToken;
+  var btn = $('files-more');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; } // double-click must not re-request the same offset
+  api('/api/files?limit=' + FILES_PAGE + '&offset=' + state.filesOffset).then(function (d) {
+    if (gen !== loadToken) return;
+    var body = $('files-body');
+    if (!body) return;
+    body.insertAdjacentHTML('beforeend', filesTableHtml(d));
+    state.filesOffset = d.offset + d.files.length;
+    var more = $('files-more');
+    if (more) more.parentNode.remove();
+    var panel = body.closest('.panel');
+    if (panel) panel.insertAdjacentHTML('beforeend', moreFilesHtml(d));
+    var next = $('files-more');
+    if (next) next.onclick = appendFiles;
+  }).catch(function (e) {
+    if (gen !== loadToken) return;
+    var failed = $('files-more');
+    if (failed) { failed.disabled = false; failed.textContent = failed.getAttribute('data-label') || 'Show more'; }
+    toast(e && e.message ? e.message : String(e));
+  });
 }
 
 /* ── sessions ─────────────────────────────────────────────────────── */
 function loadSessions() {
+  var gen = ++loadToken;
   api('/api/sessions').then(function (d) {
+    if (gen !== loadToken) return; // superseded by a newer load
     if (d.sessions.length === 0) { setMain('<div class="empty">No sessions recorded yet.</div>'); return; }
     var items = d.sessions.map(function (s) {
       var active = s.id === d.activeSessionId;
@@ -279,9 +337,11 @@ function loadSessions() {
     Array.prototype.forEach.call(document.querySelectorAll('.sess-item'), function (el) {
       el.onclick = function () { openSession(el.getAttribute('data-id')); };
     });
-    if (!state.sessionId) openSession(d.sessions[0].id, true);
-    else openSession(state.sessionId, true);
-  }).catch(errPanel);
+    // Keep the selection when it is still in the list; after a project switch
+    // the old session id is gone, so fall back to the newest.
+    var keep = state.sessionId && d.sessions.some(function (s) { return s.id === state.sessionId; });
+    openSession(keep ? state.sessionId : d.sessions[0].id, true);
+  }).catch(function (e) { if (gen === loadToken) errPanel(e); });
 }
 
 function openSession(id, silent) {
@@ -291,7 +351,7 @@ function openSession(id, silent) {
   });
   api('/api/sessions/' + encodeURIComponent(id)).then(function (d) {
     var box = $('sess-detail');
-    if (!box) return;
+    if (!box || state.sessionId !== id) return; // selection moved on before the response landed
     var html = '';
     if (d.session) {
       html += '<h2>' + esc(d.session.project) + ' · ' + esc(d.session.status) + '</h2>' +
@@ -323,7 +383,9 @@ function openSession(id, silent) {
 
 /* ── memory ───────────────────────────────────────────────────────── */
 function loadMemory() {
+  var gen = ++loadToken;
   api('/api/decisions').then(function (d) {
+    if (gen !== loadToken) return; // superseded by a newer load
     var html = '<div class="grid two-col"><div class="panel"><h2>Decisions</h2>';
     if (d.decisions.length === 0 && d.consolidated.length === 0) {
       html += '<div class="empty">No recorded decisions yet. The agent saves them with record_decision.</div>';
@@ -349,12 +411,14 @@ function loadMemory() {
     }
     html += '</div></div>';
     setMain(html);
-  }).catch(errPanel);
+  }).catch(function (e) { if (gen === loadToken) errPanel(e); });
 }
 
 /* ── savings ──────────────────────────────────────────────────────── */
 function loadSavings() {
+  var gen = ++loadToken;
   api('/api/savings').then(function (d) {
+    if (gen !== loadToken) return; // superseded by a newer load
     var t = d.totals;
     var html = '<div class="grid cards" style="margin-bottom:14px">' +
       card('Saved', fmtK(t.savedTokens), 'full-file baseline') +
@@ -387,7 +451,7 @@ function loadSavings() {
       html = '<div class="empty">No savings recorded yet — they accumulate as the agent uses context_search.</div>';
     }
     setMain(html);
-  }).catch(errPanel);
+  }).catch(function (e) { if (gen === loadToken) errPanel(e); });
 }
 
 function errPanel(e) {

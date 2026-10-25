@@ -7,6 +7,7 @@ import { defaultConfig, type Config } from "../src/config.js";
 import { DashboardServer } from "../src/dashboard/server.js";
 import {
 	decisionsPayload,
+	exportPayload,
 	filesPayload,
 	savingsPayload,
 	sessionsPayload,
@@ -107,6 +108,36 @@ describe("dashboard API payloads", () => {
 
 		const decisions = decisionsPayload(engine);
 		expect(decisions.decisions.some((d) => d.decision.includes("JWT"))).toBe(true);
+	});
+
+	it("files payload pages through the full sorted list via offset", async () => {
+		const { engine } = await harness();
+		await engine.reindex({});
+		const all = filesPayload(engine, 5000);
+		expect(all.total).toBeGreaterThanOrEqual(3);
+		const page1 = filesPayload(engine, 2);
+		const page2 = filesPayload(engine, 2, 2);
+		expect(page1.offset).toBe(0);
+		expect(page2.offset).toBe(2);
+		expect(page1.files).toHaveLength(2);
+		expect(page2.files).toHaveLength(Math.min(2, all.total - 2));
+		// pages tile the same sorted list with no overlap or gap
+		const seen = new Set([...page1.files, ...page2.files].map((f) => f.filePath));
+		expect(seen.size).toBe(page1.files.length + page2.files.length);
+		// offset past the end is empty, not an error
+		expect(filesPayload(engine, 2, all.total + 10).files).toHaveLength(0);
+	});
+
+	it("export includes session timelines, not just metadata", async () => {
+		const { engine } = await harness();
+		await engine.reindex({});
+		await engine.recordPrompt("build the dashboard");
+		await engine.recordToolEvent("bash", "{}", "ok", 1);
+		const exported = await exportPayload(engine, { indexing: false });
+		expect(exported.timelines).toHaveLength(exported.sessions.sessions.length);
+		const own = exported.timelines.find((t) => t.session?.id === engine.sessionId);
+		expect(own).toBeTruthy();
+		expect(own!.events.length).toBeGreaterThanOrEqual(1);
 	});
 
 	it("does not write savings when rendering snapshots", async () => {

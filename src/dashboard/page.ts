@@ -107,8 +107,7 @@ export const PAGE_HTML = `<!doctype html>
 <script>
 'use strict';
 var TABS = ['overview', 'files', 'sessions', 'memory', 'savings'];
-var state = { tab: 'overview', sessionId: null, status: null };
-var pollTimer = null;
+var state = { tab: 'overview', sessionId: null, status: null, project: null, filesOffset: 0 };
 
 function $(id) { return document.getElementById(id); }
 function esc(s) {
@@ -162,6 +161,14 @@ function renderStatus(st) {
   else if (st.chunks > 0) { badge.className = 'badge live'; $('state-text').textContent = 'live'; }
   else { badge.className = 'badge'; $('state-text').textContent = 'no index'; }
   $('counts').textContent = fmt(st.chunks) + ' chunks · ' + fmt(st.files) + ' files';
+  // Project switch (live engine replaced): drop session selection and refetch
+  // the ACTIVE tab, or project A's rows stay on screen under project B's label.
+  var projectChanged = state.project !== null && state.project !== st.project;
+  state.project = st.project;
+  if (projectChanged) {
+    state.sessionId = null;
+    if (state.tab !== 'overview') { switchTab(state.tab); return; }
+  }
   if (state.tab === 'overview') renderOverview(st);
 }
 
@@ -248,23 +255,57 @@ function card(k, v, s) {
 function cfg(k, v) { return '<div>' + esc(k) + ': <b>' + v + '</b></div>'; }
 
 /* ── files ────────────────────────────────────────────────────────── */
+var FILES_PAGE = 500;
+function filesTableHtml(d) {
+  var max = d.files.length > 0 ? d.files[0].chunks : 0;
+  return d.files.map(function (f) {
+    return '<tr><td class="path">' + esc(f.filePath) + '</td>' +
+      '<td class="num" style="width:70px">' + fmt(f.chunks) + '</td>' +
+      '<td style="width:180px">' + pctBar(f.chunks, max) + '</td></tr>';
+  }).join('');
+}
 function loadFiles() {
-  api('/api/files').then(function (d) {
+  var tab = state.tab;
+  state.filesOffset = 0;
+  api('/api/files?limit=' + FILES_PAGE).then(function (d) {
+    if (state.tab !== tab) return; // tab switched while the request was in flight
     if (d.files.length === 0) { setMain('<div class="empty">No files indexed yet.</div>'); return; }
-    var max = d.files[0].chunks;
-    var rows = d.files.map(function (f) {
-      return '<tr><td class="path">' + esc(f.filePath) + '</td>' +
-        '<td class="num" style="width:70px">' + fmt(f.chunks) + '</td>' +
-        '<td style="width:180px">' + pctBar(f.chunks, max) + '</td></tr>';
-    }).join('');
     setMain('<div class="panel"><h2>' + fmt(d.total) + ' files · ' + fmt(d.chunks) + ' chunks</h2>' +
-      '<table><tr><th>File</th><th class="num">Chunks</th><th></th></tr>' + rows + '</table></div>');
+      '<table><tr><th>File</th><th class="num">Chunks</th><th></th></tr><tbody id="files-body">' +
+      filesTableHtml(d) + '</tbody></table>' + moreFilesHtml(d) + '</div>');
+    state.filesOffset = d.offset + d.files.length;
+    var more = $('files-more');
+    if (more) more.onclick = appendFiles;
+  }).catch(errPanel);
+}
+function moreFilesHtml(d) {
+  var remaining = d.total - (d.offset + d.files.length);
+  if (remaining <= 0) return '';
+  return '<div style="margin-top:12px"><button class="btn" id="files-more">Show ' + fmt(remaining) +
+         ' more files</button></div>';
+}
+function appendFiles() {
+  var tab = state.tab;
+  api('/api/files?limit=' + FILES_PAGE + '&offset=' + state.filesOffset).then(function (d) {
+    if (state.tab !== tab) return;
+    var body = $('files-body');
+    if (!body) return;
+    body.insertAdjacentHTML('beforeend', filesTableHtml(d));
+    state.filesOffset = d.offset + d.files.length;
+    var more = $('files-more');
+    if (more) more.parentNode.remove();
+    var panel = body.closest('.panel');
+    if (panel) panel.insertAdjacentHTML('beforeend', moreFilesHtml(d));
+    var next = $('files-more');
+    if (next) next.onclick = appendFiles;
   }).catch(errPanel);
 }
 
 /* ── sessions ─────────────────────────────────────────────────────── */
 function loadSessions() {
+  var tab = state.tab;
   api('/api/sessions').then(function (d) {
+    if (state.tab !== tab) return; // tab switched while the request was in flight
     if (d.sessions.length === 0) { setMain('<div class="empty">No sessions recorded yet.</div>'); return; }
     var items = d.sessions.map(function (s) {
       var active = s.id === d.activeSessionId;
@@ -279,8 +320,8 @@ function loadSessions() {
     Array.prototype.forEach.call(document.querySelectorAll('.sess-item'), function (el) {
       el.onclick = function () { openSession(el.getAttribute('data-id')); };
     });
-    if (!state.sessionId) openSession(d.sessions[0].id, true);
-    else openSession(state.sessionId, true);
+    var keep = state.sessionId && d.sessions.some(function (s) { return s.id === state.sessionId; });
+    openSession(keep ? state.sessionId : d.sessions[0].id, true);
   }).catch(errPanel);
 }
 
@@ -291,7 +332,7 @@ function openSession(id, silent) {
   });
   api('/api/sessions/' + encodeURIComponent(id)).then(function (d) {
     var box = $('sess-detail');
-    if (!box) return;
+    if (!box || state.sessionId !== id) return; // selection moved on before the response landed
     var html = '';
     if (d.session) {
       html += '<h2>' + esc(d.session.project) + ' · ' + esc(d.session.status) + '</h2>' +
@@ -323,7 +364,9 @@ function openSession(id, silent) {
 
 /* ── memory ───────────────────────────────────────────────────────── */
 function loadMemory() {
+  var tab = state.tab;
   api('/api/decisions').then(function (d) {
+    if (state.tab !== tab) return; // tab switched while the request was in flight
     var html = '<div class="grid two-col"><div class="panel"><h2>Decisions</h2>';
     if (d.decisions.length === 0 && d.consolidated.length === 0) {
       html += '<div class="empty">No recorded decisions yet. The agent saves them with record_decision.</div>';
@@ -354,7 +397,9 @@ function loadMemory() {
 
 /* ── savings ──────────────────────────────────────────────────────── */
 function loadSavings() {
+  var tab = state.tab;
   api('/api/savings').then(function (d) {
+    if (state.tab !== tab) return; // tab switched while the request was in flight
     var t = d.totals;
     var html = '<div class="grid cards" style="margin-bottom:14px">' +
       card('Saved', fmtK(t.savedTokens), 'full-file baseline') +

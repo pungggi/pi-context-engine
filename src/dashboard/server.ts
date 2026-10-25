@@ -162,7 +162,7 @@ export class DashboardServer {
 					sendJson(res, 200, await savingsPayload(eng));
 					return;
 				case "/api/files":
-					sendJson(res, 200, filesPayload(eng, clampLimit(url.searchParams.get("limit"), 500, 5000)));
+					sendJson(res, 200, filesPayload(eng, clampLimit(url.searchParams.get("limit"), 500, 5000), clampLimit(url.searchParams.get("offset"), 0, 1e9)));
 					return;
 				case "/api/sessions":
 					sendJson(res, 200, sessionsPayload(eng, clampLimit(url.searchParams.get("limit"), 50, 500)));

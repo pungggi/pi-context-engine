@@ -97,8 +97,10 @@ export async function savingsPayload(eng: ContextEngine) {
 	};
 }
 
-/** Indexed files with chunk counts, largest first. */
-export function filesPayload(eng: ContextEngine, limit = 500) {
+/** Indexed files with chunk counts, largest first. `offset` + `limit`
+ * window into the sorted list — the Files tab pages through with a
+ * "show more" control instead of a hard cap. */
+export function filesPayload(eng: ContextEngine, limit = 500, offset = 0) {
 	let counts: Record<string, number> = {};
 	try {
 		counts = eng.backend.fileChunkCounts();
@@ -108,10 +110,13 @@ export function filesPayload(eng: ContextEngine, limit = 500) {
 	const rows = Object.entries(counts)
 		.map(([filePath, chunks]) => ({ filePath, chunks }))
 		.sort((a, b) => b.chunks - a.chunks || a.filePath.localeCompare(b.filePath));
+	const start = Math.max(0, Math.min(Math.floor(offset) || 0, rows.length));
+	const size = Math.max(1, Math.min(Math.floor(limit) || 500, 5000));
 	return {
 		total: rows.length,
 		chunks: rows.reduce((acc, r) => acc + r.chunks, 0),
-		files: rows.slice(0, Math.max(1, Math.min(limit, 5000))),
+		offset: start,
+		files: rows.slice(start, start + size),
 	};
 }
 
@@ -142,14 +147,21 @@ export function decisionsPayload(eng: ContextEngine, limit = 100) {
 	};
 }
 
-/** Everything, for /api/export. */
+/** Everything, for /api/export. Session timelines are included so the
+ * download really is "all of the above" (review finding on #24). */
 export async function exportPayload(eng: ContextEngine, ext: ExtDashboardState) {
+	const sessions = sessionsPayload(eng);
+	const timelines: Awaited<ReturnType<typeof timelinePayload>>[] = [];
+	for (const s of sessions.sessions) {
+		timelines.push(timelinePayload(eng, s.id));
+	}
 	return {
 		generatedAt: new Date().toISOString(),
 		status: statusPayload(eng, ext),
 		savings: await savingsPayload(eng),
-		files: filesPayload(eng),
-		sessions: sessionsPayload(eng),
+		files: filesPayload(eng, 5000),
+		sessions,
+		timelines,
 		decisions: decisionsPayload(eng),
 	};
 }

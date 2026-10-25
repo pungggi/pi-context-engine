@@ -105,6 +105,8 @@ export interface Config {
 	indexerWatch: boolean;
 	indexerRedactSecrets: boolean;
 	memoryRedactPii: boolean;
+	/** TCP port for the /context-dashboard web server. 0 = pick a free port (default). */
+	dashboardPort: number;
 	pricingModel: string;
 	pricingInput: number | null;
 	pricingOutput: number | null;
@@ -140,6 +142,7 @@ export function defaultConfig(): Config {
 		indexerWatch: true,
 		indexerRedactSecrets: true,
 		memoryRedactPii: true,
+		dashboardPort: 0,
 		pricingModel: "opus",
 		pricingInput: null,
 		pricingOutput: null,
@@ -176,6 +179,7 @@ const MAPPING: Record<string, keyof Config> = {
 	"indexer.watch": "indexerWatch",
 	"indexer.redact_secrets": "indexerRedactSecrets",
 	"memory.redact_pii": "memoryRedactPii",
+	"dashboard.port": "dashboardPort",
 	"storage.path": "storagePath",
 	"pricing.model": "pricingModel",
 	"pricing.input": "pricingInput",
@@ -221,6 +225,11 @@ function applyDict(config: Config, data: any): void {
 				throw new Error(`config ${dotted} must be a non-negative integer`);
 			}
 			config.indexerMaxAutoFiles = value;
+		} else if (attr === "dashboardPort") {
+			if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 65535) {
+				throw new Error(`config ${dotted} must be an integer between 0 and 65535 (0 = pick a free port)`);
+			}
+			config.dashboardPort = value;
 		} else if (attr === "pricingInput" || attr === "pricingOutput") {
 			if (value !== null && typeof value !== "number") throw new Error(`config ${dotted} must be a number or null`);
 			(config as any)[attr] = value;

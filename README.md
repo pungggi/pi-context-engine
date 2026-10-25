@@ -37,7 +37,7 @@ runs fixed queries. Run it yourself; nothing is cherry-picked.
 
 ## What you get
 
-Ten tools the agent can call, plus four slash commands.
+Ten tools the agent can call, plus five slash commands.
 
 **Search**
 - **`context_search`**: hybrid vector + BM25 retrieval with confidence scores.
@@ -57,7 +57,7 @@ Ten tools the agent can call, plus four slash commands.
 - **`reindex`**: refresh a path or the whole project.
 
 Commands: `/context-index [--full] [--reset]`, `/context-status`, `/context-savings`,
-`/context-warmup`.
+`/context-warmup`, `/context-dashboard`.
 
 **Shipped guidance.** The package also injects a ~900-token guidance section
 into the system prompt while `context_search` is active: how to formulate
@@ -150,6 +150,26 @@ unchanged repo took 237 ms.
   provisioning step (a devcontainer `postCreateCommand`, a CI cache setup),
   keeping first searches fast.
 
+### Web dashboard
+
+`/context-dashboard` starts a small read-only web server inside the pi process
+and opens it in your browser. Port is picked per session; set `dashboard.port`
+in config for a stable URL.
+
+- **Overview**: donut of measured savings, chunk/file counts, live indexing
+  state (polled every 5 s), and the active configuration.
+- **Files**: every indexed file with its chunk count, largest first.
+- **Sessions**: past sessions with per-turn summaries and tool events.
+- **Memory**: recorded decisions and code areas.
+- **Savings**: the per-bucket ledger with dollar estimates and a 30-day trend.
+- **Export**: one JSON download of all of the above.
+
+The dashboard is strictly read-only: every state change (reindex, reset,
+config) stays in pi commands. It binds to `127.0.0.1` only, serves GET
+requests only, and rejects requests whose `Host` header is not loopback, so a
+malicious page cannot read your index data via DNS rebinding. It stops when
+the session ends.
+
 ## Requirements
 
 - **Node 22+** on macOS, Linux or Windows.
@@ -220,6 +240,8 @@ indexer:
   watch: true             # reindex on file changes while the session runs (debounced, incremental)
 memory:
   redact_pii: true
+dashboard:
+  port: 0                # 0 = pick a free port; set one for a stable dashboard URL
 pricing:
   model: opus            # opus | sonnet | haiku | gpt-4o | gemini-2.5-pro | ...
 storage:
@@ -269,6 +291,10 @@ by default:
 Path arguments are validated against the project root, so a crafted `path` cannot
 read outside it.
 
+The web dashboard adds its own guards: loopback binding, GET-only routing, and
+`Host` header validation against DNS rebinding. With no mutating endpoints,
+there is nothing for a cross-site request to trigger.
+
 ## Supported languages
 
 **AST chunking** (tree-sitter): Python, JavaScript, TypeScript, TSX, PHP, Go,
@@ -286,13 +312,17 @@ This is a port, not a wrapper. Three deliberate changes:
   the `curl`-based Claude Code hooks. Session capture rides on pi's own events.
 - **No Python runtime**: embeddings run through transformers.js or Ollama, so
   installation is one npm command.
+- **Dashboard rebuilt, not ported**: upstream serves its dashboard from a
+  FastAPI app with a mutating REST surface. Ours is a read-only `node:http`
+  server (zero dependencies) with a fresh single-file page — same tabs, no
+  write endpoints.
 - **Two upstream bugs fixed**: chunk ids now include column offsets (identical
   spans on one line used to overwrite each other in the index), and the
   placeholder filter no longer suppresses unambiguous vendor keys that happen to
   contain a word like `example`.
 
-Not ported (yet): the web dashboard, output-compression rules, and editor
-bootstrapping for non-pi editors.
+Not ported (yet): output-compression rules and editor bootstrapping for
+non-pi editors.
 
 ## Development
 
@@ -302,6 +332,7 @@ npm run check          # typecheck + 251 unit tests
 npm run smoke:env      # tree-sitter + sqlite-vec capability check
 npm run smoke:loader   # load the extension through pi's jiti loader
 npm run smoke:real-world  # index this repo with the local embedder
+npx tsx scripts/smoke-dashboard.mts  # boot the dashboard, probe every route, write a static UI preview
 ```
 
 ## Credits

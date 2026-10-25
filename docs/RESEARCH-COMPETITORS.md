@@ -41,10 +41,13 @@ core retrieval design. The gap is in *breadth of context sources* and in
   Our context stays "index + memory", plus indexed third-party docs if the
   @Docs-with-proposal idea gets built (§4).
 - **Aider: PageRank repo map.** Ranks symbols by graph centrality inside a
-  token budget. **We already match at file level**: `computePageRank()` (R7)
-  scores files over the `imports`/`calls` projection and the retriever applies
-  it as a bounded prior. Missing is *symbol-level* centrality: `related_context`
-  neighbors are returned unranked, and no token-budget "repo map" view exists.
+  token budget. **Matched 2026-10-25 (WP2)**: file-level was already there
+  (`computePageRank()`, R7, retriever prior), and `computeSymbolPageRank()`
+  now ranks individual symbols over the `calls`/`defines` graph, ordering
+  `related_context` neighbours hub-first (deterministic tie-break, same
+  lifecycle as file ranks: recompute after indexing, delete with the file).
+  Still open: the token-budget "repo map" *view* (a ranked symbol-signature
+  list for architecture questions) — only build it if eval asks.
 - **Greptile / Potpie: agentic retrieval.** Iterative query loops over a full
   codebase graph, wired into PR review. Our search is one-shot with refine
   hints instead.

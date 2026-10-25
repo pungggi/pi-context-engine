@@ -43,7 +43,8 @@ Ten tools the agent can call, plus five slash commands.
 - **`context_search`**: hybrid vector + BM25 retrieval with confidence scores.
   The system prompt tells the agent to prefer it over `grep`/`read` for questions.
 - **`expand_chunk`**: full source for a compressed hit, when the snippet is not enough.
-- **`related_context`**: code reachable through `imports`/`defines` graph edges.
+- **`related_context`**: code reachable through `imports`/`defines`/`calls`
+  graph edges, ordered by symbol-level centrality so hub symbols come first.
 
 **Memory**
 - **`record_decision`**: store a choice and its reason.

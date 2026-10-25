@@ -13,6 +13,8 @@ export class LocalBackend {
 	private graphStore: GraphStore;
 	/** R7: cached PageRank table; refreshed by recomputePriors(). */
 	private pageRankCache: Map<string, number> | null = null;
+	/** WP2: cached symbol-level PageRank table; refreshed by recomputePriors(). */
+	private symbolPageRankCache: Map<string, number> | null = null;
 
 	constructor(basePath: string) {
 		this.vectorStore = new VectorStore(path.join(basePath, "vectors"));
@@ -54,16 +56,24 @@ export class LocalBackend {
 		return this.vectorStore.getById(chunkId);
 	}
 
-	/** R7: recompute file PageRank after indexing; retrieval reads it as a prior. */
+	/** R7 + WP2: recompute file and symbol PageRank after indexing. */
 	recomputePriors(): void {
 		this.graphStore.computePageRank();
+		this.graphStore.computeSymbolPageRank();
 		this.pageRankCache = null;
+		this.symbolPageRankCache = null;
 	}
 
 	/** R7: cached file→[0,1] PageRank (empty until first recomputePriors). */
 	pageRanks(): Map<string, number> {
 		if (!this.pageRankCache) this.pageRankCache = this.graphStore.pageRanks();
 		return this.pageRankCache;
+	}
+
+	/** WP2: cached node id→[0,1] symbol centrality (empty until first recomputePriors). */
+	symbolPageRanks(): Map<string, number> {
+		if (!this.symbolPageRankCache) this.symbolPageRankCache = this.graphStore.symbolPageRanks();
+		return this.symbolPageRankCache;
 	}
 
 	/** R5: symbol lookup over graph node names (exact / `.suffix`). */
@@ -100,6 +110,7 @@ export class LocalBackend {
 		this.ftsStore.deleteByFiles(filePaths);
 		this.graphStore.deleteByFiles(filePaths);
 		this.pageRankCache = null;
+		this.symbolPageRankCache = null;
 	}
 
 	countChunks(): number {
@@ -123,6 +134,7 @@ export class LocalBackend {
 		this.ftsStore.clear();
 		this.graphStore.clear();
 		this.pageRankCache = null;
+		this.symbolPageRankCache = null;
 	}
 
 	close(): void {

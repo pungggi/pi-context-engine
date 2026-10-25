@@ -1343,14 +1343,33 @@ export class ContextEngine {
 		// never existed.
 		const render = (ns: { nodeType: string; name: string; filePath: string }[]): string =>
 			ns.map((n) => `- ${n.nodeType}: ${n.name} (${n.filePath})`).join("\n");
-		const callTargets = this.backend.graphNeighbors(chunkId, "calls");
+		// WP2: neighbours arrive in arbitrary SQL order. Symbol centrality
+		// ranks them so the agent reads hub callees (called by many) first;
+		// ties break on name then path so the output stays deterministic.
+		const symbolRanks = this.backend.symbolPageRanks();
+		const byCentrality = <T extends { id: string; name: string; filePath: string }>(ns: T[]): T[] =>
+			[...ns]
+				.map((n) => ({ n, s: symbolRanks.get(n.id) ?? 0 }))
+				.sort(
+					(a, b) =>
+						b.s - a.s ||
+						(a.n.name < b.n.name ? -1 : a.n.name > b.n.name ? 1 : 0) ||
+						(a.n.filePath < b.n.filePath ? -1 : a.n.filePath > b.n.filePath ? 1 : 0),
+				)
+				.map((x) => x.n);
+		const callTargets = byCentrality(this.backend.graphNeighbors(chunkId, "calls"));
 		if (callTargets.length > 0) return render(callTargets);
-		const any = this.backend.graphNeighbors(chunkId);
+		const any = byCentrality(this.backend.graphNeighbors(chunkId));
 		if (any.length > 0) return render(any);
 		const chunk = this.backend.getChunkById(chunkId);
 		if (chunk) {
 			const related = this.backend.getRelatedFilePaths([chunk.filePath]);
 			if (related.length > 0) {
+				// File-level fallback orders by the R7 file prior, same idea.
+				const fileRanks = this.backend.pageRanks();
+				related.sort(
+					(a, b) => (fileRanks.get(b) ?? 0) - (fileRanks.get(a) ?? 0) || (a < b ? -1 : a > b ? 1 : 0),
+				);
 				return related.map((fp) => `- file: ${fp}`).join("\n");
 			}
 		}

@@ -76,7 +76,9 @@ and the index lifecycle.
 ## How it works
 
 1. **Chunk**: tree-sitter parses source into functions, classes and modules.
-   Grammars ship as WASM, so there is no C toolchain to install.
+   Grammars ship as WASM, so there is no C toolchain to install. Markdown and
+   plain text take a prose path instead: sections split at headings (with the
+   heading path carried as context), paragraphs packed to the chunk budget.
 2. **Embed**: a content-hash cache skips unchanged code. Ollama is used when it
    is reachable; otherwise a local ONNX model runs in-process.
 3. **Search**: vector similarity and BM25 are merged with Reciprocal Rank
@@ -182,7 +184,9 @@ No Python. No build tools. No API key.
 ### Embedding model choice (measured, not claimed)
 
 Evaluated on this package's own 76-query suite (`npm run eval -- --local`, same
-code state, CPU only):
+code state, CPU only). The suite has since grown to 89 queries with prose
+section chunking; the table is the original model A/B, re-run the eval to
+reproduce it on the current suite:
 
 | local model | R@5 | R@10 | nDCG@10 | distraction@10 | served tokens | p50/p95 |
 |---|---|---|---|---|---|---|
@@ -300,9 +304,15 @@ there is nothing for a cross-site request to trigger.
 **AST chunking** (tree-sitter): Python, JavaScript, TypeScript, TSX, PHP, Go,
 Rust, Java, C#.
 
-**Fallback chunking** (whole-module): every other text file, including
-Markdown, JSON, YAML, SQL, HTML, CSS and 40+ more extensions. Binary files and
-files over 2 MB are skipped.
+**Prose chunking** (heading/paragraph sections): Markdown splits at ATX
+headings with the heading path carried as chunk context, and gains a
+heading-outline parent chunk for small-to-big expansion. Plain text packs at
+paragraph boundaries. Small files without internal structure keep a single
+whole-file chunk, exactly like before.
+
+**Fallback chunking** (whole-module): structured non-AST files such as JSON,
+YAML, SQL, HTML and CSS (40+ more extensions) become one whole-file chunk.
+Binary files and files over 2 MB are skipped.
 
 ## Differences from upstream CCE
 
@@ -328,7 +338,7 @@ non-pi editors.
 
 ```bash
 npm install
-npm run check          # typecheck + 251 unit tests
+npm run check          # typecheck + 286 unit tests
 npm run smoke:env      # tree-sitter + sqlite-vec capability check
 npm run smoke:loader   # load the extension through pi's jiti loader
 npm run smoke:real-world  # index this repo with the local embedder

@@ -5,7 +5,14 @@
 import fs from "node:fs";
 import { atomicWriteText } from "../utils.js";
 
-export const CURRENT_SCHEMA_VERSION = 3;
+/**
+ * v4 (2026-10-25): prose files chunk into heading/paragraph sections instead
+ * of one whole-file chunk (docs/RESEARCH-COMPETITORS.md §4). The bump makes
+ * already-indexed Markdown/notes re-chunk: the manifest skips files by
+ * content hash, so without a format change unchanged prose would never be
+ * re-segmented. The reset wipes index stores (not memory) and rebuilds.
+ */
+export const CURRENT_SCHEMA_VERSION = 4;
 
 interface ManifestData {
 	__schema_version?: number;

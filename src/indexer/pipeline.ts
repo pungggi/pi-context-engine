@@ -1021,12 +1021,14 @@ async function runIndexingLocked(
 					// outgrew MAX_FILE_BYTES must not be read here either (this pass
 					// would otherwise load content the indexer itself rejected).
 					if (fs.statSync(abs).size > MAX_FILE_BYTES) continue;
-					// Round 3: chunking runs on REDACTED content (see the batch
-					// loop), so stored line numbers are redacted coordinates. A
-					// multi-line secret (PEM block) collapsing shifts every line
-					// after it; apply the identical transformation before
-					// attributing raw links, or they map to the wrong section.
-					raw = redactSecrets(fs.readFileSync(abs, "utf-8")).text;
+					// Round 3/4: chunking runs on REDACTED content (see the batch
+					// loop), so stored line numbers are redacted coordinates when
+					// redaction is ON. Mirror the batch condition EXACTLY — with
+					// indexerRedactSecrets off the batch chunks raw text and this
+					// pass must attribute against raw coordinates too.
+					const text = fs.readFileSync(abs, "utf-8");
+					const red = config.indexerRedactSecrets ? redactSecrets(text) : null;
+					raw = red && red.labels.length > 0 ? red.text : text;
 				} catch {
 					continue; // unreadable now: keep the edges it already contributed
 				}
@@ -1208,15 +1210,33 @@ function resolveImportPath(spec: string, importerRel: string, knownFiles: Set<st
  * project file (docs/RESEARCH-COMPETITORS.md §4 P2). Strips `#fragment` and
  * `?query`, decodes %-escapes, treats a leading `/` as project-root relative
  * and everything else as relative to the linking file. Returns null for URL
- * schemes (`http:`, `mailto:`, … also `C:`), pure anchors (`#top`), paths
- * that never resolve to an indexed file, and self-links.
+ * schemes (`http:`, `mailto:`, … also `C:`), protocol-relative `//host/path`,
+ * pure anchors (`#top`), paths that never resolve to an indexed file, and
+ * self-links.
  */
+const HTML_ENTITIES: Record<string, string> = {
+	amp: "&",
+	lt: "<",
+	gt: ">",
+	quot: '"',
+	apos: "'",
+	nbsp: " ",
+};
 function resolveDocLink(target: string, sourceRel: string, knownFiles: Set<string>): string | null {
 	let dest = target;
 	if (dest.startsWith("<") && dest.endsWith(">")) dest = dest.slice(1, -1);
 	// Round 2: CommonMark escapes (`./guide\(v2\).md`) must come off before
 	// the exact-path lookup; only backslash-escaped PUNCTUATION unescapes.
 	dest = dest.replace(/\\([!-/:-@\[-`{-~])/g, "$1");
+	// Round 3: HTML entities resolve in destinations too (`./A&amp;B.md` is
+	// `./A&B.md`); a small named set plus numeric refs, unknown ones stay.
+	dest = dest.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (m, body: string) => {
+		if (body.startsWith("#")) {
+			const num = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+			return Number.isFinite(num) && num > 0 && num <= 0x10ffff ? String.fromCodePoint(num) : m;
+		}
+		return HTML_ENTITIES[body] ?? m;
+	});
 	dest = dest.split("#")[0]!;
 	dest = dest.split("?")[0]!;
 	if (dest === "") return null; // pure anchor: same-file, nothing to link
@@ -1226,6 +1246,7 @@ function resolveDocLink(target: string, sourceRel: string, knownFiles: Set<strin
 		// malformed escape: keep the raw target
 	}
 	if (/^[a-z][a-z0-9+.-]*:/i.test(dest)) return null; // scheme
+	if (dest.startsWith("//")) return null; // round 4: protocol-relative URL (host/path), not a local path
 	const dir = sourceRel.includes("/") ? sourceRel.slice(0, sourceRel.lastIndexOf("/")) : "";
 	const joined = dest.startsWith("/") ? dest.slice(1) : `${dir}/${dest}`;
 	// Same stack walk as resolveImportPath: `..` pops (a pop off an empty

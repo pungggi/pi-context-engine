@@ -190,13 +190,20 @@ is the agreed sequence (small and evidence-backed first).
     Destinations are read with a two-phase scan (destination first, then
     the optional title), so balanced parens in either survive
     (`./guide(v2).md`, `./hub.md "Hub (draft")`), and CommonMark
-    backslash escapes (`./guide\(v2\).md`) unescape before the lookup.
-  - **Skipped**: URL schemes, pure anchors, self-links and targets that are
-    not indexed; example links inside fences, frontmatter, multi-line and
-    inline code spans, indented code blocks, and escaped `\[` never become
-    edges (the block mask mirrors the heading detector). Titles are skipped
-    whole, so a fake link inside a title cannot start a second scan, and an
-    escaped `` \` `` is literal text rather than a span delimiter.
+    backslash escapes (`./guide\(v2\).md`) unescape and HTML entities
+    (`./A&amp;B.md`) decode before the lookup; whitespace before the closing
+    `)` is legal without a title.
+  - **Skipped**: URL schemes, protocol-relative `//host/path`, pure anchors,
+    self-links and targets that are not indexed; example links inside
+    fences (including blockquoted `> ~~~` fences), frontmatter, HTML
+    comments, multi-line and inline code spans, indented code blocks (but
+    NOT indented prose inside an open list item), and escaped `\[` never
+    become edges (the block mask mirrors the heading detector). Titles are
+    skipped whole, so a fake link inside a title cannot start a second scan;
+    removing a code span leaves a separator so `[x]`+`(y)` cannot glue into
+    a link the source never had; and an escaped `` \` `` is literal text
+    rather than a span delimiter, while escapes inside an OPEN span are
+    literal and never block its close.
   - **Prose only**: a doc-link string inside a code file stays out of the
     graph, so the code calls/imports projection keeps its meaning.
   - **Derivation order**: links are derived AFTER all batches, over every

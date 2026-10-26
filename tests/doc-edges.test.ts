@@ -61,6 +61,20 @@ const FILES = {
 	"docs/wsp.md": "## W\n\nSee [w](./hub.md ) and [evil](./victim.md).\n",
 	"docs/intitle.md": "## IT\n\nSee [t](./hub.md \"[evil](./victim.md)\").\n",
 	"docs/escbt.md": "## EB\n\n\\`see [good](./hub.md) here\\`\n",
+	// Hidden round-3 + round-4 fixtures (API pagination had capped the review
+	// list at 30 comments, hiding 8 round-3 findings).
+	"docs/hstop.md": "## Open\n\ntext with ` opener\n## Next\nSee [good](./hub.md) and `more`\n",
+	"docs/listcont.md": "## LC\n\n- Intro\n\n    [good](./hub.md)\n",
+	"docs/bqfence.md": "## BQ\n\n> ~~~md\n> [evil](./victim.md)\n> ~~~\n\n[good](./hub.md)\n",
+	"docs/spancat.md": "## SC\n\n[lit]`x`(./victim.md) and [good](./hub.md)\n",
+	"docs/escabel.md": "## EL\n\nSee [see \\[guide](./hub.md).\n",
+	"docs/angle.md": "## Ang\n\nSee [bad](<./victim.md> text and [good](<./hub.md>).\n",
+	"docs/ptitle.md": "## PT\n\nSee [p](./hub.md (Hub \\(draft)).\n",
+	"docs/entity.md": "## Ent\n\nSee [e](./A&amp;B.md).\n",
+	"docs/A&B.md": "# AB\n\nTarget with an ampersand.\n",
+	"docs/spanesc.md": "## SE\n\n`[evil](./victim.md)\\` and [good](./hub.md).\n",
+	"docs/comment.md": "## Cmt\n\n<!-- [evil](./victim.md) -->\n\n[good](./hub.md)\n",
+	"docs/netpath.md": "## NP\n\nSee [x](//docs/hub.md) and [y](./victim.md).\n",
 };
 
 async function setup(): Promise<{ engine: ContextEngine; backend: LocalBackend }> {
@@ -367,5 +381,103 @@ describe("WP3 review fixes (augment PR #28, round 3)", () => {
 	it("keeps links between escaped backticks (\\` is literal, not a span)", async () => {
 		const { backend } = await setup();
 		expect(backend.getRelatedFilePaths(["docs/escbt.md"])).toContain("docs/hub.md");
+	});
+});
+
+describe("WP3 review fixes (augment PR #28, hidden round-3 + round 4)", () => {
+	it("stops a code-span lookahead at a heading (paragraph boundary)", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/hstop.md"])).toContain("docs/hub.md");
+	});
+
+	it("keeps indented prose inside an open list item after a blank", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/listcont.md"])).toContain("docs/hub.md");
+	});
+
+	it("masks blockquoted fences", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/bqfence.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("does not glue separated delimiters across a removed code span", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/spancat.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("finds an unescaped opener when the label contains an escaped bracket", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/escabel.md"])).toContain("docs/hub.md");
+	});
+
+	it("rejects an angle-bracket destination with no closing paren", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/angle.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("reads a parenthesised title containing escaped parens", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/ptitle.md"])).toContain("docs/hub.md");
+	});
+
+	it("decodes HTML entities in destinations (A&amp;B.md -> A&B.md)", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/entity.md"])).toContain("docs/A&B.md");
+	});
+
+	it("lets an escaped backtick close an open span (escapes are literal inside)", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/spanesc.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("ignores links inside HTML comments", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/comment.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("treats //host/path as an external URL, not a local path", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/netpath.md"]);
+		expect(related).not.toContain("docs/hub.md");
+		expect(related).toContain("docs/victim.md");
+	});
+
+	it("matches the batch when indexerRedactSecrets is off (raw coordinates)", async () => {
+		const projectDir = makeTempDir("pce-wp3nore-");
+		dirs.push(projectDir);
+		writeFiles(projectDir, {
+			"docs/redacted.md":
+				"## Before\n\nIntro.\n\n```\n-----BEGIN PRIVATE KEY-----\nabc123def456\n-----END PRIVATE KEY-----\n```\n\n## After\nSee [good](./hub.md).\n",
+			"docs/hub.md": "# Hub\n\nTarget.\n",
+		});
+		const storageRoot = makeTempDir("pce-wp3norestore-");
+		dirs.push(storageRoot);
+		const config: Config = {
+			...defaultConfig(),
+			storagePath: storageRoot,
+			indexerChunkBudgetChars: 500,
+			indexerRedactSecrets: false,
+		};
+		const backend = new LocalBackend(storageRoot);
+		const engine = new ContextEngine({ projectDir, config, runtime: { backend, embedder: makeFakeEmbedder() } });
+		engines.push(engine);
+		await engine.reindex({ full: true });
+		const section = backend
+			.chunksByFile("docs/redacted.md", 10)
+			.find((c) => c.chunkType === "doc" && c.content.includes("See [good]"))!;
+		expect(section).toBeDefined();
+		// The batch chunked RAW text: the pass must attribute raw lines too, or
+		// the redacted coordinate (line 10) lands inside Before (1-10) instead.
+		expect(engine.relatedContext(section.id)).toContain("(docs/hub.md)");
 	});
 });

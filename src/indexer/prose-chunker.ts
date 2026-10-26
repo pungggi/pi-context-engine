@@ -375,6 +375,10 @@ function readBalancedDest(line: string, start: number): { dest: string; end: num
 			let d = 1;
 			j++;
 			while (j < len && d > 0) {
+				if (line[j] === "\\") {
+					j += 2; // round 3: `(Hub \(draft))` — escapes are literal here
+					continue;
+				}
 				if (line[j] === "(") d++;
 				else if (line[j] === ")") d--;
 				j++;
@@ -450,7 +454,12 @@ function readBalancedDest(line: string, start: number): { dest: string; end: num
  * treated as literal text (CommonMark's outcome).
  */
 export function extractDocLinkTargets(content: string): DocLinkTarget[] {
-	const lines = content.split("\n");
+	// Round 4: HTML comments are not rendered, so links inside them are inert.
+	// Blank the comment CONTENT (newlines survive) so line numbers and the
+	// block scanner below stay byte-for-byte aligned with the raw file.
+	const lines = content
+		.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, " "))
+		.split("\n");
 
 	// Block-level mask (round 2): frontmatter and fenced code never reach the
 	// inline scanner, and the code-span lookahead below stops at exactly these
@@ -475,13 +484,16 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 				continue;
 			}
 			const line = lines[i]!;
+			// Round 3: a blockquoted fence (`> ~~~md`) is a fence too — match
+			// after stripping the quote markers, same as block parsing does.
+			const bq = line.replace(/^ {0,3}(?:>[ \t]?)+/, "");
 			if (fence !== null) {
 				blocked[i] = true;
-				const close = line.match(FENCE_CLOSE);
+				const close = bq.match(FENCE_CLOSE);
 				if (close && close[1]!.startsWith(fence[0]!) && close[1]!.length >= fence.length) fence = null;
 				continue;
 			}
-			const openMatch = line.match(FENCE_OPEN_BT) ?? line.match(FENCE_OPEN_TL);
+			const openMatch = bq.match(FENCE_OPEN_BT) ?? bq.match(FENCE_OPEN_TL);
 			if (openMatch) {
 				blocked[i] = true;
 				fence = openMatch[1]!;
@@ -511,9 +523,10 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			}
 			let e = p;
 			while (e < str.length && str[e] === "`") e++;
-			// Round 3: an escaped backtick (\`) is literal text, never a
-			// delimiter — it cannot close a span or open one.
-			if (!isEscaped(str, p) && e - p === n) return { end: e };
+			// Round 4: escapes do NOT apply to a span's CLOSING run — inside an
+			// open code span backslashes are literal, so `\`` still closes it.
+			// (The OPENING side is escape-checked in the main scan below.)
+			if (e - p === n) return { end: e };
 			p = e;
 		}
 		return null;
@@ -526,6 +539,9 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			if (blocked[k]) return null;
 			const l = lines[k]!;
 			if (l.trim() === "") return null;
+			// Round 3: headings terminate paragraphs even without a blank line,
+			// so a span can never tunnel across `## Next`.
+			if (ATX.test(l)) return null;
 			const hit = findExactRun(l, 0, n);
 			if (hit !== null) return { line: k, col: hit.end };
 		}
@@ -541,6 +557,7 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 	let suppress: { line: number; col: number } | null = null;
 	let prevBlank = true; // start of file: an indented line there starts code
 	let indentedCode: boolean = false;
+	let listIndent = 0; // content column of the open list item, 0 = no list
 
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i]!;
@@ -559,11 +576,22 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			text = line;
 		}
 
+		// List state (round 3): a marker opens an item whose content column is
+		// marker + whitespace; indented text at/after that column is prose of
+		// the item, not code. The list ends at a dedented non-marker line.
+		const marker = /^( {0,3})([-*+]|\d{1,9}[.)])([ \t]+)/.exec(line);
+		const indentCols = line.startsWith("\t") ? 4 : line.match(/^ */)![0]!.length;
+		if (marker) listIndent = marker[1]!.length + marker[2]!.length + marker[3]!.length;
+		else if (line.trim() !== "" && indentCols < listIndent) listIndent = 0;
+
 		// Indented code blocks (round 2): 4-space/tab indent after a blank line,
 		// or continuing such a block, is literal. A lazy paragraph continuation
-		// (indent with a non-blank line above) stays live.
+		// (indent with a non-blank line above) stays live, and so does indented
+		// prose inside an open list item (round 3): `- Intro` sets the content
+		// column to 2, so a 4-space continuation below a blank is item prose.
 		const indented = line.startsWith("    ") || line.startsWith("\t");
-		const inIndentedCode: boolean = indented && (prevBlank || indentedCode);
+		const inIndentedCode: boolean =
+			indented && (prevBlank || indentedCode) && !(listIndent > 0 && indentCols >= listIndent);
 		indentedCode = inIndentedCode;
 		prevBlank = line.trim() === "";
 		if (inIndentedCode) continue;
@@ -591,7 +619,9 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			const n = runEnd - bt;
 			const close = findExactRun(text, runEnd, n);
 			if (close !== null) {
-				live += text.slice(pos, bt);
+				// Round 3: keep a separator — deleting the span must not glue
+				// `[x]` and `(y)` into a link the source never had.
+				live += text.slice(pos, bt) + " ";
 				pos = close.end;
 				continue;
 			}
@@ -613,9 +643,18 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			const idx = text.indexOf("](", search);
 			if (idx === -1) break;
 			search = idx + 2;
-			const openIdx = text.lastIndexOf("[", idx);
-			if (openIdx === -1) continue; // no opener bracket
-			if (isEscaped(text, idx) || isEscaped(text, openIdx)) continue; // \] or \[
+			// Round 3: the opener is the nearest UNESCAPED `[` — `[see \[guide](x)`
+			// carries an escaped bracket inside its label; rejecting on it would
+			// kill the whole valid link.
+			let openIdx = -1;
+			for (let p = idx - 1; p >= 0; p--) {
+				if (text[p] === "[" && !isEscaped(text, p)) {
+					openIdx = p;
+					break;
+				}
+			}
+			if (openIdx === -1) continue; // no unescaped opener bracket
+			if (isEscaped(text, idx)) continue; // \] is not a delimiter either
 			const link = readBalancedDest(text, idx + 2);
 			if (link !== null) {
 				push(link.dest, i + 1);

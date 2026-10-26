@@ -53,6 +53,14 @@ const FILES = {
 	"docs/mlspan.md": "## ML\n\n`see\n[evil](./victim.md)\nthe example`\n\n[good](./hub.md)\n",
 	"docs/indented.md": "## Ind\n\nIntro.\n\n    [evil](./victim.md)\n\n[good](./hub.md)\n",
 	"docs/bracket.md": "## Br\n\n\\[evil](./victim.md) and [good](./hub.md)\n",
+	// Round-3 fixtures (augment PR #28, round 3).
+	// Multi-line PEM block: redaction collapses it (3 lines -> 1), shifting
+	// every stored line number after it away from the raw file's.
+	"docs/redacted.md":
+		"## Before\n\nIntro.\n\n```\n-----BEGIN PRIVATE KEY-----\nabc123def456ghi789\n-----END PRIVATE KEY-----\n```\n\n## After\n\nSee [good](./hub.md).\n",
+	"docs/wsp.md": "## W\n\nSee [w](./hub.md ) and [evil](./victim.md).\n",
+	"docs/intitle.md": "## IT\n\nSee [t](./hub.md \"[evil](./victim.md)\").\n",
+	"docs/escbt.md": "## EB\n\n\\`see [good](./hub.md) here\\`\n",
 };
 
 async function setup(): Promise<{ engine: ContextEngine; backend: LocalBackend }> {
@@ -323,5 +331,41 @@ describe("WP3 review fixes (augment PR #28, round 2)", () => {
 		related = backend.getRelatedFilePaths(["docs/a.md"]);
 		expect(related).toContain("docs/b.md");
 		expect(related).not.toContain("docs/c.md");
+	});
+});
+
+describe("WP3 review fixes (augment PR #28, round 3)", () => {
+	it("keeps line attribution stable when secret redaction collapses lines", async () => {
+		const { engine, backend } = await setup();
+		const section = backend
+			.chunksByFile("docs/redacted.md", 10)
+			.find((c) => c.chunkType === "doc" && c.content.includes("See [good]"))!;
+		expect(section).toBeDefined();
+		const text = engine.relatedContext(section.id);
+		// Step-2 render: only the SECTION holding the edge prints the path in
+		// parens. With raw-line attribution the PEM collapse (3 lines -> 1)
+		// shifts this link onto the outline parent / fallback instead.
+		expect(text).toContain("(docs/hub.md)");
+	});
+
+	it("accepts whitespace before the closing paren (no title)", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/wsp.md"]);
+		expect(related).toContain("docs/hub.md");
+		// Sanity: the real second link on the same line still lands.
+		expect(related).toContain("docs/victim.md");
+	});
+
+	it("does not rescan inside a link's title", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/intitle.md"]);
+		expect(related).toContain("docs/hub.md");
+		// The title is literal text: no reference to its fake link target.
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("keeps links between escaped backticks (\\` is literal, not a span)", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/escbt.md"])).toContain("docs/hub.md");
 	});
 });

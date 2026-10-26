@@ -336,27 +336,65 @@ export interface DocLinkTarget {
 
 /**
  * Read the destination of an inline link whose `](` starts at `start`
- * (index just after the `(`).
+ * (index just after the `(`). Returns the destination plus the index AFTER
+ * the link's closing `)`, so the caller can resume scanning outside it (a
+ * `](` inside a title must not start a second link).
  *
  * Phase 1 reads the destination: backslash escapes never count toward paren
  * depth (`./guide\(v2\).md`), and whitespace ends the destination because a
- * title follows. Phase 2, only when that title zone was reached, skips a
- * quoted or parenthesised title and demands the link's closing `)`. The split
- * is what makes `[guide](./hub.md "Hub (draft")` work: a title's unmatched
- * `(` must not be counted before the destination is separated (round-2
- * review fix; the depth-only scan returned null there and lost the edge).
- * Supports the `<angle-bracket>` form. Returns null when the line never
- * closes the link (CommonMark: no link). Multi-line links are not followed;
- * that approximation is documented on `extractDocLinkTargets`.
+ * title may follow. Phase 2 (the shared `tail`) accepts, in order: just the
+ * closing paren (whitespace before `)` is legal without a title, round-3
+ * fix), a quoted/parenthesised title then `)`, or rejects. That split is
+ * what makes `[guide](./hub.md "Hub (draft")` work: a title's unmatched `(`
+ * must not be counted before the destination is separated. Supports the
+ * `<angle-bracket>` form. Returns null when the line never closes the link
+ * (CommonMark: no link). Multi-line links are not followed; that
+ * approximation is documented on `extractDocLinkTargets`.
  */
-function readBalancedDest(line: string, start: number): string | null {
+function readBalancedDest(line: string, start: number): { dest: string; end: number } | null {
 	const len = line.length;
+	const tail = (from: number, dest: string): { dest: string; end: number } | null => {
+		let j = from;
+		while (j < len && /\s/.test(line[j]!)) j++;
+		if (j >= len) return null;
+		if (line[j] === ")") return { dest, end: j + 1 }; // no title, just space
+		const q = line[j];
+		if (q === '"' || q === "'") {
+			let k = j + 1;
+			while (k < len) {
+				if (line[k] === "\\") {
+					k += 2;
+					continue;
+				}
+				if (line[k] === q) break;
+				k++;
+			}
+			if (k >= len) return null;
+			j = k + 1;
+		} else if (q === "(") {
+			let d = 1;
+			j++;
+			while (j < len && d > 0) {
+				if (line[j] === "(") d++;
+				else if (line[j] === ")") d--;
+				j++;
+			}
+			if (d > 0) return null;
+		} else {
+			return null; // garbage after the destination: not a link
+		}
+		while (j < len && /\s/.test(line[j]!)) j++;
+		return j < len && line[j] === ")" ? { dest, end: j + 1 } : null;
+	};
+
 	let i = start;
 	while (i < len && /\s/.test(line[i]!)) i++;
 	if (i >= len) return null;
 	if (line[i] === "<") {
-		const end = line.indexOf(">", i + 1);
-		return end === -1 ? null : line.slice(i + 1, end);
+		const close = line.indexOf(">", i + 1);
+		if (close === -1) return null;
+		const dest = line.slice(i + 1, close);
+		return dest.length > 0 ? tail(close + 1, dest) : null;
 	}
 
 	// Phase 1: destination, until the closing paren or the first whitespace.
@@ -388,38 +426,8 @@ function readBalancedDest(line: string, start: number): string | null {
 	if (destEnd === -1) return null;
 	const dest = line.slice(body, destEnd);
 	if (dest.length === 0) return null;
-	if (!stoppedAtWs) return dest;
-
-	// Phase 2: title zone — skip the quoted/parenthesised title, then `)`.
-	while (i < len && /\s/.test(line[i]!)) i++;
-	if (i >= len) return null;
-	const q = line[i];
-	if (q === '"' || q === "'") {
-		let k = i + 1;
-		while (k < len) {
-			if (line[k] === "\\") {
-				k += 2;
-				continue;
-			}
-			if (line[k] === q) break;
-			k++;
-		}
-		if (k >= len) return null;
-		i = k + 1;
-	} else if (q === "(") {
-		let d = 1;
-		i++;
-		while (i < len && d > 0) {
-			if (line[i] === "(") d++;
-			else if (line[i] === ")") d--;
-			i++;
-		}
-		if (d > 0) return null;
-	} else {
-		return null; // garbage after the destination: not a link
-	}
-	while (i < len && /\s/.test(line[i]!)) i++;
-	return i < len && line[i] === ")" ? dest : null;
+	if (!stoppedAtWs) return { dest, end: destEnd + 1 };
+	return tail(destEnd, dest);
 }
 
 /**
@@ -503,7 +511,9 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			}
 			let e = p;
 			while (e < str.length && str[e] === "`") e++;
-			if (e - p === n) return { end: e };
+			// Round 3: an escaped backtick (\`) is literal text, never a
+			// delimiter — it cannot close a span or open one.
+			if (!isEscaped(str, p) && e - p === n) return { end: e };
 			p = e;
 		}
 		return null;
@@ -570,6 +580,12 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 				live += text.slice(pos);
 				break;
 			}
+			if (isEscaped(text, bt)) {
+				// Round 3: \` is a literal backtick, not a span delimiter.
+				live += text.slice(pos, bt + 1);
+				pos = bt + 1;
+				continue;
+			}
 			let runEnd = bt;
 			while (runEnd < text.length && text[runEnd] === "`") runEnd++;
 			const n = runEnd - bt;
@@ -600,8 +616,13 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			const openIdx = text.lastIndexOf("[", idx);
 			if (openIdx === -1) continue; // no opener bracket
 			if (isEscaped(text, idx) || isEscaped(text, openIdx)) continue; // \] or \[
-			const dest = readBalancedDest(text, idx + 2);
-			if (dest !== null) push(dest, i + 1);
+			const link = readBalancedDest(text, idx + 2);
+			if (link !== null) {
+				push(link.dest, i + 1);
+				// Round 3: resume AFTER the whole link, so a `](` inside its
+				// title or destination cannot start a second scan.
+				search = link.end;
+			}
 		}
 	}
 	return out;

@@ -1021,7 +1021,12 @@ async function runIndexingLocked(
 					// outgrew MAX_FILE_BYTES must not be read here either (this pass
 					// would otherwise load content the indexer itself rejected).
 					if (fs.statSync(abs).size > MAX_FILE_BYTES) continue;
-					raw = fs.readFileSync(abs, "utf-8");
+					// Round 3: chunking runs on REDACTED content (see the batch
+					// loop), so stored line numbers are redacted coordinates. A
+					// multi-line secret (PEM block) collapsing shifts every line
+					// after it; apply the identical transformation before
+					// attributing raw links, or they map to the wrong section.
+					raw = redactSecrets(fs.readFileSync(abs, "utf-8")).text;
 				} catch {
 					continue; // unreadable now: keep the edges it already contributed
 				}

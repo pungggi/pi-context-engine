@@ -194,7 +194,9 @@ is the agreed sequence (small and evidence-backed first).
   - **Skipped**: URL schemes, pure anchors, self-links and targets that are
     not indexed; example links inside fences, frontmatter, multi-line and
     inline code spans, indented code blocks, and escaped `\[` never become
-    edges (the block mask mirrors the heading detector).
+    edges (the block mask mirrors the heading detector). Titles are skipped
+    whole, so a fake link inside a title cannot start a second scan, and an
+    escaped `` \` `` is literal text rather than a span delimiter.
   - **Prose only**: a doc-link string inside a code file stays out of the
     graph, so the code calls/imports projection keeps its meaning.
   - **Derivation order**: links are derived AFTER all batches, over every
@@ -203,7 +205,9 @@ is the agreed sequence (small and evidence-backed first).
     owner is the TIGHTEST covering chunk, so the whole-file outline parent
     cannot steal a section's links). The pass replaces rather than adds
     (drop + re-insert), so links that vanish from the source cannot linger,
-    and it honors the batch path's `MAX_FILE_BYTES` guard. That survives
+    it honors the batch path's `MAX_FILE_BYTES` guard, and it applies the
+    same `redactSecrets` transform the chunker saw (a collapsed PEM block
+    would otherwise shift every later line's attribution). That survives
     fences split across chunk windows and heals links whose target file
     appears on a later run, without a source edit.
   - **Why it helps**: the edges ride three existing consumers unchanged:
@@ -219,13 +223,13 @@ is the agreed sequence (small and evidence-backed first).
   |---|---|---|
   | overall R@10 (fake backend = committed gate) | 0.830 | 0.852 |
   | prose nDCG@10 (fake) | 0.269 | 0.307 |
-  | overall R@10 (real ONNX embedder) | 0.800 | 0.826 |
-  | overall nDCG@10 (real ONNX) | 0.682 | 0.723 |
+  | overall R@10 (real ONNX embedder) | 0.800 | 0.807 |
+  | overall nDCG@10 (real ONNX) | 0.682 | 0.711 |
   | prose R@10 (real ONNX) | 0.308 | 0.385 |
-  | prose nDCG@10 (real ONNX) | 0.200 | 0.328 |
-  | distraction@10 (real ONNX, lower is better) | 0.733 | 0.712 |
+  | prose nDCG@10 (real ONNX) | 0.200 | 0.299 |
+  | distraction@10 (real ONNX, lower is better) | 0.733 | 0.728 |
 
-  The prose slice moves the most (nDCG +0.128 on the real embedder): linked
+  The prose slice moves the most (nDCG +0.099 on the real embedder): linked
   pages now expand into each other, which is exactly what whole-file notes
   could not do before. The direct win stays `related_context` on a note
   returning its linked pages instead of "No related context found".

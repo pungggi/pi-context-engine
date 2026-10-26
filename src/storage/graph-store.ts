@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS pagerank (
 	file_path TEXT PRIMARY KEY,
 	score     REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pagerank_nodes (
+	node_id TEXT PRIMARY KEY,
+	score   REAL NOT NULL
+);
 `;
 
 type Sqlite = SqliteHandle;
@@ -249,6 +253,88 @@ export class GraphStore {
 		return new Map(rows.map((r) => [r.file_path, r.score]));
 	}
 
+	/**
+	 * Symbol-level PageRank (WP2, docs/RESEARCH-COMPETITORS.md §1): the same
+	 * power iteration as computePageRank, but over the node/edge graph itself
+	 * instead of its file projection. `calls` (caller→callee) and `defines`
+	 * (file→symbol) edges let a hub function that many files call outrank a
+	 * leaf of equal lexical evidence, so unranked neighbour lists (the
+	 * related_context fallbacks) get an importance order à la Aider's repo map.
+	 *
+	 * Scope: code edges only (`calls`, `imports`, `defines`); commit and
+	 * memory nodes stay out, dangling mass is redistributed like the file
+	 * version, and scores are max-normalised to [0,1].
+	 */
+	computeSymbolPageRank(): void {
+		const nodes = new Set<string>();
+		for (const r of this.db
+			.prepare("SELECT id FROM nodes WHERE node_type IN ('function','class','file','module','doc')")
+			.all() as { id: string }[]) nodes.add(r.id);
+		const edgeRows = this.db
+			.prepare("SELECT source_id, target_id FROM edges WHERE edge_type IN ('calls','imports','defines')")
+			.all() as { source_id: string; target_id: string }[];
+
+		const out = new Map<string, Set<string>>();
+		const incoming = new Map<string, string[]>();
+		const seenPair = new Set<string>();
+		let edges = 0;
+		for (const e of edgeRows) {
+			if (!nodes.has(e.source_id) || !nodes.has(e.target_id)) continue; // stale endpoint guard
+			if (e.source_id === e.target_id) continue;
+			const key = `${e.source_id}\u0000${e.target_id}`;
+			if (seenPair.has(key)) continue; // dedupe: edge PK is (source,target,type), types collapse here
+			seenPair.add(key);
+			edges++;
+			let set = out.get(e.source_id);
+			if (!set) out.set(e.source_id, (set = new Set()));
+			set.add(e.target_id);
+			let inc = incoming.get(e.target_id);
+			if (!inc) incoming.set(e.target_id, (inc = []));
+			inc.push(e.source_id);
+		}
+
+		const run = this.db.transaction(() => {
+			this.db.exec("DELETE FROM pagerank_nodes");
+			if (nodes.size === 0 || edges === 0) return;
+			const d = 0.85;
+			const n = nodes.size;
+			let rank = new Map<string, number>();
+			for (const node of nodes) rank.set(node, 1 / n);
+			for (let iter = 0; iter < 25; iter++) {
+				const next = new Map<string, number>();
+				let dangling = 0;
+				for (const node of nodes) {
+					const o = out.get(node);
+					if (!o || o.size === 0) dangling += rank.get(node) ?? 0;
+				}
+				for (const node of nodes) {
+					let s = (1 - d) / n + (d * dangling) / n;
+					for (const src of incoming.get(node) ?? []) {
+						s += (d * (rank.get(src) ?? 0)) / (out.get(src)?.size ?? 1);
+					}
+					next.set(node, s);
+				}
+				rank = next;
+			}
+			// Loop, not Math.max(...values()): node counts track chunk counts and
+			// spread hits V8's argument cap on big indexes.
+			let max = 1e-12;
+			for (const s of rank.values()) if (s > max) max = s;
+			const ins = this.db.prepare("INSERT OR REPLACE INTO pagerank_nodes (node_id, score) VALUES (?, ?)");
+			for (const [id, s] of rank) ins.run(id, s / max);
+		});
+		run();
+	}
+
+	/** Read of the symbol PageRank table (node_id → score in [0,1]). */
+	symbolPageRanks(): Map<string, number> {
+		const rows = this.db.prepare("SELECT node_id, score FROM pagerank_nodes").all() as {
+			node_id: string;
+			score: number;
+		}[];
+		return new Map(rows.map((r) => [r.node_id, r.score]));
+	}
+
 	getNodesByType(nodeType: NodeType): GraphNode[] {
 		const rows = this.db
 			.prepare("SELECT id, node_type, name, file_path, properties FROM nodes WHERE node_type = ?")
@@ -281,6 +367,10 @@ export class GraphStore {
 					const idPh = idBatch.map(() => "?").join(",");
 					this.db
 						.prepare(`DELETE FROM nodes WHERE id IN (${idPh})`).run(...idBatch);
+					// WP2: symbol PageRank rows are keyed by the same node ids
+					// (no file_path column), so they go in the same pass.
+					this.db
+						.prepare(`DELETE FROM pagerank_nodes WHERE node_id IN (${idPh})`).run(...idBatch);
 				}
 				const srcPh = nodeIds.map(() => "?").join(",");
 				this.db.prepare("DELETE FROM edges WHERE source_id IN (" + srcPh + ")").run(...nodeIds);
@@ -299,6 +389,7 @@ export class GraphStore {
 		this.db.exec("DELETE FROM edges");
 		this.db.exec("DELETE FROM nodes");
 		this.db.exec("DELETE FROM pagerank");
+		this.db.exec("DELETE FROM pagerank_nodes");
 	}
 
 	close(): void {

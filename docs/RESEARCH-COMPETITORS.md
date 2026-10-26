@@ -186,12 +186,19 @@ is the agreed sequence (small and evidence-backed first).
   `references` edge to every indexed file their Markdown links resolve to:
   - **Covered links**: inline `[text](other.md)` / `![img](...)` and
     reference definitions `[label]: dest`; `..`, root-`/` and %-encoded
-    targets; `#fragment` and `?query` are stripped before resolution.
+    targets; `#fragment` and `?query` are stripped before resolution;
+    destinations with balanced parentheses (`./guide(v2).md`) are read with
+    a paren-depth scan, not a regex.
   - **Skipped**: URL schemes, pure anchors, self-links and targets that are
     not indexed; example links inside fences, frontmatter and inline code
     spans never become edges (the scanner mirrors the heading detector).
   - **Prose only**: a doc-link string inside a code file stays out of the
     graph, so the code calls/imports projection keeps its meaning.
+  - **Derivation order**: links are derived AFTER all batches, over every
+    indexed prose file, from a fence-aware scan of the RAW file with line
+    attribution back into chunks (mirrors the calls-derivation design). That
+    survives fences split across chunk windows and heals links whose target
+    file appears on a later run, without a source edit.
   - **Why it helps**: the edges ride three existing consumers unchanged:
     `related_context`'s neighbour lookup, `getRelatedFilePaths` (retriever
     1-hop expansion and the file-level fallback), and both PageRank tables,
@@ -205,12 +212,16 @@ is the agreed sequence (small and evidence-backed first).
   |---|---|---|
   | overall R@10 (fake backend = committed gate) | 0.830 | 0.841 |
   | prose nDCG@10 (fake) | 0.269 | 0.307 |
-  | overall nDCG@10 (real ONNX embedder) | 0.682 | 0.689 |
-  | prose nDCG@10 (real ONNX) | 0.200 | 0.228 |
-  | identifier R@5 (real ONNX) | 0.900 | 0.922 |
+  | overall R@10 (real ONNX embedder) | 0.800 | 0.839 |
+  | overall nDCG@10 (real ONNX) | 0.682 | 0.721 |
+  | prose R@10 (real ONNX) | 0.308 | 0.462 |
+  | prose nDCG@10 (real ONNX) | 0.200 | 0.333 |
+  | distraction@10 (real ONNX, lower is better) | 0.733 | 0.719 |
 
-  The metric deltas are small but consistently non-negative; the direct win
-  is `related_context` on a note returning its linked pages instead of "No
+  The prose slice moves the most (R@10 +0.154, nDCG +0.133 on the real
+  embedder): linked pages now expand into each other, which is exactly what
+  whole-file notes could not do before. The direct win stays
+  `related_context` on a note returning its linked pages instead of "No
   related context found".
 
 - **B. Summary chunk per large prose file**, generated via Ollama at index time

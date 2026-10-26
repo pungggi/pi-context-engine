@@ -871,25 +871,6 @@ async function runIndexingLocked(
 						edgeType: "defines",
 						properties: {},
 					});
-					// WP3 doc-graph edges: prose chunks link out to the indexed
-					// files their Markdown references ([text](other.md)), so
-					// related_context / graph expansion work for notes instead of
-					// always hitting the empty file-level fallback. Only prose:
-					// code files keep their calls/imports graph, and a doc-link
-					// string inside code must not become an edge.
-					if (isProseLanguage(item.language)) {
-						for (const raw of extractDocLinkTargets(chunk.content)) {
-							const resolved = resolveDocLink(raw, item.relPath, knownFiles);
-							if (resolved !== null && resolved !== item.relPath) {
-								batchEdges.push({
-									sourceId: chunk.id,
-									targetId: `file_${resolved}`,
-									edgeType: "references",
-									properties: {},
-								});
-							}
-						}
-					}
 					// R7 calls-graph collection (raw content, before the context header
 					// prepends file paths and `defines:` lists that would pollute the
 					// identifier set).
@@ -1011,6 +992,51 @@ async function runIndexingLocked(
 					backend.ingest([], [], callsEdges);
 					log?.(`  [graph] ${callsEdges.length} cross-file call edge(s)`);
 				}
+		}
+
+		// ── WP3: markdown reference edges ────────────────────────────────────
+		// Runs AFTER all batches and over ALL indexed prose files, for the same
+		// order-independence reasons as the calls derivation above:
+		// - line attribution comes from a fence/frontmatter-aware scan of the
+		//   RAW file, so a fenced block that packSegment split into line windows
+		//   cannot leak example links (a continuation chunk starts with no fence
+		//   state) nor hide real links after a stray closing fence;
+		// - links resolve against the CURRENT file set, so a target created after
+		//   the source was indexed self-heals on the next run instead of waiting
+		//   for a source edit or full rebuild (incremental review fix);
+		// - prose only: code files keep their calls/imports graph, and a doc-link
+		//   string inside code must not become an edge.
+		{
+			const refEdges: GraphEdge[] = [];
+			for (const rel of Object.keys(manifest.fileEntries)) {
+				const stored = backend.chunksByFile(rel, 500);
+				if (stored.length === 0 || !isProseLanguage(stored[0]!.language)) continue;
+				let raw: string;
+				try {
+					raw = fs.readFileSync(path.join(projectDir, rel), "utf-8");
+				} catch {
+					continue; // unreadable now: keep the edges it already contributed
+				}
+				for (const link of extractDocLinkTargets(raw)) {
+					const resolved = resolveDocLink(link.target, rel, knownFiles);
+					if (resolved === null || resolved === rel) continue;
+					// Sections cover every line contiguously; the fallback catches
+					// trailing-line drift from the legacy endLine = trim() count.
+					const owner =
+						stored.find((c) => link.line >= c.startLine && link.line <= c.endLine) ??
+						stored[stored.length - 1]!;
+					refEdges.push({
+						sourceId: owner.id,
+						targetId: `file_${resolved}`,
+						edgeType: "references",
+						properties: {},
+					});
+				}
+			}
+			if (refEdges.length > 0) {
+				backend.ingest([], [], refEdges);
+				log?.(`  [graph] ${refEdges.length} doc reference edge(s)`);
+			}
 		}
 
 		// ── Git history on full runs ──────────────────────────────────────────

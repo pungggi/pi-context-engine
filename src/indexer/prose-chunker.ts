@@ -323,24 +323,69 @@ export function chunkProse(source: string, filePath: string, language: string, b
 	return chunks;
 }
 
-/** Inline `[text](dest)` / `![alt](dest)` with an optional link title. */
-const INLINE_LINK = /!?\[[^\]]*\]\(\s*(<[^>\n]*>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
 /** Reference definition `[label]: dest` at the start of a line. */
 const LINK_REFDEF = /^ {0,3}\[[^\]]+\]:\s*(<[^>\n]*>|\S+)/;
 
+/** One raw link destination and the 1-based raw-file line it sits on. */
+export interface DocLinkTarget {
+	/** Raw destination as written (unresolved, fragment intact). */
+	target: string;
+	/** Line in the RAW file, so the pipeline can attribute it to a chunk. */
+	line: number;
+}
+
 /**
- * Raw Markdown link destinations in `content` (WP3 doc-graph edges,
- * docs/RESEARCH-COMPETITORS.md §4 P2): inline links plus reference
- * definitions, deduped with order preserved.
- *
- * The scan mirrors `segmentMarkdown`'s fence/frontmatter state machine, and
- * single-line inline code spans are stripped first, so an example link inside
- * `` `code` `` or a fenced block never becomes a graph edge (the same
- * distinction the heading scanner makes between `# comment` and a heading).
- * Returns RAW destinations; resolution against the index is the pipeline's
- * job (`resolveDocLink`).
+ * Read the destination of an inline link whose `](` starts at `start`
+ * (index just after the `(`). Tracks paren depth so balanced destinations
+ * (`./guide(v2).md`) survive intact (review fix: a regex stops at the first
+ * `)`), supports the `<angle-bracket>` form, and takes the destination up to
+ * the first whitespace so a trailing title (`./a.md "Title"`) falls away.
+ * Returns null when the parens never balance on this line (CommonMark: no
+ * link). Multi-line links are not followed; that approximation is documented
+ * on `extractDocLinkTargets`.
  */
-export function extractDocLinkTargets(content: string): string[] {
+function readBalancedDest(line: string, start: number): string | null {
+	let i = start;
+	while (i < line.length && /\s/.test(line[i]!)) i++;
+	if (i >= line.length) return null;
+	if (line[i] === "<") {
+		const end = line.indexOf(">", i + 1);
+		return end === -1 ? null : line.slice(i + 1, end);
+	}
+	const body = i;
+	let depth = 1; // the opening `(` we were called after
+	while (i < line.length) {
+		const ch = line[i];
+		if (ch === "(") depth++;
+		else if (ch === ")") {
+			depth--;
+			if (depth === 0) break;
+		}
+		i++;
+	}
+	if (depth !== 0) return null;
+	const inner = line.slice(body, i);
+	const ws = inner.search(/\s/);
+	const dest = ws === -1 ? inner : inner.slice(0, ws);
+	return dest.length > 0 ? dest : null;
+}
+
+/**
+ * Raw Markdown link destinations in `content` with their line numbers (WP3
+ * doc-graph edges, docs/RESEARCH-COMPETITORS.md §4 P2.A): inline links and
+ * images via `](` scanning, plus reference definitions, deduped per line.
+ *
+ * The scan mirrors `segmentMarkdown`'s fence/frontmatter state machine and
+ * strips code spans first (including multi-backtick forms: `` ``[x](y)`` ``
+ * is one span, not two empty ones), so example links in fenced blocks or code
+ * spans never become graph edges. The pipeline runs this on the RAW file and
+ * attributes each line to its chunk: scanning per chunk would misread a fence
+ * that `packSegment` split into line windows (continuation chunks start with
+ * no fence state), and line numbers only make sense against raw content.
+ * Approximation: destinations must close on their own line (no multi-line
+ * links).
+ */
+export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 	const lines = content.split("\n");
 
 	// Frontmatter: same guard as segmentMarkdown — a YAML literal block must
@@ -356,14 +401,15 @@ export function extractDocLinkTargets(content: string): string[] {
 		}
 	}
 
-	const out: string[] = [];
+	const out: DocLinkTarget[] = [];
 	const seen = new Set<string>();
-	const push = (raw: string): void => {
+	const push = (raw: string, line: number): void => {
 		const target = raw.trim();
-		if (target.length > 0 && !seen.has(target)) {
-			seen.add(target);
-			out.push(target);
-		}
+		if (target.length === 0) return;
+		const key = `${line}\u0000${target}`;
+		if (seen.has(key)) return;
+		seen.add(key);
+		out.push({ target, line });
 	};
 
 	let fence: string | null = null;
@@ -380,13 +426,22 @@ export function extractDocLinkTargets(content: string): string[] {
 			fence = openMatch[1]!;
 			continue;
 		}
-		// Inline code spans are literal text: `` `[x](y.md)` `` is not a link.
-		// Single-line approximation — multi-line code spans are vanishingly rare
-		// in link position.
-		const text = line.replace(/`[^`]*`/g, "");
+		// Inline code spans are literal text. The lazy backreference matches a
+		// whole span whatever its delimiter length (`a` or ``a``), where
+		// pairing single backticks independently would re-expose the content of
+		// a double-backtick span (review fix).
+		const text = line.replace(/(`+).*?\1/g, "");
 		const ref = text.match(LINK_REFDEF);
-		if (ref) push(ref[1]!);
-		for (const m of text.matchAll(INLINE_LINK)) push(m[1]!);
+		if (ref) push(ref[1]!, i + 1);
+		let search = 0;
+		for (;;) {
+			const idx = text.indexOf("](", search);
+			if (idx === -1) break;
+			search = idx + 2;
+			if (text.lastIndexOf("[", idx) === -1) continue; // no opener bracket
+			const dest = readBalancedDest(text, idx + 2);
+			if (dest !== null) push(dest, i + 1);
+		}
 	}
 	return out;
 }

@@ -4,6 +4,8 @@
  * prose chunk that contains them to the target file's node, so
  * `related_context` and graph expansion are no longer empty for notes.
  */
+import fs from "node:fs";
+import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ContextEngine } from "../src/engine.js";
 import { defaultConfig, type Config } from "../src/config.js";
@@ -35,6 +37,16 @@ const FILES = {
 	"docs/legacy.md": "Just a flat note with a link to [the hub](./hub.md).\n",
 	// Code file containing a doc-link string: prose gate must keep it out.
 	"src/weird.ts": 'export const note = "see [x](../docs/hub.md)";\n',
+	// Review-fix fixtures (augment PR #28, round 1).
+	"docs/victim.md": "# Victim\n\nMust never appear as a reference target.\n",
+	"docs/guide(v2).md": "# Guide v2\n\nDestination with balanced parentheses.\n",
+	// Oversize fence (> budget) splits across chunk windows; its last window
+	// holds "[evil] ``` [good]" — per-chunk scanning would leak the example
+	// AND treat the closer as an opener that hides the real link.
+	"docs/bigfence.md":
+		"## Big\n\n```md\n" + "x".repeat(4200) + "\n[evil](./victim.md)\n```\n[good](./hub.md)\n",
+	"docs/dblb.md": "## Dbl\n\n``[evil](./victim.md)`` and [good](./hub.md)\n",
+	"docs/paren.md": "## Paren\n\nSee [the guide](./guide(v2).md).\n",
 };
 
 async function setup(): Promise<{ engine: ContextEngine; backend: LocalBackend }> {
@@ -43,7 +55,7 @@ async function setup(): Promise<{ engine: ContextEngine; backend: LocalBackend }
 	writeFiles(projectDir, FILES);
 	const storageRoot = makeTempDir("pce-wp3store-");
 	dirs.push(storageRoot);
-	const config: Config = { ...defaultConfig(), storagePath: storageRoot };
+	const config: Config = { ...defaultConfig(), storagePath: storageRoot, indexerChunkBudgetChars: 500 };
 	const backend = new LocalBackend(storageRoot);
 	const engine = new ContextEngine({ projectDir, config, runtime: { backend, embedder: makeFakeEmbedder() } });
 	engines.push(engine);
@@ -125,5 +137,49 @@ describe("WP3: deletion keeps reference edges consistent", () => {
 		const ranks = backend.pageRanks();
 		expect(ranks.has("docs/b.md")).toBe(false);
 		expect(ranks.has("docs/hub.md")).toBe(true);
+	});
+});
+
+describe("WP3 review fixes (augment PR #28, round 1)", () => {
+	it("keeps example links inside an oversized fence that chunk windows split", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/bigfence.md"]);
+		// The split window holds "[evil] ``` [good]": per-chunk scanning would
+		// leak the example and let the stray closer hide the real link. The
+		// raw-file scan gets both right.
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("treats a double-backtick code span as one span (no leaked edge)", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/dblb.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("keeps destinations with balanced parentheses", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/paren.md"])).toContain("docs/guide(v2).md");
+	});
+
+	it("heals a link whose target appears later, without touching the source", async () => {
+		const projectDir = makeTempDir("pce-wp3defer-");
+		dirs.push(projectDir);
+		writeFiles(projectDir, { "docs/a.md": "## A\n\nLink to [b](./b.md), not indexed yet.\n" });
+		const storageRoot = makeTempDir("pce-wp3deferstore-");
+		dirs.push(storageRoot);
+		const config: Config = { ...defaultConfig(), storagePath: storageRoot, indexerChunkBudgetChars: 500 };
+		const backend = new LocalBackend(storageRoot);
+		const engine = new ContextEngine({ projectDir, config, runtime: { backend, embedder: makeFakeEmbedder() } });
+		engines.push(engine);
+		await engine.reindex({ full: true });
+		expect(backend.getRelatedFilePaths(["docs/a.md"])).toHaveLength(0);
+
+		fs.writeFileSync(path.join(projectDir, "docs", "b.md"), "# B\n\nTarget page.\n");
+		// Incremental: a.md is unchanged and skipped by the manifest, so only
+		// the end-of-run derivation pass can heal the edge.
+		await engine.reindex();
+		expect(backend.getRelatedFilePaths(["docs/a.md"])).toContain("docs/b.md");
 	});
 });

@@ -1009,22 +1009,48 @@ async function runIndexingLocked(
 		{
 			const refEdges: GraphEdge[] = [];
 			for (const rel of Object.keys(manifest.fileEntries)) {
-				const stored = backend.chunksByFile(rel, 500);
+				// Round 2: one file's chunks are bounded by MAX_FILE_BYTES, so a
+				// large limit is safe; the 500 cap silently truncated heading-less
+				// notes that pack to thousands of chunks, orphaning their links.
+				const stored = backend.chunksByFile(rel, 100_000);
 				if (stored.length === 0 || !isProseLanguage(stored[0]!.language)) continue;
+				const abs = path.join(projectDir, rel);
 				let raw: string;
 				try {
-					raw = fs.readFileSync(path.join(projectDir, rel), "utf-8");
+					// Round 2: mirror the batch path's safeRead guard — a file that
+					// outgrew MAX_FILE_BYTES must not be read here either (this pass
+					// would otherwise load content the indexer itself rejected).
+					if (fs.statSync(abs).size > MAX_FILE_BYTES) continue;
+					raw = fs.readFileSync(abs, "utf-8");
 				} catch {
 					continue; // unreadable now: keep the edges it already contributed
 				}
+				// Round 2: replace, do not just add. Links removed from the source
+				// (edit reverted, target never reindexed) must not linger as stale
+				// rows once the raw file no longer contains them.
+				backend.dropEdgesFrom(
+					stored.map((c) => c.id),
+					"references",
+				);
 				for (const link of extractDocLinkTargets(raw)) {
 					const resolved = resolveDocLink(link.target, rel, knownFiles);
 					if (resolved === null || resolved === rel) continue;
-					// Sections cover every line contiguously; the fallback catches
-					// trailing-line drift from the legacy endLine = trim() count.
-					const owner =
-						stored.find((c) => link.line >= c.startLine && link.line <= c.endLine) ??
-						stored[stored.length - 1]!;
+					// Round 2: `find` by startLine picks the outline parent
+					// (startLine 1, endLine EOF) for every line, stealing links from
+					// the sections that own them. Prefer the TIGHTEST covering range
+					// (a section beats the parent; ties keep source order); the last
+					// chunk catches trailing-line drift from the legacy endLine =
+					// trim() computation.
+					let owner = stored[stored.length - 1]!;
+					let bestSpan = Number.POSITIVE_INFINITY;
+					for (const c of stored) {
+						if (link.line < c.startLine || link.line > c.endLine) continue;
+						const span = c.endLine - c.startLine;
+						if (span < bestSpan) {
+							bestSpan = span;
+							owner = c;
+						}
+					}
 					refEdges.push({
 						sourceId: owner.id,
 						targetId: `file_${resolved}`,
@@ -1183,6 +1209,9 @@ function resolveImportPath(spec: string, importerRel: string, knownFiles: Set<st
 function resolveDocLink(target: string, sourceRel: string, knownFiles: Set<string>): string | null {
 	let dest = target;
 	if (dest.startsWith("<") && dest.endsWith(">")) dest = dest.slice(1, -1);
+	// Round 2: CommonMark escapes (`./guide\(v2\).md`) must come off before
+	// the exact-path lookup; only backslash-escaped PUNCTUATION unescapes.
+	dest = dest.replace(/\\([!-/:-@\[-`{-~])/g, "$1");
 	dest = dest.split("#")[0]!;
 	dest = dest.split("?")[0]!;
 	if (dest === "") return null; // pure anchor: same-file, nothing to link

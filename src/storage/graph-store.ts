@@ -387,6 +387,20 @@ export class GraphStore {
 		run([...batchedParams(filePaths)]);
 	}
 
+	/**
+	 * WP3 round 2: drop all out-edges of `edgeType` sourced from `nodeIds`.
+	 * The doc-reference derivation re-runs for every prose file each index run
+	 * and replaces (drop + re-insert) rather than only adding, so links that
+	 * vanished from the source cannot linger as stale rows forever.
+	 */
+	deleteEdgesFrom(nodeIds: string[], edgeType: EdgeType): void {
+		if (nodeIds.length === 0) return;
+		for (const batch of batchedParams(nodeIds)) {
+			const ph = batch.map(() => "?").join(",");
+			this.db.prepare(`DELETE FROM edges WHERE edge_type = ? AND source_id IN (${ph})`).run(edgeType, ...batch);
+		}
+	}
+
 	clear(): void {
 		this.db.exec("DELETE FROM edges");
 		this.db.exec("DELETE FROM nodes");

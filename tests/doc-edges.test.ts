@@ -47,6 +47,12 @@ const FILES = {
 		"## Big\n\n```md\n" + "x".repeat(4200) + "\n[evil](./victim.md)\n```\n[good](./hub.md)\n",
 	"docs/dblb.md": "## Dbl\n\n``[evil](./victim.md)`` and [good](./hub.md)\n",
 	"docs/paren.md": "## Paren\n\nSee [the guide](./guide(v2).md).\n",
+	// Round-2 fixtures (augment PR #28, round 2).
+	"docs/quoted.md": "## Q\n\nSee [q](./hub.md \"Hub (draft\") and [evil](./victim.md).\n",
+	"docs/escaped.md": "## Esc\n\nSee [g](./guide\\(v2\\).md).\n",
+	"docs/mlspan.md": "## ML\n\n`see\n[evil](./victim.md)\nthe example`\n\n[good](./hub.md)\n",
+	"docs/indented.md": "## Ind\n\nIntro.\n\n    [evil](./victim.md)\n\n[good](./hub.md)\n",
+	"docs/bracket.md": "## Br\n\n\\[evil](./victim.md) and [good](./hub.md)\n",
 };
 
 async function setup(): Promise<{ engine: ContextEngine; backend: LocalBackend }> {
@@ -72,6 +78,10 @@ describe("WP3: markdown references become graph edges", () => {
 		const text = engine.relatedContext(section.id);
 		expect(text).not.toContain("No related context");
 		expect(text).toContain("docs/hub.md");
+		// Round 2: the STEP-2 render carries the node path in parens; the
+		// file-level fallback does not. If the outline parent (startLine 1,
+		// endLine EOF) steals the link, this section lands on the fallback.
+		expect(text).toContain("(docs/hub.md)");
 	});
 
 	it("resolves ..-relative links from a whole-file fallback chunk", async () => {
@@ -181,5 +191,137 @@ describe("WP3 review fixes (augment PR #28, round 1)", () => {
 		// the end-of-run derivation pass can heal the edge.
 		await engine.reindex();
 		expect(backend.getRelatedFilePaths(["docs/a.md"])).toContain("docs/b.md");
+	});
+});
+
+describe("WP3 review fixes (augment PR #28, round 2)", () => {
+	it("attributes a link to its own section, not the whole-file outline parent", async () => {
+		const { engine, backend } = await setup();
+		const section = backend
+			.chunksByFile("docs/a.md", 10)
+			.find((c) => c.chunkType === "doc" && c.content.includes("the guide"))!;
+		const text = engine.relatedContext(section.id);
+		// Step-2 neighbour render carries the node path in parens; the
+		// file-level fallback does not. Parent theft lands on the fallback.
+		expect(text).toContain("(docs/hub.md)");
+	});
+
+	it("reads titles with an unmatched paren before separating the destination", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/quoted.md"])).toContain("docs/hub.md");
+	});
+
+	it("unescapes CommonMark \\( \\) destinations before the exact-path lookup", async () => {
+		const { backend } = await setup();
+		expect(backend.getRelatedFilePaths(["docs/escaped.md"])).toContain("docs/guide(v2).md");
+	});
+
+	it("suppresses links inside multi-line code spans", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/mlspan.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("suppresses links in indented code blocks after a blank line", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/indented.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("treats an escaped opening bracket as literal text", async () => {
+		const { backend } = await setup();
+		const related = backend.getRelatedFilePaths(["docs/bracket.md"]);
+		expect(related).toContain("docs/hub.md");
+		expect(related).not.toContain("docs/victim.md");
+	});
+
+	it("attributes links beyond a 500-chunk note to the chunk containing them", async () => {
+		const projectDir = makeTempDir("pce-wp3late-");
+		dirs.push(projectDir);
+		const paras = Array.from({ length: 601 }, (_, i) =>
+			i === 600 ? "P600: late link [late](./hub.md)" : `P${i}: ${"x".repeat(350)}`,
+		);
+		writeFiles(projectDir, {
+			"docs/late.md": paras.join("\n\n"),
+			"docs/hub.md": "# Hub\n\nTarget.\n",
+		});
+		const storageRoot = makeTempDir("pce-wp3latestore-");
+		dirs.push(storageRoot);
+		const config: Config = { ...defaultConfig(), storagePath: storageRoot, indexerChunkBudgetChars: 500 };
+		const backend = new LocalBackend(storageRoot);
+		const engine = new ContextEngine({ projectDir, config, runtime: { backend, embedder: makeFakeEmbedder() } });
+		engines.push(engine);
+		await engine.reindex({ full: true });
+
+		const all = backend.chunksByFile("docs/late.md", 100_000);
+		expect(all.length).toBeGreaterThan(500);
+		const last = all[all.length - 1]!;
+		expect(last.content).toContain("[late](./hub.md)");
+		expect(backend.graphNeighbors(last.id, "references").length).toBeGreaterThan(0);
+	});
+
+	it("never reads a file that outgrew MAX_FILE_BYTES (keeps its old edges)", async () => {
+		const projectDir = makeTempDir("pce-wp3grow-");
+		dirs.push(projectDir);
+		writeFiles(projectDir, {
+			"docs/grow.md": "## Grow\n\nSmall [g](./hub.md) note.\n",
+			"docs/hub.md": "# Hub\n\nTarget.\n",
+			"docs/victim.md": "# Victim\n\nNo.\n",
+		});
+		const storageRoot = makeTempDir("pce-wp3growstore-");
+		dirs.push(storageRoot);
+		const config: Config = { ...defaultConfig(), storagePath: storageRoot, indexerChunkBudgetChars: 500 };
+		const backend = new LocalBackend(storageRoot);
+		const engine = new ContextEngine({ projectDir, config, runtime: { backend, embedder: makeFakeEmbedder() } });
+		engines.push(engine);
+		await engine.reindex({ full: true });
+		expect(backend.getRelatedFilePaths(["docs/grow.md"])).toContain("docs/hub.md");
+
+		// Grows past the 2 MiB guard and now "links" the victim: the batch path
+		// rejects it via safeRead, and the derivation pass must too.
+		fs.writeFileSync(
+			path.join(projectDir, "docs", "grow.md"),
+			"## Grow\n\n" + "y".repeat(2_200_000) + "\n[evil](./victim.md)\n",
+		);
+		await engine.reindex();
+		const related = backend.getRelatedFilePaths(["docs/grow.md"]);
+		expect(related).toContain("docs/hub.md"); // old edges kept
+		expect(related).not.toContain("docs/victim.md"); // oversized content never scanned
+	});
+
+	it("drops stale edges when a source reverts while staying manifest-unchanged", async () => {
+		const projectDir = makeTempDir("pce-wp3stale-");
+		dirs.push(projectDir);
+		writeFiles(projectDir, {
+			"docs/a.md": "## A\n\nLink to [b](./b.md).\n",
+			"docs/b.md": "# B\n\nTarget B.\n",
+			"docs/c.md": "# C\n\nTarget C.\n",
+		});
+		const storageRoot = makeTempDir("pce-wp3stalestore-");
+		dirs.push(storageRoot);
+		const config: Config = { ...defaultConfig(), storagePath: storageRoot, indexerChunkBudgetChars: 500 };
+		const backend = new LocalBackend(storageRoot);
+		const engine = new ContextEngine({ projectDir, config, runtime: { backend, embedder: makeFakeEmbedder() } });
+		engines.push(engine);
+		await engine.reindex({ full: true });
+		expect(backend.getRelatedFilePaths(["docs/a.md"])).toContain("docs/b.md");
+
+		// a.md is edited on disk but NEVER reindexed (targeted run on c only):
+		// the pass follows the raw file (b -> c) and drops the old edge.
+		fs.writeFileSync(path.join(projectDir, "docs", "a.md"), "## A\n\nLink to [c](./c.md).\n");
+		await engine.reindex({ targetPath: "docs/c.md" });
+		let related = backend.getRelatedFilePaths(["docs/a.md"]);
+		expect(related).toContain("docs/c.md");
+		expect(related).not.toContain("docs/b.md");
+
+		// Revert: a.md matches its manifest hash again, so the batch skips it —
+		// without drop+re-insert the a->c edge would linger forever.
+		fs.writeFileSync(path.join(projectDir, "docs", "a.md"), "## A\n\nLink to [b](./b.md).\n");
+		await engine.reindex();
+		related = backend.getRelatedFilePaths(["docs/a.md"]);
+		expect(related).toContain("docs/b.md");
+		expect(related).not.toContain("docs/c.md");
 	});
 });

@@ -336,38 +336,90 @@ export interface DocLinkTarget {
 
 /**
  * Read the destination of an inline link whose `](` starts at `start`
- * (index just after the `(`). Tracks paren depth so balanced destinations
- * (`./guide(v2).md`) survive intact (review fix: a regex stops at the first
- * `)`), supports the `<angle-bracket>` form, and takes the destination up to
- * the first whitespace so a trailing title (`./a.md "Title"`) falls away.
- * Returns null when the parens never balance on this line (CommonMark: no
- * link). Multi-line links are not followed; that approximation is documented
- * on `extractDocLinkTargets`.
+ * (index just after the `(`).
+ *
+ * Phase 1 reads the destination: backslash escapes never count toward paren
+ * depth (`./guide\(v2\).md`), and whitespace ends the destination because a
+ * title follows. Phase 2, only when that title zone was reached, skips a
+ * quoted or parenthesised title and demands the link's closing `)`. The split
+ * is what makes `[guide](./hub.md "Hub (draft")` work: a title's unmatched
+ * `(` must not be counted before the destination is separated (round-2
+ * review fix; the depth-only scan returned null there and lost the edge).
+ * Supports the `<angle-bracket>` form. Returns null when the line never
+ * closes the link (CommonMark: no link). Multi-line links are not followed;
+ * that approximation is documented on `extractDocLinkTargets`.
  */
 function readBalancedDest(line: string, start: number): string | null {
+	const len = line.length;
 	let i = start;
-	while (i < line.length && /\s/.test(line[i]!)) i++;
-	if (i >= line.length) return null;
+	while (i < len && /\s/.test(line[i]!)) i++;
+	if (i >= len) return null;
 	if (line[i] === "<") {
 		const end = line.indexOf(">", i + 1);
 		return end === -1 ? null : line.slice(i + 1, end);
 	}
+
+	// Phase 1: destination, until the closing paren or the first whitespace.
 	const body = i;
 	let depth = 1; // the opening `(` we were called after
-	while (i < line.length) {
-		const ch = line[i];
+	let destEnd = -1;
+	let stoppedAtWs = false;
+	while (i < len) {
+		const ch = line[i]!;
+		if (ch === "\\") {
+			i += 2; // escaped char stays in the destination, never counts
+			continue;
+		}
 		if (ch === "(") depth++;
 		else if (ch === ")") {
 			depth--;
-			if (depth === 0) break;
+			if (depth === 0) {
+				destEnd = i;
+				i++;
+				break;
+			}
+		} else if (/\s/.test(ch)) {
+			destEnd = i;
+			stoppedAtWs = true;
+			break;
 		}
 		i++;
 	}
-	if (depth !== 0) return null;
-	const inner = line.slice(body, i);
-	const ws = inner.search(/\s/);
-	const dest = ws === -1 ? inner : inner.slice(0, ws);
-	return dest.length > 0 ? dest : null;
+	if (destEnd === -1) return null;
+	const dest = line.slice(body, destEnd);
+	if (dest.length === 0) return null;
+	if (!stoppedAtWs) return dest;
+
+	// Phase 2: title zone — skip the quoted/parenthesised title, then `)`.
+	while (i < len && /\s/.test(line[i]!)) i++;
+	if (i >= len) return null;
+	const q = line[i];
+	if (q === '"' || q === "'") {
+		let k = i + 1;
+		while (k < len) {
+			if (line[k] === "\\") {
+				k += 2;
+				continue;
+			}
+			if (line[k] === q) break;
+			k++;
+		}
+		if (k >= len) return null;
+		i = k + 1;
+	} else if (q === "(") {
+		let d = 1;
+		i++;
+		while (i < len && d > 0) {
+			if (line[i] === "(") d++;
+			else if (line[i] === ")") d--;
+			i++;
+		}
+		if (d > 0) return null;
+	} else {
+		return null; // garbage after the destination: not a link
+	}
+	while (i < len && /\s/.test(line[i]!)) i++;
+	return i < len && line[i] === ")" ? dest : null;
 }
 
 /**
@@ -375,28 +427,56 @@ function readBalancedDest(line: string, start: number): string | null {
  * doc-graph edges, docs/RESEARCH-COMPETITORS.md §4 P2.A): inline links and
  * images via `](` scanning, plus reference definitions, deduped per line.
  *
- * The scan mirrors `segmentMarkdown`'s fence/frontmatter state machine and
- * strips code spans first (including multi-backtick forms: `` ``[x](y)`` ``
- * is one span, not two empty ones), so example links in fenced blocks or code
- * spans never become graph edges. The pipeline runs this on the RAW file and
- * attributes each line to its chunk: scanning per chunk would misread a fence
- * that `packSegment` split into line windows (continuation chunks start with
- * no fence state), and line numbers only make sense against raw content.
- * Approximation: destinations must close on their own line (no multi-line
- * links).
+ * Block-level guards run first: frontmatter and fenced code are masked
+ * (same state machine as `segmentMarkdown`). Inline guards follow: code
+ * spans are stripped including MULTI-LINE spans (a span opened on one line
+ * and closed later suppresses the lines between; it only exists if the
+ * close precedes a blank or fenced line, per CommonMark's block
+ * boundaries), indented code blocks after a blank line are literal, and an
+ * escaped `\[` / `\]` is not a link delimiter. The pipeline runs this on
+ * the RAW file and attributes each line to its chunk: scanning per chunk
+ * would misread a fence that `packSegment` split into line windows
+ * (continuation chunks start with no fence state), and line numbers only
+ * make sense against raw content. Approximations: destinations must close
+ * on their own line (no multi-line links), and a span that never closes is
+ * treated as literal text (CommonMark's outcome).
  */
 export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 	const lines = content.split("\n");
 
-	// Frontmatter: same guard as segmentMarkdown — a YAML literal block must
-	// not feed `example: | [x](y.md)` lines to the extractor.
-	let frontmatterEnd = -1;
-	if (lines.length > 0 && lines[0]!.trim() === "---") {
-		for (let i = 1; i < lines.length; i++) {
-			const t = lines[i]!.trim();
-			if (t === "---" || t === "...") {
-				frontmatterEnd = i;
-				break;
+	// Block-level mask (round 2): frontmatter and fenced code never reach the
+	// inline scanner, and the code-span lookahead below stops at exactly these
+	// boundaries. Frontmatter first — a YAML literal block must not feed
+	// `example: | [x](y.md)` lines to the extractor.
+	const blocked = new Array<boolean>(lines.length).fill(false);
+	{
+		let frontmatterEnd = -1;
+		if (lines.length > 0 && lines[0]!.trim() === "---") {
+			for (let i = 1; i < lines.length; i++) {
+				const t = lines[i]!.trim();
+				if (t === "---" || t === "...") {
+					frontmatterEnd = i;
+					break;
+				}
+			}
+		}
+		let fence: string | null = null;
+		for (let i = 0; i < lines.length; i++) {
+			if (i <= frontmatterEnd) {
+				blocked[i] = true;
+				continue;
+			}
+			const line = lines[i]!;
+			if (fence !== null) {
+				blocked[i] = true;
+				const close = line.match(FENCE_CLOSE);
+				if (close && close[1]!.startsWith(fence[0]!) && close[1]!.length >= fence.length) fence = null;
+				continue;
+			}
+			const openMatch = line.match(FENCE_OPEN_BT) ?? line.match(FENCE_OPEN_TL);
+			if (openMatch) {
+				blocked[i] = true;
+				fence = openMatch[1]!;
 			}
 		}
 	}
@@ -412,25 +492,104 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 		out.push({ target, line });
 	};
 
-	let fence: string | null = null;
+	// Run of exactly `n` backticks at/after `from`; longer/shorter runs never
+	// close a span (CommonMark matches opening/closing lengths exactly).
+	const findExactRun = (str: string, from: number, n: number): { end: number } | null => {
+		let p = from;
+		while (p < str.length) {
+			if (str[p] !== "`") {
+				p++;
+				continue;
+			}
+			let e = p;
+			while (e < str.length && str[e] === "`") e++;
+			if (e - p === n) return { end: e };
+			p = e;
+		}
+		return null;
+	};
+	// Close of a span opened on `fromLine`: search later lines, stopping at a
+	// blank line (paragraph break) or a blocked line (fence/frontmatter wins),
+	// so a span can never tunnel through a block boundary.
+	const findSpanClose = (fromLine: number, n: number): { line: number; col: number } | null => {
+		for (let k = fromLine + 1; k < lines.length; k++) {
+			if (blocked[k]) return null;
+			const l = lines[k]!;
+			if (l.trim() === "") return null;
+			const hit = findExactRun(l, 0, n);
+			if (hit !== null) return { line: k, col: hit.end };
+		}
+		return null;
+	};
+	// CommonMark backslash escape: `\` before punctuation makes it literal.
+	const isEscaped = (str: string, pos: number): boolean => {
+		let n = 0;
+		for (let k = pos - 1; k >= 0 && str[k] === "\\"; k--) n++;
+		return n % 2 === 1;
+	};
+
+	let suppress: { line: number; col: number } | null = null;
+	let prevBlank = true; // start of file: an indented line there starts code
+	let indentedCode: boolean = false;
+
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i]!;
-		if (i <= frontmatterEnd) continue;
-		if (fence !== null) {
-			const close = line.match(FENCE_CLOSE);
-			if (close && close[1]!.startsWith(fence[0]!) && close[1]!.length >= fence.length) fence = null;
+		if (blocked[i]) {
+			prevBlank = line.trim() === "";
+			indentedCode = false;
 			continue;
 		}
-		const openMatch = line.match(FENCE_OPEN_BT) ?? line.match(FENCE_OPEN_TL);
-		if (openMatch) {
-			fence = openMatch[1]!;
-			continue;
+
+		let text: string;
+		if (suppress !== null) {
+			if (i < suppress.line) continue; // inside a multi-line span: literal
+			text = line.slice(suppress.col); // line holding the close: suffix is live
+			suppress = null;
+		} else {
+			text = line;
 		}
-		// Inline code spans are literal text. The lazy backreference matches a
-		// whole span whatever its delimiter length (`a` or ``a``), where
-		// pairing single backticks independently would re-expose the content of
-		// a double-backtick span (review fix).
-		const text = line.replace(/(`+).*?\1/g, "");
+
+		// Indented code blocks (round 2): 4-space/tab indent after a blank line,
+		// or continuing such a block, is literal. A lazy paragraph continuation
+		// (indent with a non-blank line above) stays live.
+		const indented = line.startsWith("    ") || line.startsWith("\t");
+		const inIndentedCode: boolean = indented && (prevBlank || indentedCode);
+		indentedCode = inIndentedCode;
+		prevBlank = line.trim() === "";
+		if (inIndentedCode) continue;
+
+		// Strip inline code spans; a span that opens here and closes on a later
+		// line suppresses the rest of this line plus the lines up to its close
+		// (round 2: per-line stripping leaked links out of multi-line spans).
+		// An unclosed span anywhere is literal text, per CommonMark.
+		let pos = 0;
+		let live = "";
+		for (;;) {
+			const bt = text.indexOf("`", pos);
+			if (bt === -1) {
+				live += text.slice(pos);
+				break;
+			}
+			let runEnd = bt;
+			while (runEnd < text.length && text[runEnd] === "`") runEnd++;
+			const n = runEnd - bt;
+			const close = findExactRun(text, runEnd, n);
+			if (close !== null) {
+				live += text.slice(pos, bt);
+				pos = close.end;
+				continue;
+			}
+			const later = findSpanClose(i, n);
+			if (later !== null) {
+				live += text.slice(pos, bt);
+				suppress = later;
+				break;
+			}
+			live += text.slice(pos, runEnd); // no close here or later: literal
+			pos = runEnd;
+		}
+		text = live;
+
 		const ref = text.match(LINK_REFDEF);
 		if (ref) push(ref[1]!, i + 1);
 		let search = 0;
@@ -438,7 +597,9 @@ export function extractDocLinkTargets(content: string): DocLinkTarget[] {
 			const idx = text.indexOf("](", search);
 			if (idx === -1) break;
 			search = idx + 2;
-			if (text.lastIndexOf("[", idx) === -1) continue; // no opener bracket
+			const openIdx = text.lastIndexOf("[", idx);
+			if (openIdx === -1) continue; // no opener bracket
+			if (isEscaped(text, idx) || isEscaped(text, openIdx)) continue; // \] or \[
 			const dest = readBalancedDest(text, idx + 2);
 			if (dest !== null) push(dest, i + 1);
 		}

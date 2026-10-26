@@ -58,6 +58,11 @@ export class LocalBackend {
 		return this.vectorStore.getById(chunkId);
 	}
 
+	/** WP3 round 2: drop a file's own out-edges of one type before re-deriving them. */
+	dropEdgesFrom(nodeIds: string[], edgeType: EdgeType): void {
+		this.graphStore.deleteEdgesFrom(nodeIds, edgeType);
+	}
+
 	/** R7 + WP2: recompute file and symbol PageRank after indexing. */
 	recomputePriors(): void {
 		this.graphStore.computePageRank();

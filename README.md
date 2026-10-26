@@ -45,6 +45,7 @@ Ten tools the agent can call, plus five slash commands.
 - **`expand_chunk`**: full source for a compressed hit, when the snippet is not enough.
 - **`related_context`**: code reachable through `imports`/`defines`/`calls`
   graph edges, ordered by symbol-level centrality so hub symbols come first.
+  Markdown links add `references` edges, so notes reach their linked pages too.
 
 **Memory**
 - **`record_decision`**: store a choice and its reason.

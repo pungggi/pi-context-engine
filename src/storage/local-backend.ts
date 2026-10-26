@@ -40,14 +40,16 @@ export class LocalBackend {
 		return this.graphStore.getNeighbors(nodeId, edgeType);
 	}
 
-	/** Files reachable via CALLS/IMPORTS edges from the given files (1-hop expansion). */
+	/** Files reachable via CALLS/IMPORTS/markdown-reference edges from the given files (1-hop expansion). */
 	getRelatedFilePaths(filePaths: string[]): string[] {
 		if (filePaths.length === 0) return [];
 		const inputSet = new Set(filePaths);
+		// WP3: `references` edges hang off prose `doc` chunks, so `doc` joins the
+		// source-node filter or linked notes would never surface here.
 		const neighbors = this.graphStore.neighborsForFiles(
 			filePaths,
-			["calls", "imports"],
-			["function", "class", "file", "module"],
+			["calls", "imports", "references"],
+			["function", "class", "file", "module", "doc"],
 		);
 		return [...new Set(neighbors.map((n) => n.filePath).filter((fp) => fp && !inputSet.has(fp)))];
 	}

@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { Config } from "../config.js";
 import { projectStorageDir, sha256Hex, yieldToEventLoop } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
-import { chunkProse, isProseLanguage } from "./prose-chunker.js";
+import { chunkProse, extractDocLinkTargets, isProseLanguage } from "./prose-chunker.js";
 import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
 import { EmbeddingCache } from "./embedding-cache.js";
@@ -871,6 +871,25 @@ async function runIndexingLocked(
 						edgeType: "defines",
 						properties: {},
 					});
+					// WP3 doc-graph edges: prose chunks link out to the indexed
+					// files their Markdown references ([text](other.md)), so
+					// related_context / graph expansion work for notes instead of
+					// always hitting the empty file-level fallback. Only prose:
+					// code files keep their calls/imports graph, and a doc-link
+					// string inside code must not become an edge.
+					if (isProseLanguage(item.language)) {
+						for (const raw of extractDocLinkTargets(chunk.content)) {
+							const resolved = resolveDocLink(raw, item.relPath, knownFiles);
+							if (resolved !== null && resolved !== item.relPath) {
+								batchEdges.push({
+									sourceId: chunk.id,
+									targetId: `file_${resolved}`,
+									edgeType: "references",
+									properties: {},
+								});
+							}
+						}
+					}
 					// R7 calls-graph collection (raw content, before the context header
 					// prepends file paths and `defines:` lists that would pollute the
 					// identifier set).
@@ -1125,4 +1144,39 @@ function resolveImportPath(spec: string, importerRel: string, knownFiles: Set<st
 		if (knownFiles.has(base + ext)) return base + ext;
 	}
 	return null;
+}
+
+/**
+ * WP3 doc-graph edges: resolve a raw Markdown link destination to an indexed
+ * project file (docs/RESEARCH-COMPETITORS.md §4 P2). Strips `#fragment` and
+ * `?query`, decodes %-escapes, treats a leading `/` as project-root relative
+ * and everything else as relative to the linking file. Returns null for URL
+ * schemes (`http:`, `mailto:`, … also `C:`), pure anchors (`#top`), paths
+ * that never resolve to an indexed file, and self-links.
+ */
+function resolveDocLink(target: string, sourceRel: string, knownFiles: Set<string>): string | null {
+	let dest = target;
+	if (dest.startsWith("<") && dest.endsWith(">")) dest = dest.slice(1, -1);
+	dest = dest.split("#")[0]!;
+	dest = dest.split("?")[0]!;
+	if (dest === "") return null; // pure anchor: same-file, nothing to link
+	try {
+		dest = decodeURIComponent(dest);
+	} catch {
+		// malformed escape: keep the raw target
+	}
+	if (/^[a-z][a-z0-9+.-]*:/i.test(dest)) return null; // scheme
+	const dir = sourceRel.includes("/") ? sourceRel.slice(0, sourceRel.lastIndexOf("/")) : "";
+	const joined = dest.startsWith("/") ? dest.slice(1) : `${dir}/${dest}`;
+	// Same stack walk as resolveImportPath: `..` pops (a pop off an empty
+	// stack is a silent no-op there too), so behavior stays consistent.
+	const outStack: string[] = [];
+	for (const part of joined.split("/")) {
+		if (part === "" || part === ".") continue;
+		if (part === "..") outStack.pop();
+		else outStack.push(part);
+	}
+	const rel = outStack.join("/");
+	if (rel === "") return null;
+	return knownFiles.has(rel) ? rel : null;
 }

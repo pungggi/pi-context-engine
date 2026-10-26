@@ -175,7 +175,8 @@ export class GraphStore {
 
 	/**
 	 * R7: PageRank over the file-level projection of the graph (imports +
-	 * calls edges collapsed to file→file). Scores are normalised so the
+	 * calls edges collapsed to file→file; WP3 adds markdown `references`, so
+	 * linked notes gain the same hub signal code files have). Scores are normalised so the
 	 * best-connected file is 1.0; the retriever applies them as a bounded
 	 * multiplicative prior. Hub files genuinely central to a codebase —
 	 * types, shared utils, the engine — consistently rank above leaves, which
@@ -191,7 +192,7 @@ export class GraphStore {
 			nodeFile.set(row.id, row.file_path);
 		}
 		const edgeRows = this.db
-			.prepare("SELECT source_id, target_id FROM edges WHERE edge_type IN ('imports', 'calls')")
+			.prepare("SELECT source_id, target_id FROM edges WHERE edge_type IN ('imports', 'calls', 'references')")
 			.all() as { source_id: string; target_id: string }[];
 
 		const nodes = new Set<string>();
@@ -261,9 +262,10 @@ export class GraphStore {
 	 * leaf of equal lexical evidence, so unranked neighbour lists (the
 	 * related_context fallbacks) get an importance order à la Aider's repo map.
 	 *
-	 * Scope: code edges only (`calls`, `imports`, `defines`); commit and
-	 * memory nodes stay out, dangling mass is redistributed like the file
-	 * version, and scores are max-normalised to [0,1].
+	 * Scope: code edges (`calls`, `imports`, `defines`) plus WP3 markdown
+	 * `references` (doc→file link hubs rank up too); commit and memory nodes
+	 * stay out, dangling mass is redistributed like the file version, and
+	 * scores are max-normalised to [0,1].
 	 */
 	computeSymbolPageRank(): void {
 		const nodes = new Set<string>();
@@ -271,7 +273,7 @@ export class GraphStore {
 			.prepare("SELECT id FROM nodes WHERE node_type IN ('function','class','file','module','doc')")
 			.all() as { id: string }[]) nodes.add(r.id);
 		const edgeRows = this.db
-			.prepare("SELECT source_id, target_id FROM edges WHERE edge_type IN ('calls','imports','defines')")
+			.prepare("SELECT source_id, target_id FROM edges WHERE edge_type IN ('calls','imports','defines','references')")
 			.all() as { source_id: string; target_id: string }[];
 
 		const out = new Map<string, Set<string>>();

@@ -322,3 +322,71 @@ export function chunkProse(source: string, filePath: string, language: string, b
 	}
 	return chunks;
 }
+
+/** Inline `[text](dest)` / `![alt](dest)` with an optional link title. */
+const INLINE_LINK = /!?\[[^\]]*\]\(\s*(<[^>\n]*>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
+/** Reference definition `[label]: dest` at the start of a line. */
+const LINK_REFDEF = /^ {0,3}\[[^\]]+\]:\s*(<[^>\n]*>|\S+)/;
+
+/**
+ * Raw Markdown link destinations in `content` (WP3 doc-graph edges,
+ * docs/RESEARCH-COMPETITORS.md §4 P2): inline links plus reference
+ * definitions, deduped with order preserved.
+ *
+ * The scan mirrors `segmentMarkdown`'s fence/frontmatter state machine, and
+ * single-line inline code spans are stripped first, so an example link inside
+ * `` `code` `` or a fenced block never becomes a graph edge (the same
+ * distinction the heading scanner makes between `# comment` and a heading).
+ * Returns RAW destinations; resolution against the index is the pipeline's
+ * job (`resolveDocLink`).
+ */
+export function extractDocLinkTargets(content: string): string[] {
+	const lines = content.split("\n");
+
+	// Frontmatter: same guard as segmentMarkdown — a YAML literal block must
+	// not feed `example: | [x](y.md)` lines to the extractor.
+	let frontmatterEnd = -1;
+	if (lines.length > 0 && lines[0]!.trim() === "---") {
+		for (let i = 1; i < lines.length; i++) {
+			const t = lines[i]!.trim();
+			if (t === "---" || t === "...") {
+				frontmatterEnd = i;
+				break;
+			}
+		}
+	}
+
+	const out: string[] = [];
+	const seen = new Set<string>();
+	const push = (raw: string): void => {
+		const target = raw.trim();
+		if (target.length > 0 && !seen.has(target)) {
+			seen.add(target);
+			out.push(target);
+		}
+	};
+
+	let fence: string | null = null;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]!;
+		if (i <= frontmatterEnd) continue;
+		if (fence !== null) {
+			const close = line.match(FENCE_CLOSE);
+			if (close && close[1]!.startsWith(fence[0]!) && close[1]!.length >= fence.length) fence = null;
+			continue;
+		}
+		const openMatch = line.match(FENCE_OPEN_BT) ?? line.match(FENCE_OPEN_TL);
+		if (openMatch) {
+			fence = openMatch[1]!;
+			continue;
+		}
+		// Inline code spans are literal text: `` `[x](y.md)` `` is not a link.
+		// Single-line approximation — multi-line code spans are vanishingly rare
+		// in link position.
+		const text = line.replace(/`[^`]*`/g, "");
+		const ref = text.match(LINK_REFDEF);
+		if (ref) push(ref[1]!);
+		for (const m of text.matchAll(INLINE_LINK)) push(m[1]!);
+	}
+	return out;
+}

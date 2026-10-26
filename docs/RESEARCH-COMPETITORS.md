@@ -1,6 +1,8 @@
 # Competitor comparison and the prose (non-code) gap
 
-Status: research only, no code changes. Date: 2026-10-25.
+Status: living design and implementation record. Shipped: P0/P1 prose
+chunking (2026-10-25), WP2 symbol PageRank ordering and P2.A doc-graph edges
+(2026-10-26). Pending: the rest of §4. Date: 2026-10-25.
 
 Companion to `docs/RESEARCH-RETRIEVAL.md`, which reviews the retrieval
 literature for **code**. This file answers two questions:
@@ -47,7 +49,8 @@ core retrieval design. The gap is in *breadth of context sources* and in
   `related_context` neighbours hub-first (deterministic tie-break, same
   lifecycle as file ranks: recompute after indexing, delete with the file).
   Still open: the token-budget "repo map" *view* (a ranked symbol-signature
-  list for architecture questions) — only build it if eval asks.
+  list for architecture questions). Opened 2026-10-26 as WP4 in the §4
+  sequence (user decision; the earlier "only if eval asks" gate was waived).
 - **Greptile / Potpie: agentic retrieval.** Iterative query loops over a full
   codebase graph, wired into PR review. Our search is one-shot with refine
   hints instead.
@@ -65,7 +68,9 @@ core retrieval design. The gap is in *breadth of context sources* and in
 product-scope features (cloud, accounts, editor plugins) and stay out. External
 docs indexing is the one competitor feature still worth a design decision,
 because the agent-proposed flow is not something Cursor/Continue do. The rest
-(centrality ranking, summary chunks) are candidates only if eval shows a win.
+(centrality ranking, summary chunks) were candidates only if eval shows a win.
+(2026-10-26: superseded. The user opened every remaining candidate including
+@Docs for implementation; §4 holds the sequence and per-item eval gates.)
 
 ---
 
@@ -84,8 +89,9 @@ Facts verified in this repo:
 - **Small-to-big degenerates.** `retrieval.expand_context` serves a hit's
   module parent, but for prose the hit *is* the whole file, so there is no
   finer context to expand from.
-- **No graph signal.** Prose files have no import edges, so
-  `related_context` always falls back to file level.
+- **No graph signal** (fixed 2026-10-26, §4 P2.A): prose files had no
+  import edges, so `related_context` always fell back to file level. Markdown
+  links now become `references` edges, so notes reach the pages they cite.
 - **Prose is unmeasured.** `tests/eval/queries.jsonl` has 76 queries, **0**
   targeting `.md` or docs paths. The README quality numbers are code-only.
 - **No markdown parser available.** `tree-sitter-wasms` ships no markdown
@@ -170,13 +176,46 @@ and the degenerate small-to-big case in one change, with no new dependencies.
   type `doc` with zero storage migration. The outline parent stays `module`,
   which is what the retriever's parent lookup and dedupe exemption key on.
 
-### P2: gated follow-ups (only if eval asks for them)
+### P2: follow-ups — opened for implementation 2026-10-26, each with its own eval A/B
 
-- **File-level prose graph edges** (heading -> file, doc -> doc links via
-  Markdown references) so `related_context` is not empty for notes.
-- **Summary chunk per large prose file**, generated via Ollama at index time
+The earlier "only if eval asks" gate was waived by the user; the order below
+is the agreed sequence (small and evidence-backed first).
+
+- **A. File-level prose graph edges** — **implemented 2026-10-26 (WP3)**.
+  Section (heading) chunks and legacy whole-file note chunks emit a
+  `references` edge to every indexed file their Markdown links resolve to:
+  - **Covered links**: inline `[text](other.md)` / `![img](...)` and
+    reference definitions `[label]: dest`; `..`, root-`/` and %-encoded
+    targets; `#fragment` and `?query` are stripped before resolution.
+  - **Skipped**: URL schemes, pure anchors, self-links and targets that are
+    not indexed; example links inside fences, frontmatter and inline code
+    spans never become edges (the scanner mirrors the heading detector).
+  - **Prose only**: a doc-link string inside a code file stays out of the
+    graph, so the code calls/imports projection keeps its meaning.
+  - **Why it helps**: the edges ride three existing consumers unchanged:
+    `related_context`'s neighbour lookup, `getRelatedFilePaths` (retriever
+    1-hop expansion and the file-level fallback), and both PageRank tables,
+    so a note linked from many notes gains hub signal like an imported code
+    file does.
+
+  A/B on the 89-query suite (same query set before/after; the ±0.05 gate
+  passed on both backends):
+
+  | metric | before | after |
+  |---|---|---|
+  | overall R@10 (fake backend = committed gate) | 0.830 | 0.841 |
+  | prose nDCG@10 (fake) | 0.269 | 0.307 |
+  | overall nDCG@10 (real ONNX embedder) | 0.682 | 0.689 |
+  | prose nDCG@10 (real ONNX) | 0.200 | 0.228 |
+  | identifier R@5 (real ONNX) | 0.900 | 0.922 |
+
+  The metric deltas are small but consistently non-negative; the direct win
+  is `related_context` on a note returning its linked pages instead of "No
+  related context found".
+
+- **B. Summary chunk per large prose file**, generated via Ollama at index time
   (Zed-style), behind a config flag: costs an LLM call per changed file.
-- **Semantic chunking** for heading-less unstructured text, behind a flag.
+- **C. Semantic chunking** for heading-less unstructured text, behind a flag.
 
 ### What we deliberately do not chase
 

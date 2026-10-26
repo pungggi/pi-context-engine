@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { Config } from "../config.js";
 import { projectStorageDir, sha256Hex, yieldToEventLoop } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
-import { chunkProse, isProseLanguage } from "./prose-chunker.js";
+import { chunkProse, extractDocLinkTargets, isProseLanguage } from "./prose-chunker.js";
 import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
 import { EmbeddingCache } from "./embedding-cache.js";
@@ -994,6 +994,84 @@ async function runIndexingLocked(
 				}
 		}
 
+		// ── WP3: markdown reference edges ────────────────────────────────────
+		// Runs AFTER all batches and over ALL indexed prose files, for the same
+		// order-independence reasons as the calls derivation above:
+		// - line attribution comes from a fence/frontmatter-aware scan of the
+		//   RAW file, so a fenced block that packSegment split into line windows
+		//   cannot leak example links (a continuation chunk starts with no fence
+		//   state) nor hide real links after a stray closing fence;
+		// - links resolve against the CURRENT file set, so a target created after
+		//   the source was indexed self-heals on the next run instead of waiting
+		//   for a source edit or full rebuild (incremental review fix);
+		// - prose only: code files keep their calls/imports graph, and a doc-link
+		//   string inside code must not become an edge.
+		{
+			const refEdges: GraphEdge[] = [];
+			for (const rel of Object.keys(manifest.fileEntries)) {
+				// Round 2: one file's chunks are bounded by MAX_FILE_BYTES, so a
+				// large limit is safe; the 500 cap silently truncated heading-less
+				// notes that pack to thousands of chunks, orphaning their links.
+				const stored = backend.chunksByFile(rel, 100_000);
+				if (stored.length === 0 || !isProseLanguage(stored[0]!.language)) continue;
+				const abs = path.join(projectDir, rel);
+				let raw: string;
+				try {
+					// Round 2: mirror the batch path's safeRead guard — a file that
+					// outgrew MAX_FILE_BYTES must not be read here either (this pass
+					// would otherwise load content the indexer itself rejected).
+					if (fs.statSync(abs).size > MAX_FILE_BYTES) continue;
+					// Round 3/4: chunking runs on REDACTED content (see the batch
+					// loop), so stored line numbers are redacted coordinates when
+					// redaction is ON. Mirror the batch condition EXACTLY — with
+					// indexerRedactSecrets off the batch chunks raw text and this
+					// pass must attribute against raw coordinates too.
+					const text = fs.readFileSync(abs, "utf-8");
+					const red = config.indexerRedactSecrets ? redactSecrets(text) : null;
+					raw = red && red.labels.length > 0 ? red.text : text;
+				} catch {
+					continue; // unreadable now: keep the edges it already contributed
+				}
+				// Round 2: replace, do not just add. Links removed from the source
+				// (edit reverted, target never reindexed) must not linger as stale
+				// rows once the raw file no longer contains them.
+				backend.dropEdgesFrom(
+					stored.map((c) => c.id),
+					"references",
+				);
+				for (const link of extractDocLinkTargets(raw)) {
+					const resolved = resolveDocLink(link.target, rel, knownFiles);
+					if (resolved === null || resolved === rel) continue;
+					// Round 2: `find` by startLine picks the outline parent
+					// (startLine 1, endLine EOF) for every line, stealing links from
+					// the sections that own them. Prefer the TIGHTEST covering range
+					// (a section beats the parent; ties keep source order); the last
+					// chunk catches trailing-line drift from the legacy endLine =
+					// trim() computation.
+					let owner = stored[stored.length - 1]!;
+					let bestSpan = Number.POSITIVE_INFINITY;
+					for (const c of stored) {
+						if (link.line < c.startLine || link.line > c.endLine) continue;
+						const span = c.endLine - c.startLine;
+						if (span < bestSpan) {
+							bestSpan = span;
+							owner = c;
+						}
+					}
+					refEdges.push({
+						sourceId: owner.id,
+						targetId: `file_${resolved}`,
+						edgeType: "references",
+						properties: {},
+					});
+				}
+			}
+			if (refEdges.length > 0) {
+				backend.ingest([], [], refEdges);
+				log?.(`  [graph] ${refEdges.length} doc reference edge(s)`);
+			}
+		}
+
 		// ── Git history on full runs ──────────────────────────────────────────
 		if (full && !targetPath && fs.existsSync(path.join(projectDir, ".git"))) {
 			try {
@@ -1125,4 +1203,61 @@ function resolveImportPath(spec: string, importerRel: string, knownFiles: Set<st
 		if (knownFiles.has(base + ext)) return base + ext;
 	}
 	return null;
+}
+
+/**
+ * WP3 doc-graph edges: resolve a raw Markdown link destination to an indexed
+ * project file (docs/RESEARCH-COMPETITORS.md §4 P2). Strips `#fragment` and
+ * `?query`, decodes %-escapes, treats a leading `/` as project-root relative
+ * and everything else as relative to the linking file. Returns null for URL
+ * schemes (`http:`, `mailto:`, … also `C:`), protocol-relative `//host/path`,
+ * pure anchors (`#top`), paths that never resolve to an indexed file, and
+ * self-links.
+ */
+const HTML_ENTITIES: Record<string, string> = {
+	amp: "&",
+	lt: "<",
+	gt: ">",
+	quot: '"',
+	apos: "'",
+	nbsp: " ",
+};
+function resolveDocLink(target: string, sourceRel: string, knownFiles: Set<string>): string | null {
+	let dest = target;
+	if (dest.startsWith("<") && dest.endsWith(">")) dest = dest.slice(1, -1);
+	// Round 2: CommonMark escapes (`./guide\(v2\).md`) must come off before
+	// the exact-path lookup; only backslash-escaped PUNCTUATION unescapes.
+	dest = dest.replace(/\\([!-/:-@\[-`{-~])/g, "$1");
+	// Round 3: HTML entities resolve in destinations too (`./A&amp;B.md` is
+	// `./A&B.md`); a small named set plus numeric refs, unknown ones stay.
+	dest = dest.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (m, body: string) => {
+		if (body.startsWith("#")) {
+			const num = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+			return Number.isFinite(num) && num > 0 && num <= 0x10ffff ? String.fromCodePoint(num) : m;
+		}
+		return HTML_ENTITIES[body] ?? m;
+	});
+	dest = dest.split("#")[0]!;
+	dest = dest.split("?")[0]!;
+	if (dest === "") return null; // pure anchor: same-file, nothing to link
+	try {
+		dest = decodeURIComponent(dest);
+	} catch {
+		// malformed escape: keep the raw target
+	}
+	if (/^[a-z][a-z0-9+.-]*:/i.test(dest)) return null; // scheme
+	if (dest.startsWith("//")) return null; // round 4: protocol-relative URL (host/path), not a local path
+	const dir = sourceRel.includes("/") ? sourceRel.slice(0, sourceRel.lastIndexOf("/")) : "";
+	const joined = dest.startsWith("/") ? dest.slice(1) : `${dir}/${dest}`;
+	// Same stack walk as resolveImportPath: `..` pops (a pop off an empty
+	// stack is a silent no-op there too), so behavior stays consistent.
+	const outStack: string[] = [];
+	for (const part of joined.split("/")) {
+		if (part === "" || part === ".") continue;
+		if (part === "..") outStack.pop();
+		else outStack.push(part);
+	}
+	const rel = outStack.join("/");
+	if (rel === "") return null;
+	return knownFiles.has(rel) ? rel : null;
 }

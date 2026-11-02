@@ -108,7 +108,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 				if (err instanceof AutomaticIndexFileLimitError) {
 					pauseAutomaticIndexing(eng, err, notify);
 				} else if (notify) {
-					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
+					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 240);
 					notify(`Context index: watcher reindex failed (${detail})`, "warning");
 				}
 			})
@@ -229,7 +229,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 				}
 				lazyIndexStarted = false;
 				if (notify) {
-					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
+					const detail = (err instanceof Error ? err.message : String(err)).slice(0, 240);
 					notify(`Context index: background indexing failed — run /context-index for details (${detail})`, "warning");
 				}
 			})

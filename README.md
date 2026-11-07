@@ -140,6 +140,25 @@ unchanged repo took 237 ms.
   unchanged repo), so this removes the classic cold-start failure of searching
   an empty index, without ever blocking the UI.
 
+### Session bootstrap
+
+- **Where you left off**: the first prompt of a session injects a compact
+  hidden block: prior decisions from earlier sessions, the last session's
+  most-touched files, and the index state. The agent starts oriented without
+  re-reading anything.
+- **Compaction recovery**: compaction removes that block from active context
+  like any other message. On `session_compact` the extension re-injects it:
+  the next prompt gets a fresh persisted copy, and the mid-run retry path
+  (threshold/overflow recovery, where `before_agent_start` never fires) gets
+  it re-asserted per request until the persisted copy is back. The text is
+  regenerated, not replayed, so decisions recorded mid-session still appear.
+- **Why it matters**: compaction is exactly when orientation is most needed,
+  and also when it is most likely to be lost. Without recovery the agent
+  silently forgets prior decisions halfway through a long task.
+- **Cost**: zero while not recovering. Outside the armed window the
+  `context` hook is an O(1) check, and the block itself is injected only on
+  change (first prompt, after each compaction).
+
 ### Model warmup
 
 - **`/context-warmup`** downloads the embedding model up front, no project or

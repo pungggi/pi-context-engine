@@ -113,3 +113,74 @@ describe("createBootstrapReinjector", () => {
 		expect(r.armed).toBe(false);
 	});
 });
+
+describe("createBootstrapReinjector — onBuildFailure (once per armed window)", () => {
+	it("notifies on the first failure per window, not on subsequent ones", async () => {
+		const failures: unknown[] = [];
+		let n = 0;
+		const r = createBootstrapReinjector(
+			async () => {
+				throw new Error(`boom ${++n}`);
+			},
+			{ onBuildFailure: (err) => failures.push(err) },
+		);
+		r.arm();
+		expect(await r.handle("/p", [userMessage])).toBeUndefined(); // failure 1 → notify
+		expect(await r.handle("/p", [userMessage])).toBeUndefined(); // failure 2 → silent
+		expect(await r.handle("/p", [userMessage])).toBeUndefined(); // failure 3 → silent
+		expect(failures).toHaveLength(1);
+		expect((failures[0] as Error).message).toBe("boom 1");
+		expect(r.armed).toBe(true); // still retrying quietly
+	});
+
+	it("a successful build never notifies; a later failure in the same window does (once)", async () => {
+		const failures: unknown[] = [];
+		let fail = false;
+		const r = createBootstrapReinjector(
+			async () => {
+				if (fail) throw new Error("late boom");
+				return "ok";
+			},
+			{ onBuildFailure: (err) => failures.push(err) },
+		);
+		r.arm();
+		const ok = await r.handle("/p", [userMessage]);
+		expect(ok).toBeDefined(); // success, no notify
+		fail = true;
+		await r.handle("/p", [userMessage]);
+		await r.handle("/p", [userMessage]);
+		expect(failures).toHaveLength(1);
+	});
+
+	it("re-arming opens a fresh window (a persistent failure notifies again)", async () => {
+		const failures: unknown[] = [];
+		const r = createBootstrapReinjector(
+			async () => {
+				throw new Error("boom");
+			},
+			{ onBuildFailure: (err) => failures.push(err) },
+		);
+		r.arm();
+		await r.handle("/p", [userMessage]); // window 1: notify
+		r.reset();
+		r.arm();
+		await r.handle("/p", [userMessage]); // window 2: notify again
+		expect(failures).toHaveLength(2);
+	});
+
+	it("a throwing onBuildFailure callback never breaks recovery", async () => {
+		const r = createBootstrapReinjector(
+			async () => {
+				throw new Error("boom");
+			},
+			{
+				onBuildFailure: () => {
+					throw new Error("observer bug");
+				},
+			},
+		);
+		r.arm();
+		expect(await r.handle("/p", [userMessage])).toBeUndefined();
+		expect(r.armed).toBe(true); // recovery unaffected
+	});
+});

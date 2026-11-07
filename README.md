@@ -152,6 +152,8 @@ unchanged repo took 237 ms.
   (threshold/overflow recovery, where `before_agent_start` never fires) gets
   it re-asserted per request until the persisted copy is back. The text is
   regenerated, not replayed, so decisions recorded mid-session still appear.
+  A build failure during the recovery window is surfaced once (notification)
+  and retried on the next request.
 - **Why it matters**: compaction is exactly when orientation is most needed,
   and also when it is most likely to be lost. Without recovery the agent
   silently forgets prior decisions halfway through a long task.

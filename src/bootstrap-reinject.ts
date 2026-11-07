@@ -65,20 +65,35 @@ export interface BootstrapReinjector {
 	 * conversation, returns a message list with the regenerated block appended.
 	 * Seeing a persisted copy disarms. A failed build skips this request and
 	 * stays armed: bootstrapText failures should be transient, and the retry
-	 * cost is bounded by the armed window (best-effort, never throws).
-	 * Generic over the host message type so the appended literal (a structural
-	 * CustomMessage) is checked once, where it is built. */
+	 * cost is bounded by the armed window (best-effort, never throws; the
+	 * optional onBuildFailure callback makes the first failure per window
+	 * observable). Generic over the host message type so the appended literal
+	 * (a structural CustomMessage) is checked once, where it is built. */
 	handle<M>(cwd: string, messages: ReadonlyArray<M>): Promise<{ messages: M[] } | undefined>;
 }
 
-export function createBootstrapReinjector(build: (cwd: string) => Promise<string>): BootstrapReinjector {
+export interface BootstrapReinjectorOptions {
+	/** Notified at most ONCE per armed window when a build fails, so a
+	 * persistent failure (e.g. a corrupted index) is observable without
+	 * per-request spam. The window opens on arm() and closes on disarm/reset;
+	 * a failure in a later window notifies again. Never throws. */
+	onBuildFailure?: (error: unknown) => void;
+}
+
+export function createBootstrapReinjector(
+	build: (cwd: string) => Promise<string>,
+	options?: BootstrapReinjectorOptions,
+): BootstrapReinjector {
 	let armed = false;
+	let failureNotified = false;
 	return {
 		arm() {
 			armed = true;
+			failureNotified = false;
 		},
 		reset() {
 			armed = false;
+			failureNotified = false;
 		},
 		get armed() {
 			return armed;
@@ -92,7 +107,17 @@ export function createBootstrapReinjector(build: (cwd: string) => Promise<string
 			let content: string;
 			try {
 				content = await build(cwd);
-			} catch {
+			} catch (err) {
+				// Once per armed window: the first failure is worth surfacing; the
+				// rest are the same condition retrying quietly.
+				if (!failureNotified) {
+					failureNotified = true;
+					try {
+						options?.onBuildFailure?.(err);
+					} catch {
+						// observation must never break recovery
+					}
+				}
 				return undefined; // stays armed; retry on the next request
 			}
 			// The literal is a structurally valid custom message; M is the host's

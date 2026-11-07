@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { ContextEngine, isPceConfig } from "./engine.js";
+import { BOOTSTRAP_CUSTOM_TYPE, createBootstrapReinjector } from "./bootstrap-reinject.js";
 import { applyContextSearchGuidance } from "./guidance.js";
 import { ProjectWatcher } from "./indexer/watcher.js";
 import { AutomaticIndexFileLimitError } from "./indexer/pipeline.js";
@@ -53,6 +54,30 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 	let promptNumber = 0;
 	let lazyIndexStarted = false;
 	let bootstrapSent = false;
+	/** Session-scoped ui notify channel for the bootstrap reinjector's
+	 *  once-per-window build-failure report (set in session_start, like
+	 *  watcherNotify below; undefined when the host has no ui). */
+	let uiNotify: ((msg: string, level: "info" | "warning") => void) | undefined;
+
+	/** Compaction recovery (see bootstrap-reinject.ts for the why): re-inject
+	 *  the session bootstrap after a compaction removed it. Regenerates the
+	 *  text fresh, so decisions recorded mid-session still show up. A
+	 *  persistently failing build is surfaced once per armed window. */
+	const bootstrapReinjector = createBootstrapReinjector(
+		(cwd) => {
+			const eng = engine && currentCwd === cwd ? engine : getEngine(cwd);
+			return eng.bootstrapText();
+		},
+		{
+			onBuildFailure: (err) => {
+				const detail = (err instanceof Error ? err.message : String(err)).slice(0, 120);
+				uiNotify?.(
+					`Context bootstrap re-injection failed (${detail}) — retrying on the next request; run /context-status if this persists.`,
+					"warning",
+				);
+			},
+		},
+	);
 	let autoIndexTimer: NodeJS.Timeout | null = null;
 	let indexInFlight = false;
 	let automaticIndexBlock: AutomaticIndexFileLimitError | null = null;
@@ -663,7 +688,9 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		engine.startBackgroundWork();
 		lazyIndexStarted = false;
 		bootstrapSent = false;
+		bootstrapReinjector.reset();
 		watcherNotify = ctx.hasUI ? (msg, level) => ctx.ui.notify(msg, level) : undefined;
+		uiNotify = watcherNotify;
 		// (Re)arm the file watcher for this session: fresh notify channel, and
 		// config may have changed since the last session. No-op when
 		// `indexer.watch` is off.
@@ -722,9 +749,15 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			bootstrapSent = true;
 			try {
 				const bootstrap = await eng.bootstrapText();
+				// The persisted copy makes per-request re-assertion unnecessary
+				// from this point on: disarm DETERMINISTICALLY here rather than
+				// relying on the next `context` event to observe the copy (which
+				// depends on host ordering). A failed build above keeps us armed
+				// — no persisted copy landed, so the retry window stays open.
+				bootstrapReinjector.reset();
 				return {
 					message: {
-						customType: "context-engine-bootstrap",
+						customType: BOOTSTRAP_CUSTOM_TYPE,
 						content: bootstrap,
 						display: false,
 					},
@@ -734,6 +767,27 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			}
 		}
 		return;
+	});
+
+	// Compaction dropped the persisted bootstrap message. Reset the
+	// once-per-session gate so the next user prompt injects a fresh copy via
+	// before_agent_start, and arm the per-request re-assertion for the mid-run
+	// retry path: overflow/threshold recovery resumes the turn through
+	// agent_start, where before_agent_start never fires (all compaction
+	// reasons are handled the same way — the block is gone either way).
+	pi.on("session_compact", async (_event, _ctx) => {
+		bootstrapSent = false;
+		bootstrapReinjector.arm();
+	});
+
+	// Per-request re-assertion while armed (see bootstrap-reinject.ts). With
+	// no pending re-injection this is an O(1) no-op; while armed the block is
+	// rebuilt per request, so a decision recorded after the compaction is
+	// included. Once before_agent_start lands a persisted copy (next user
+	// prompt), the persisted-check disarms the reinjector.
+	pi.on("context", async (event, ctx) => {
+		if (!bootstrapReinjector.armed) return;
+		return bootstrapReinjector.handle(ctx.cwd, event.messages);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -754,6 +808,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		}
 		stopWatcher();
 		watcherNotify = undefined;
+		uiNotify = undefined;
 		automaticIndexBlock = null;
 		if (dashboard) {
 			const d = dashboard;

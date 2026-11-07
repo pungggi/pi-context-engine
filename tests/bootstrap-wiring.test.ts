@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import contextEngineExtension from "../src/extension.js";
+import contextEngineExtension, { parseContextDecideArgs } from "../src/extension.js";
 import { BOOTSTRAP_CUSTOM_TYPE } from "../src/bootstrap-reinject.js";
 
 /** Minimal handler shape (the extension's handlers take (event, ctx)). */
@@ -26,6 +26,8 @@ interface FakePi {
 	handlers: Map<string, Handler[]>;
 	tools: unknown[];
 	commands: string[];
+	/** Full command defs (name → def), so tests can invoke a handler. */
+	commandDefs: Map<string, { handler: (args: string, ctx: unknown) => unknown }>;
 }
 
 /** Records pi.on registrations / tool + command defs; never invokes them. */
@@ -34,11 +36,12 @@ function makeFakePi(): FakePi {
 		handlers: new Map(),
 		tools: [],
 		commands: [],
+		commandDefs: new Map(),
 	};
 	const fake = pi as unknown as {
 		on: (event: string, handler: Handler) => () => void;
 		registerTool: (def: unknown) => void;
-		registerCommand: (name: string, def: unknown) => void;
+		registerCommand: (name: string, def: { handler: (args: string, ctx: unknown) => unknown }) => void;
 	};
 	fake.on = (event, handler) => {
 		const list = pi.handlers.get(event) ?? [];
@@ -47,7 +50,10 @@ function makeFakePi(): FakePi {
 		return () => undefined; // pi.on returns an unsubscribe
 	};
 	fake.registerTool = (def) => pi.tools.push(def);
-	fake.registerCommand = (name) => pi.commands.push(name);
+	fake.registerCommand = (name, def) => {
+		pi.commands.push(name);
+		pi.commandDefs.set(name, def);
+	};
 	return pi;
 }
 
@@ -116,6 +122,49 @@ function boot(dir: string): FakePi {
 	contextEngineExtension(pi as unknown as ExtensionAPI);
 	return pi;
 }
+
+describe("extension wiring — /context-decide (provenance, issue #32.3)", () => {
+	it("registers the command, warns on empty input, and parses decision/reason", async () => {
+		const dir = sandboxProject();
+		const pi = boot(dir);
+		expect(pi.commands).toContain("context-decide");
+		const def = pi.commandDefs.get("context-decide");
+		expect(def).toBeDefined();
+
+		// Empty input must short-circuit to the usage warning WITHOUT touching
+		// the engine (no embedder, no storage — this fake has neither).
+		const notes: string[] = [];
+		const ctx = {
+			cwd: dir,
+			hasUI: true,
+			ui: {
+				notify: (msg: string, level?: string) => {
+					notes.push(`${level ?? "info"}: ${msg}`);
+				},
+			},
+		};
+		await def!.handler("", ctx);
+		expect(notes.join("\n")).toContain("Usage: /context-decide");
+	});
+
+	it("splits `<decision> [--because <reason>]` at the first --because", () => {
+		expect(parseContextDecideArgs("Use pnpm, not npm --because repo convention")).toEqual({
+			decision: "Use pnpm, not npm",
+			reason: "repo convention",
+		});
+		expect(parseContextDecideArgs("Use pnpm, not npm")).toEqual({ decision: "Use pnpm, not npm", reason: "" });
+		expect(parseContextDecideArgs("--because just the reason")).toEqual({ decision: "", reason: "just the reason" });
+		expect(parseContextDecideArgs("  spaced decision   --because   spaced reason  ")).toEqual({
+			decision: "spaced decision",
+			reason: "spaced reason",
+		});
+		// Only the FIRST flag splits; later occurrences stay in the reason.
+		expect(parseContextDecideArgs("Pass --because twice --because docs")).toEqual({
+			decision: "Pass",
+			reason: "twice --because docs",
+		});
+	});
+});
 
 describe("extension wiring — compaction recovery lifecycle", () => {
 	it("registers the lifecycle hooks (tools/commands recorded, handlers wired)", () => {

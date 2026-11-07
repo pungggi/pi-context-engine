@@ -15,6 +15,10 @@ export interface DecisionRecord {
 	decision: string;
 	reason: string;
 	timestamp: number;
+	/** Issue #32.3 provenance: who authored it. Missing on records written
+	 * before the column existed — treat absence as `agent` (conservative:
+	 * model-authored, never owner authority). */
+	authoredBy?: "agent" | "owner";
 }
 
 export interface CodeAreaRecord {
@@ -74,10 +78,10 @@ export class SessionCapture {
 		return sessionId;
 	}
 
-	recordDecision(sessionId: string, decision: string, reason: string): void {
+	recordDecision(sessionId: string, decision: string, reason: string, authoredBy: "agent" | "owner" = "agent"): void {
 		const session = this.active.get(sessionId);
 		if (!session) return;
-		session.decisions.push({ decision, reason, timestamp: this.nextTs() });
+		session.decisions.push({ decision, reason, timestamp: this.nextTs(), authoredBy });
 	}
 
 	recordCodeArea(sessionId: string, filePath: string, description: string): void {
@@ -178,6 +182,7 @@ export class SessionCapture {
 						decision: d.decision ?? "",
 						reason: d.reason ?? "",
 						timestamp: d.timestamp ?? 0,
+						authoredBy: d.authoredBy ?? "agent",
 						sessionId: data.id ?? "",
 					});
 					appended++;
@@ -205,7 +210,7 @@ export class SessionCapture {
 		return { pruned: deleted, kept: keepFiles.length, decisionsAppended: appended };
 	}
 
-	loadConsolidatedDecisions(): { decision: string; reason: string; timestamp: number }[] {
+	loadConsolidatedDecisions(): { decision: string; reason: string; timestamp: number; authoredBy?: "agent" | "owner" }[] {
 		const logPath = path.join(this.sessionsDir, DECISIONS_LOG_NAME);
 		if (!fs.existsSync(logPath)) return [];
 		try {

@@ -108,6 +108,8 @@ describe("dashboard API payloads", () => {
 
 		const decisions = decisionsPayload(engine);
 		expect(decisions.decisions.some((d) => d.decision.includes("JWT"))).toBe(true);
+		// Provenance rides the payload so the UI can label authorship (issue #32.3).
+		expect(decisions.decisions[0]).toHaveProperty("authoredBy", "agent");
 	});
 
 	it("files payload pages through the full sorted list via offset", async () => {

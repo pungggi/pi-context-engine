@@ -16,8 +16,12 @@
   "license": "MIT",
   "type": "module",
   "main": "src/extension.ts",
+  "bin": {
+    "pce": "dist/cli.js"
+  },
   "files": [
     "src",
+    "dist",
     "docs",
     "README.md",
     "LICENSE"
@@ -27,6 +31,8 @@
     "test:watch": "vitest watch",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run test",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "smoke:env": "node scripts/smoke-env.mjs",
     "smoke:loader": "node scripts/smoke-loader.mjs",
     "smoke:real-world": "tsx scripts/smoke-real-world.mjs",

@@ -147,6 +147,40 @@ describe("extension wiring — /context-decide (provenance, issue #32.3)", () =>
 		expect(notes.join("\n")).toContain("Usage: /context-decide");
 	});
 
+	it("gates the owner write behind ctx.ui.confirm — declining touches nothing", async () => {
+		const dir = sandboxProject();
+		const pi = boot(dir);
+		const def = pi.commandDefs.get("context-decide");
+		expect(def).toBeDefined();
+
+		const notes: string[] = [];
+		const confirms: string[] = [];
+		let confirmCalls = 0;
+		const ctx = {
+			cwd: dir,
+			hasUI: true,
+			ui: {
+				notify: (msg: string, level?: string) => {
+					notes.push(`${level ?? "info"}: ${msg}`);
+				},
+				// Declining. If the handler wrote anyway it would construct a real
+				// engine (embedder, storage) and blow up this fake — so surviving
+				// without a confirm-accepting ui IS the assertion: the confirmation
+				// gates every owner write (issue #32.3 boundary).
+				confirm: async (title: string, message: string) => {
+					confirmCalls++;
+					confirms.push(`${title}: ${message}`);
+					return false;
+				},
+			},
+		};
+		await def!.handler("Use pnpm, not npm --because repo convention", ctx);
+		expect(confirmCalls).toBe(1);
+		expect(confirms[0]).toContain("by=owner");
+		expect(confirms[0]).toContain("Use pnpm, not npm");
+		expect(notes.join("\n")).toContain("cancelled");
+	});
+
 	it("splits `<decision> [--because <reason>]` at the first --because", () => {
 		expect(parseContextDecideArgs("Use pnpm, not npm --because repo convention")).toEqual({
 			decision: "Use pnpm, not npm",

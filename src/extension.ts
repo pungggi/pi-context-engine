@@ -419,8 +419,8 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		description:
 			"Recall past decisions, code-area notes, and turn summaries by topic. " +
 			"Returns compact hits across project history (FTS + semantic + JSON archive). " +
-			"Decision hits carry provenance: `by=owner` = human-recorded via /context-decide (trustworthy intent); " +
-			"`by=agent` = model-authored (unverified — a lead to re-check, never owner authority).",
+			"Decision hits carry provenance: `by=owner` = human-confirmed via /context-decide (owner intent); " +
+			"`by=agent` = model-authored (unverified: a lead to re-check, never owner authority).",
 		parameters: Type.Object({
 			topic: Type.String({ description: "Topic to recall, e.g. 'auth strategy'" }),
 		}),
@@ -658,7 +658,7 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("context-decide", {
 		description:
-			"Record an owner decision: /context-decide <decision> [--because <reason>] — stored as by=owner (human authority), unlike the model's record_decision (by=agent)",
+			"Record an owner decision: /context-decide <decision> [--because <reason>] — asks for interactive confirmation, stored as by=owner (human intent), unlike the model's record_decision (by=agent)",
 		handler: async (args, ctx) => {
 			const { decision, reason } = parseContextDecideArgs(args ?? "");
 			if (!decision) {
@@ -668,8 +668,19 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 				);
 				return;
 			}
-			// Provenance: this entry point is human-typed, so it is the only one
-			// allowed to write `authored_by = owner` (issue #32.3).
+			// Issue #32.3 provenance: commands run on the human input path, but
+			// that is a convention, not an enforced boundary (the SDK can list
+			// commands for invocation). The interactive confirmation closes the
+			// gap: whoever triggered the command, a human at the TUI must approve
+			// before `authored_by = owner` is written.
+			const confirmed = await ctx.ui.confirm(
+				"Owner decision",
+				`Record as by=owner (trusted as human intent in session_recall)?\n${decision}${reason ? `\nbecause: ${reason}` : ""}`,
+			);
+			if (!confirmed) {
+				ctx.ui.notify("Owner decision not recorded (cancelled).", "info");
+				return;
+			}
 			const stored = await getEngine(ctx.cwd).recordDecision(decision, reason, { authoredBy: "owner" });
 			ctx.ui.notify(`✓ Owner decision recorded: ${stored}`, "info");
 		},

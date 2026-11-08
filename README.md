@@ -170,18 +170,20 @@ Decisions come from two authorship paths, and recall never blurs them:
   model-callable `record_decision` tool, the auto-extractor, and older
   migrated records. Useful leads, but unverified: a model can invent a
   "decision" that later reads as owner intent.
-- **`by=owner` (human-authored)**: recorded only through the
-  `/context-decide` slash command, which only a human can type. Slash
-  commands are the reliable trust boundary, so this is the sole write path
-  allowed to mint owner-authority records.
+- **`by=owner` (human-authored)**: recorded only through `/context-decide`,
+  which runs on the human input path and asks for an interactive
+  confirmation before writing. This is a best-effort trust boundary, not a
+  cryptographic guarantee: `by=owner` means a human approved the exact text
+  at the TUI, so treat it as intent that survived one explicit yes.
 
 Workflow:
 
 1. The agent resolves an ambiguity and calls `record_decision` → stored as
    `by=agent`, recalled as `[decision #12 src=manual by=agent|sid:…]`.
-2. You confirm the convention yourself:
-   `/context-decide Use pnpm, not npm --because repo convention` → stored as
-   `by=owner`, recalled as `[… by=owner …]`.
+2. You record the convention yourself with
+   `/context-decide Use pnpm, not npm --because repo convention` and approve
+   the confirmation prompt → stored as `by=owner`, recalled as
+   `[… by=owner …]`.
 3. In `session_recall`, treat `by=agent` hits as leads to re-check and
    `by=owner` hits as settled intent. The dashboard shows the same label.
 

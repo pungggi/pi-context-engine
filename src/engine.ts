@@ -527,9 +527,10 @@ export class ContextEngine {
 	): Promise<string> {
 		const decision = scrubPii(decisionInput.trim());
 		const reason = scrubPii(reasonInput.trim());
-		// Issue #32.3 provenance: `owner` is set only by human-driven entry
-		// points (/context-decide). The model-callable record_decision tool
-		// never passes it, so a model cannot mint owner-authority records.
+		// Issue #32.3 provenance: `owner` is set only by the /context-decide
+		// entry point, whose handler gates the write behind an interactive
+		// confirmation. The model-callable record_decision tool never passes it.
+		// Best-effort boundary, not a cryptographic one — see extension.ts.
 		const authoredBy = opts.authoredBy === "owner" ? "owner" : "agent";
 		// R13: structured attributes - scrubbed before any write, like the text.
 		const tags = (opts.tags ?? []).map((x) => scrubPii(x.trim())).filter(Boolean).slice(0, 8);

@@ -22,6 +22,19 @@ import { DashboardServer } from "./dashboard/server.js";
 const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
 
 /**
+ * `/context-decide` argument split: `<decision> [--because <reason>]`.
+ * Exported for tests (issue #32.3) — the parsing is the fiddly part of the
+ * human-facing entry point; the engine-side provenance write is covered by
+ * the engine tests.
+ */
+export function parseContextDecideArgs(raw: string): { decision: string; reason: string } {
+	const input = (raw ?? "").trim();
+	const split = /^(.*?)\s*--because\s*([\s\S]*)$/.exec(input);
+	if (!split) return { decision: input, reason: "" };
+	return { decision: (split[1] ?? "").trim(), reason: (split[2] ?? "").trim() };
+}
+
+/**
  * Delay before the session-start auto-index kicks in: long enough that pi's
  * initial render, skill loading and the user's first keystrokes win the event
  * loop, short enough that the index is warm before the agent needs it.
@@ -405,7 +418,9 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		label: "Session Recall",
 		description:
 			"Recall past decisions, code-area notes, and turn summaries by topic. " +
-			"Returns compact hits across project history (FTS + semantic + JSON archive).",
+			"Returns compact hits across project history (FTS + semantic + JSON archive). " +
+			"Decision hits carry provenance: `by=owner` = human-confirmed via /context-decide (owner intent); " +
+			"`by=agent` = model-authored (unverified: a lead to re-check, never owner authority).",
 		parameters: Type.Object({
 			topic: Type.String({ description: "Topic to recall, e.g. 'auth strategy'" }),
 		}),
@@ -452,7 +467,9 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 		label: "Record Decision",
 		description:
 			"Record a decision (with its reason) so future sessions can recall it. " +
-			"Use when you choose a library, resolve an ambiguity, or establish a convention.",
+			"Use when you choose a library, resolve an ambiguity, or establish a convention. " +
+			"Records you write are labeled `by=agent` (model-authored) in session_recall; " +
+			"the human records owner-authority decisions with /context-decide (`by=owner`).",
 		promptGuidelines: [
 			"Call record_decision when you make a choice that a future session would otherwise have to re-derive.",
 		],
@@ -636,6 +653,36 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 				`✓ Warmup complete: ${parts.join(" · ")}`,
 				report.reranker && !report.rerankerReady ? "warning" : "info",
 			);
+		},
+	});
+
+	pi.registerCommand("context-decide", {
+		description:
+			"Record an owner decision: /context-decide <decision> [--because <reason>] — asks for interactive confirmation, stored as by=owner (human intent), unlike the model's record_decision (by=agent)",
+		handler: async (args, ctx) => {
+			const { decision, reason } = parseContextDecideArgs(args ?? "");
+			if (!decision) {
+				ctx.ui.notify(
+					"Usage: /context-decide <decision> [--because <reason>] — the reason is what future sessions need to judge whether the decision still holds.",
+					"warning",
+				);
+				return;
+			}
+			// Issue #32.3 provenance: commands run on the human input path, but
+			// that is a convention, not an enforced boundary (the SDK can list
+			// commands for invocation). The interactive confirmation closes the
+			// gap: whoever triggered the command, a human at the TUI must approve
+			// before `authored_by = owner` is written.
+			const confirmed = await ctx.ui.confirm(
+				"Owner decision",
+				`Record as by=owner (trusted as human intent in session_recall)?\n${decision}${reason ? `\nbecause: ${reason}` : ""}`,
+			);
+			if (!confirmed) {
+				ctx.ui.notify("Owner decision not recorded (cancelled).", "info");
+				return;
+			}
+			const stored = await getEngine(ctx.cwd).recordDecision(decision, reason, { authoredBy: "owner" });
+			ctx.ui.notify(`✓ Owner decision recorded: ${stored}`, "info");
 		},
 	});
 

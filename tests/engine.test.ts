@@ -182,8 +182,30 @@ describe("ContextEngine memory", () => {
 
 		const recall = await engine.sessionRecall("jwt auth");
 		expect(recall).toContain("JWT");
-		// Decisions render with provenance and a drill-down affordance.
-		expect(recall).toMatch(/\[decision #\d+ src=manual\|sid:/);
+		// Decisions render with provenance, authorship and a drill-down affordance.
+		expect(recall).toMatch(/\[decision #\d+ src=manual by=agent\|sid:/);
+	});
+
+	it("labels decision provenance: agent by default, owner via the /context-decide path", async () => {
+		const { engine } = await harness();
+		await engine.reindex({});
+		await engine.recordDecision("Use JWT for auth", "session cookies broke mobile clients");
+		await engine.recordDecision("Pin pnpm in CI", "repo convention", { authoredBy: "owner" });
+
+		const memory = engine.getMemory()!;
+		const rows = memory.db
+			.prepare("SELECT decision, authored_by FROM decisions ORDER BY id")
+			.all() as { decision: string; authored_by: string }[];
+		// The model-callable path must never mint owner-authority rows.
+		expect(rows.map((r) => r.authored_by)).toEqual(["agent", "owner"]);
+
+		const recall = await engine.sessionRecall("jwt pnpm auth convention");
+		expect(recall).toMatch(/\[decision #\d+ src=manual by=agent\|sid:/);
+		expect(recall).toMatch(/\[decision #\d+ src=manual by=owner\|sid:/);
+
+		// The session snapshot carries provenance for the JSON recall candidates too.
+		const snap = engine.sessionCapture.getSnapshot(engine.sessionId)!;
+		expect(snap.decisions.map((d) => d.authoredBy)).toEqual(["agent", "owner"]);
 	});
 
 	it("returns guidance when nothing matches", async () => {
@@ -252,5 +274,32 @@ describe("ContextEngine status", () => {
 		for (let i = 0; i < 4; i++) await engine.search("charge card", { topK: 2 });
 		await engine.recordDecision("Keep gateway retries", "provider documents 3x tolerance");
 		expect(engine.buildNudge()).toBe("");
+	});
+});
+
+describe("ContextEngine ephemeral mode (pce CLI, issue #32.4)", () => {
+	it("creates no session snapshot, file or row — CLI runs stay invisible to history", async () => {
+		const projectDir = makeTempDir("pce-eph-");
+		const storageRoot = makeTempDir("pce-eph-store-");
+		tempDirs.push(projectDir, storageRoot);
+		writeFiles(projectDir, SAMPLE_REPO);
+		const config: Config = { ...defaultConfig(), storagePath: storageRoot };
+		const engine = new ContextEngine({ projectDir, config, ephemeral: true });
+		engines.push(engine);
+
+		expect(engine.sessionId).toBe("");
+		expect(engine.sessionCapture.getSnapshot("")).toBeNull();
+
+		await engine.shutdown();
+
+		const sessionsDir = path.join(engine.storageBase, "sessions");
+		const sessionFiles = fs.existsSync(sessionsDir)
+			? fs.readdirSync(sessionsDir).filter((f) => f.endsWith(".json"))
+			: [];
+		expect(sessionFiles).toEqual([]);
+		// No completed-session row either: shutdown's rollup + UPDATE are skipped.
+		const memory = engine.getMemory()!;
+		const rows = memory.db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number };
+		expect(Number(rows.n)).toBe(0);
 	});
 });

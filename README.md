@@ -37,7 +37,7 @@ runs fixed queries. Run it yourself; nothing is cherry-picked.
 
 ## What you get
 
-Ten tools the agent can call, plus five slash commands.
+Ten tools the agent can call, plus six slash commands.
 
 **Search**
 - **`context_search`**: hybrid vector + BM25 retrieval with confidence scores.
@@ -47,9 +47,10 @@ Ten tools the agent can call, plus five slash commands.
   graph edges, ordered by symbol-level centrality so hub symbols come first.
 
 **Memory**
-- **`record_decision`**: store a choice and its reason.
+- **`record_decision`**: store a choice and its reason (labeled `by=agent`, model-authored).
 - **`record_code_area`**: store a file and what it does.
 - **`session_recall`**: search past decisions and turn summaries by topic.
+  Every decision hit carries provenance (`by=agent` vs `by=owner`).
 - **`session_timeline`**: walk a session's turns, oldest first.
 - **`session_event`**: inspect the raw payload behind one turn.
 
@@ -58,7 +59,7 @@ Ten tools the agent can call, plus five slash commands.
 - **`reindex`**: refresh a path or the whole project.
 
 Commands: `/context-index [--full] [--reset]`, `/context-status`, `/context-savings`,
-`/context-warmup`, `/context-dashboard`.
+`/context-warmup`, `/context-dashboard`, `/context-decide`.
 
 **Shipped guidance.** The package also injects a ~900-token guidance section
 into the system prompt while `context_search` is active: how to formulate
@@ -161,6 +162,39 @@ unchanged repo took 237 ms.
   `context` hook is an O(1) check, and the block itself is injected only on
   change (first prompt, after each compaction).
 
+### Decision provenance
+
+Decisions come from two authorship paths, and recall never blurs them:
+
+- **`by=agent` (model-authored)**: everything written through the
+  model-callable `record_decision` tool, the auto-extractor, and older
+  migrated records. Useful leads, but unverified: a model can invent a
+  "decision" that later reads as owner intent.
+- **`by=owner` (human-authored)**: recorded only through `/context-decide`,
+  which runs on the human input path and asks for an interactive
+  confirmation before writing. This is a best-effort trust boundary, not a
+  cryptographic guarantee: `by=owner` means a human approved the exact text
+  at the TUI, so treat it as intent that survived one explicit yes.
+
+Workflow:
+
+1. The agent resolves an ambiguity and calls `record_decision` → stored as
+   `by=agent`, recalled as `[decision #12 src=manual by=agent|sid:…]`.
+2. You record the convention yourself with
+   `/context-decide Use pnpm, not npm --because repo convention` and approve
+   the confirmation prompt → stored as `by=owner`, recalled as
+   `[… by=owner …]`.
+3. In `session_recall`, treat `by=agent` hits as leads to re-check and
+   `by=owner` hits as settled intent. The dashboard shows the same label.
+
+- **Why it matters**: provenance is what lets a future session distinguish
+  "the model decided once" from "the human decided this". Without labels the
+  two are indistinguishable after compaction, which is exactly when recall
+  matters most.
+- **Migration**: databases from earlier releases get the `authored_by`
+  column backfilled as `agent`, because every write path until now was
+  model-callable. Nothing existing becomes owner authority retroactively.
+
 ### Model warmup
 
 - **`/context-warmup`** downloads the embedding model up front, no project or
@@ -179,6 +213,35 @@ unchanged repo took 237 ms.
 `/context-dashboard` starts a small read-only web server inside the pi process
 and opens it in your browser. Port is picked per session; set `dashboard.port`
 in config for a stable URL.
+
+### pce CLI
+
+The package also ships `pce`, a standalone CLI over the same `engine.ts` and
+the same store the extension uses:
+
+```bash
+pce search "how does hybrid retrieval merge results"   # hybrid retrieval
+pce status                                            # index health + savings
+pce recall "auth strategy"                            # decisions by topic
+pce index [--full]                                    # build or refresh
+```
+
+- **Same data, no session**: it reads the project's real index and memory,
+  so what you see in a terminal is what the tools return inside pi. Debug
+  retrieval without starting a session; script sanity checks in CI.
+- **Read-only habits**: CLI runs are ephemeral: no session row, no session
+  file, no rollup. They never pollute session history or recall results.
+  `pce search` also never triggers background indexing; an empty index tells
+  you to run `pce index` explicitly.
+- **Flags**: `--project <dir>` targets another workspace (default: cwd),
+  `--top-k N` / `--max-tokens N` shape search output.
+- **Exit codes**: `0` ok, `1` operational failure (`search`: empty index or
+  zero hits; `index`: build errors; any runtime error), `2` usage error, so
+  CI can assert on them. `recall` with no match is a normal answer (exit `0`)
+  and prints its guidance instead.
+- **Where it lives**: the `pce` bin is linked wherever the package is
+  installed (`node_modules/.bin/pce`), or run it directly with
+  `node <pkg>/dist/cli.js`.
 
 - **Overview**: donut of measured savings, chunk/file counts, live indexing
   state (polled every 5 s), and the active configuration.
@@ -360,7 +423,8 @@ non-pi editors.
 
 ```bash
 npm install
-npm run check          # typecheck + 286 unit tests
+npm run check          # typecheck + unit tests
+npm run build          # dist/ for the pce bin (prepack runs this on publish)
 npm run smoke:env      # tree-sitter + sqlite-vec capability check
 npm run smoke:loader   # load the extension through pi's jiti loader
 npm run smoke:real-world  # index this repo with the local embedder

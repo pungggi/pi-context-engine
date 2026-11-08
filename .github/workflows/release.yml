@@ -49,6 +49,11 @@ jobs:
       - run: npm test
       - run: npm run smoke:env
 
+      # Build the `pce` bin now and smoke it: prepack builds again during
+      # publish, but a broken CLI must fail HERE, before the version guard.
+      - run: npm run build
+      - run: node dist/cli.js --version
+
       - name: Determine version
         id: ver
         run: |

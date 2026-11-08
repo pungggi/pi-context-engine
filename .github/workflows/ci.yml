@@ -71,3 +71,6 @@ jobs:
           grep -E 'src/extension\.ts' pack.log
           grep -E 'src/engine\.ts' pack.log
           grep -E 'LICENSE' pack.log
+          # the `pce` bin must ship: prepack just built it via the same pack
+          grep -E 'dist/cli\.js' pack.log
+          node dist/cli.js --version

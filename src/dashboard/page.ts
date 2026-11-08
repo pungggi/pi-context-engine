@@ -392,12 +392,13 @@ function loadMemory() {
     }
     d.decisions.forEach(function (x) {
       html += '<div class="decision"><div>' + esc(x.decision) +
-        ' <span class="muted">· ' + esc(x.source) + '</span></div>' +
+        ' <span class="muted">· ' + esc(x.source) + ' · ' + esc(x.authoredBy || 'agent') + '</span></div>' +
         '<div class="why">' + esc(x.reason) + '</div>' +
         '<div class="when">' + esc(x.createdAt) + '</div></div>';
     });
     d.consolidated.forEach(function (x) {
-      html += '<div class="decision"><div>' + esc(x.decision) + ' <span class="muted">· archive</span></div>' +
+      html += '<div class="decision"><div>' + esc(x.decision) + ' <span class="muted">· archive' +
+        (x.authoredBy === 'owner' ? ' · owner' : '') + '</span></div>' +
         '<div class="why">' + esc(x.reason) + '</div></div>';
     });
     html += '</div><div class="panel"><h2>Code areas</h2>';

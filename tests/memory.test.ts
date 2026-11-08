@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { MemoryDb, BUCKETS, memoryDbPath, scrubPii, setPiiRedaction } from "../src/memory/db.js";
+import { openDatabase } from "../src/sqlite.js";
 import { SessionCapture } from "../src/memory/session-capture.js";
 import { compressTurn, compressSessionRollup, drainOne, enqueueTurn } from "../src/memory/compressor.js";
 import { makeFakeEmbedder, makeTempDir, rmrf } from "./helpers.js";
@@ -23,6 +24,57 @@ describe("MemoryDb", () => {
 			expect(reopened.schemaVersion()).toBe(4);
 			reopened.close();
 		});
+	});
+
+	it("migrates pre-provenance databases: adds authored_by and backfills rows as agent", () => {
+		const dir = makeTempDir("pce-mem-auth-");
+		const dbPath = memoryDbPath(dir);
+		// Old shape: create the decisions table the way pre-#32.3 releases did,
+		// store a row, then let MemoryDb enforce the current shape on open.
+		const raw = openDatabase(dbPath);
+		raw.db.exec(
+			`CREATE TABLE decisions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				session_id TEXT,
+				decision TEXT NOT NULL,
+				reason TEXT NOT NULL,
+				source TEXT NOT NULL DEFAULT 'manual',
+				created_at_epoch INTEGER NOT NULL,
+				created_at TEXT NOT NULL
+			)`,
+		);
+		const epoch = Math.floor(Date.now() / 1000);
+		raw.db
+			.prepare(
+				"INSERT INTO decisions (decision, reason, source, created_at_epoch, created_at) VALUES (?, ?, 'manual', ?, ?)",
+			)
+			.run("Use JWT", "stateless", epoch, new Date(epoch * 1000).toISOString());
+		raw.db.close();
+
+		const memory = new MemoryDb(dbPath);
+		try {
+			const cols = (memory.db.prepare("PRAGMA table_info(decisions)").all() as { name: string }[]).map((c) => c.name);
+			expect(cols).toContain("authored_by");
+			expect(cols).toContain("tags"); // the pre-existing R13 migration still runs
+			// Backfill: every write path until now was model-callable, so a
+			// pre-existing row must read as agent, never owner.
+			const row = memory.db.prepare("SELECT authored_by FROM decisions WHERE id = 1").get() as {
+				authored_by: string;
+			};
+			expect(row.authored_by).toBe("agent");
+			expect(memory.listDecisions()[0]?.authoredBy).toBe("agent");
+			// The CHECK constraint survives the ALTER: unknown authors rejected.
+			expect(() =>
+				memory.db
+					.prepare(
+						"INSERT INTO decisions (decision, reason, authored_by, created_at_epoch, created_at) VALUES ('x', 'y', 'other', 0, 'now')",
+					)
+					.run(),
+			).toThrow();
+		} finally {
+			memory.close();
+			rmrf(dir);
+		}
 	});
 
 	it("creates the vec tables when sqlite-vec is available", async () => {

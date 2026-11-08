@@ -129,6 +129,10 @@ export interface EngineOptions {
 	 * auto-detecting. `backend` may be nulled by resetIndex — the pipeline
 	 * then constructs a fresh one. */
 	runtime?: { backend?: LocalBackend | null; embedder: Embedder; reranker?: LocalReranker };
+	/** Read-only CLI usage (issue #32.4): no session snapshot/row, no rollup
+	 * on shutdown, so `pce ...` runs never pollute the project's session
+	 * history (session lists, recall candidates, dashboard). */
+	ephemeral?: boolean;
 }
 
 /** Issue #11 (upstream warmup): what /context-warmup resolved + cached. */
@@ -183,6 +187,7 @@ export class ContextEngine {
 	private hasRecordedDecision = false;
 	private vecBackfillStarted = false;
 	private autoIndexDone = false;
+	private readonly ephemeral: boolean;
 
 	constructor(options: EngineOptions) {
 		this.projectDir = fs.realpathSync(path.resolve(options.projectDir));
@@ -197,7 +202,10 @@ export class ContextEngine {
 		fs.mkdirSync(this.storageBase, { recursive: true });
 		setPiiRedaction(this.config.memoryRedactPii);
 		this.sessionCapture = new SessionCapture(path.join(this.storageBase, "sessions"));
-		this.sessionId = this.sessionCapture.startSession(this.projectName);
+		this.ephemeral = options.ephemeral ?? false;
+		// Ephemeral engines have no session to record against; sessionId stays
+		// empty and every session-keyed write no-ops (active.get("") → null).
+		this.sessionId = this.ephemeral ? "" : this.sessionCapture.startSession(this.projectName);
 		this.statsPath = path.join(this.storageBase, "stats.json");
 		this.stats = this.loadStats();
 	}
@@ -294,7 +302,9 @@ export class ContextEngine {
 	}
 
 	private ensureSessionRow(): void {
-		if (!this.memoryInstance) return;
+		// Ephemeral engines (pce CLI) have no session: skipping keeps a `""`
+		// row out of the sessions table the moment recall/savings open memory.
+		if (this.ephemeral || !this.memoryInstance) return;
 		const epoch = epochSeconds();
 		this.memoryInstance.db
 			.prepare(
@@ -513,14 +523,19 @@ export class ContextEngine {
 	async recordDecision(
 		decisionInput: string,
 		reasonInput: string,
-		opts: { relatedTo?: number[]; tags?: string[]; files?: string[] } = {},
+		opts: { relatedTo?: number[]; tags?: string[]; files?: string[]; authoredBy?: "agent" | "owner" } = {},
 	): Promise<string> {
 		const decision = scrubPii(decisionInput.trim());
 		const reason = scrubPii(reasonInput.trim());
+		// Issue #32.3 provenance: `owner` is set only by the /context-decide
+		// entry point, whose handler gates the write behind an interactive
+		// confirmation. The model-callable record_decision tool never passes it.
+		// Best-effort boundary, not a cryptographic one — see extension.ts.
+		const authoredBy = opts.authoredBy === "owner" ? "owner" : "agent";
 		// R13: structured attributes - scrubbed before any write, like the text.
 		const tags = (opts.tags ?? []).map((x) => scrubPii(x.trim())).filter(Boolean).slice(0, 8);
 		const files = (opts.files ?? []).map((x) => scrubPii(x.trim())).filter(Boolean).slice(0, 8);
-		this.sessionCapture.recordDecision(this.sessionId, decision, reason);
+		this.sessionCapture.recordDecision(this.sessionId, decision, reason, authoredBy);
 		this.sessionCapture.persist(this.sessionId);
 		this.searchesSinceDecision = 0;
 		this.hasRecordedDecision = true;
@@ -533,12 +548,13 @@ export class ContextEngine {
 			this.recordBucket("grammar", stored.rawTokens + storedReason.rawTokens, stored.compressedTokens + storedReason.compressedTokens);
 			const result = memory.db
 				.prepare(
-					"INSERT INTO decisions (session_id, decision, reason, source, created_at_epoch, created_at, tags, files) VALUES (?, ?, ?, 'manual', ?, ?, ?, ?)",
+					"INSERT INTO decisions (session_id, decision, reason, source, authored_by, created_at_epoch, created_at, tags, files) VALUES (?, ?, ?, 'manual', ?, ?, ?, ?, ?)",
 				)
 				.run(
 					this.sessionId,
 					stored.text,
 					storedReason.text,
+					authoredBy,
 					epoch,
 					new Date(epoch * 1000).toISOString(),
 					JSON.stringify([...tags, ...keywordsOf(decision)].slice(0, 8)),
@@ -687,19 +703,21 @@ export class ContextEngine {
 		// where a throw would surface as a pi error, and it must still release
 		// the sqlite handles (Windows keeps files locked otherwise).
 		try {
-			const memory = this.getMemory();
-			if (memory) {
-				enqueueSessionRollup(memory, this.sessionId);
-				await this.drainCompressionQueue(200);
-				memory.db
-					.prepare("UPDATE sessions SET status = 'completed', ended_at_epoch = ?, ended_at = ? WHERE id = ?")
-					.run(epochSeconds(), new Date().toISOString(), this.sessionId);
+			if (!this.ephemeral) {
+				const memory = this.getMemory();
+				if (memory) {
+					enqueueSessionRollup(memory, this.sessionId);
+					await this.drainCompressionQueue(200);
+					memory.db
+						.prepare("UPDATE sessions SET status = 'completed', ended_at_epoch = ?, ended_at = ? WHERE id = ?")
+						.run(epochSeconds(), new Date().toISOString(), this.sessionId);
+				}
 			}
 		} catch {
 			// compression/flush failures must not block cleanup
 		}
 		try {
-			this.sessionCapture.endSession(this.sessionId);
+			if (!this.ephemeral) this.sessionCapture.endSession(this.sessionId);
 		} catch {
 			// ignore
 		}
@@ -1022,7 +1040,9 @@ export class ContextEngine {
 		const seen = new Set<string>();
 		for (const session of sessions) {
 			for (const d of session.decisions ?? []) {
-				const text = `[decision] ${d.decision} — ${d.reason}`;
+				// Issue #32.3: tag provenance in recall output so a model-authored
+				// record never reads as owner intent. Absence = agent (conservative).
+				const text = `[decision by=${d.authoredBy ?? "agent"}] ${d.decision} — ${d.reason}`;
 				if (!seen.has(text)) {
 					seen.add(text);
 					out.push(text);
@@ -1037,7 +1057,7 @@ export class ContextEngine {
 			}
 		}
 		for (const d of this.sessionCapture.loadConsolidatedDecisions()) {
-			const text = `[decision] ${d.decision} — ${d.reason}`;
+			const text = `[decision by=${d.authoredBy ?? "agent"}] ${d.decision} — ${d.reason}`;
 			if (!seen.has(text)) {
 				seen.add(text);
 				out.push(text);
@@ -1143,13 +1163,14 @@ export class ContextEngine {
 			(
 				memory.db
 					.prepare(
-						`SELECT id, decision, reason, source, session_id, created_at_epoch FROM decisions WHERE id IN (${placeholders})`,
+						`SELECT id, decision, reason, source, authored_by, session_id, created_at_epoch FROM decisions WHERE id IN (${placeholders})`,
 					)
 					.all(...ids) as {
 					id: number;
 					decision: string;
 					reason: string;
 					source: string;
+					authored_by: string | null;
 					session_id: string | null;
 					created_at_epoch: number;
 				}[]
@@ -1173,8 +1194,10 @@ export class ContextEngine {
 				tail += ` · annotation #${ann.id}${ann.note ? ": " + ann.note.slice(0, 80) : ""}`;
 			}
 			if (r.session_id) tail += ` · → session_timeline("${r.session_id}")`;
+			// Issue #32.3: `by=agent` = model-authored (unverified), `by=owner` =
+			// human-recorded via /context-decide. Always labeled, never implied.
 			out.push(
-				`[decision #${r.id} src=${r.source}|sid:${r.session_id ?? "-"}] ${expand(r.decision)} — ${expand(r.reason)}${tail}`,
+				`[decision #${r.id} src=${r.source} by=${r.authored_by ?? "agent"}|sid:${r.session_id ?? "-"}] ${expand(r.decision)} — ${expand(r.reason)}${tail}`,
 			);
 		}
 		return out;

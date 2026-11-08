@@ -129,7 +129,7 @@ describe("PR #7: decision ids are discoverable", () => {
 		const reply = await engine.recordDecision("Use vitest fake timers", "real timers are flaky");
 		expect(reply).toMatch(/\[#\d+\]$/);
 		const recall = await engine.sessionRecall("vitest timers");
-		expect(recall).toMatch(/\[decision #\d+ src=manual\|sid:/);
+		expect(recall).toMatch(/\[decision #\d+ src=manual by=agent\|sid:/);
 	});
 });
 

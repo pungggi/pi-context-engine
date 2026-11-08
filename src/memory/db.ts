@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   decision TEXT NOT NULL,
   reason TEXT NOT NULL,
   source TEXT NOT NULL CHECK(source IN ('manual','migrated','auto')) DEFAULT 'manual',
+  authored_by TEXT NOT NULL DEFAULT 'agent' CHECK(authored_by IN ('agent','owner')),
   created_at_epoch INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
@@ -223,7 +224,7 @@ export class MemoryDb {
 		// vec, upgrade later" version dance.
 		const run = this.db.transaction(() => {
 			this.db.exec(SCHEMA_V1);
-			this.applyV4Columns();
+			this.applyDecisionColumns();
 			this.db.exec(SCHEMA_V3);
 			this.db.exec(SCHEMA_V4);
 			if (this.hasVec) {
@@ -238,14 +239,21 @@ export class MemoryDb {
 		run();
 	}
 
-	/** `decisions.tags` / `decisions.files` (JSON arrays) on databases created
-	 * before R13; guarded so re-runs and partial states stay safe. */
-	private applyV4Columns(): void {
+	/** Columns added to `decisions` after its CREATE TABLE first shipped:
+	 * `tags` / `files` (JSON arrays, R13) and `authored_by` (provenance,
+	 * issue #32.3). Guarded so re-runs and partial states stay safe. The
+	 * `authored_by` default backfills pre-existing rows as `agent`: every
+	 * write path until now was model-callable, and a model-authored decision
+	 * must never read as owner authority. */
+	private applyDecisionColumns(): void {
 		const cols = new Set(
 			(this.db.prepare("PRAGMA table_info(decisions)").all() as { name: string }[]).map((c) => c.name),
 		);
 		if (!cols.has("tags")) this.db.exec("ALTER TABLE decisions ADD COLUMN tags TEXT");
 		if (!cols.has("files")) this.db.exec("ALTER TABLE decisions ADD COLUMN files TEXT");
+		if (!cols.has("authored_by")) {
+			this.db.exec("ALTER TABLE decisions ADD COLUMN authored_by TEXT NOT NULL DEFAULT 'agent' CHECK(authored_by IN ('agent','owner'))");
+		}
 	}
 
 	// ── R13: linked memory (A-MEM style) ─────────────────────────────────────
@@ -663,18 +671,30 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_vec USING vec0(embedding float
 	}
 
 	/** Recent decisions, newest first. */
-	listDecisions(limit = 100): { id: number; decision: string; reason: string; source: string; createdAt: string }[] {
+	listDecisions(
+		limit = 100,
+	): { id: number; decision: string; reason: string; source: string; authoredBy: string; createdAt: string }[] {
 		try {
 			const rows = this.db
-				.prepare("SELECT id, decision, reason, source, created_at FROM decisions ORDER BY created_at_epoch DESC LIMIT ?")
+				.prepare(
+					"SELECT id, decision, reason, source, authored_by, created_at FROM decisions ORDER BY created_at_epoch DESC LIMIT ?",
+				)
 				.all(Math.max(1, Math.min(limit, 500))) as {
 				id: number;
 				decision: string;
 				reason: string;
 				source: string;
+				authored_by: string | null;
 				created_at: string;
 			}[];
-			return rows.map((r) => ({ id: r.id, decision: r.decision, reason: r.reason, source: r.source, createdAt: r.created_at }));
+			return rows.map((r) => ({
+				id: r.id,
+				decision: r.decision,
+				reason: r.reason,
+				source: r.source,
+				authoredBy: r.authored_by ?? "agent",
+				createdAt: r.created_at,
+			}));
 		} catch {
 			return [];
 		}

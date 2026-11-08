@@ -16,7 +16,8 @@
  * exposed as the `pce` bin; importing it (tests) never executes main.
  */
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { ContextEngine } from "./engine.js";
 
 const require = createRequire(import.meta.url);
@@ -99,10 +100,16 @@ export function parseCliArgs(argv: string[]): ParsedArgs {
 			if (value === undefined) out.unknown = "--project (missing value)";
 			else out.project = value;
 		} else if (arg === "--top-k" || arg === "--max-tokens") {
-			const value = Number(argv[++i]);
-			if (!Number.isFinite(value) || value <= 0) out.unknown = `${arg} (needs a positive number)`;
-			else if (arg === "--top-k") out.topK = value;
-			else out.maxTokens = value;
+			const value = argv[i + 1];
+			const parsedValue = Number(value);
+			// A flag-looking token is the NEXT flag, not this flag's value.
+			if (value === undefined || value.startsWith("-")) out.unknown = `${arg} (missing value)`;
+			else if (!Number.isFinite(parsedValue) || parsedValue <= 0) out.unknown = `${arg} (needs a positive number)`;
+			else {
+				i++;
+				if (arg === "--top-k") out.topK = parsedValue;
+				else out.maxTokens = parsedValue;
+			}
 		} else if (arg.startsWith("-") && arg !== "-") out.unknown = arg;
 		else if (out.command === null) out.command = arg;
 		else out.positional.push(arg);
@@ -217,6 +224,23 @@ export async function runCli(
 	}
 }
 
+/**
+ * True when this module is the process entry (bin invocation), false when it
+ * is imported (tests). Compares REAL paths: `process.argv[1]` keeps the
+ * symlink/short-name path it was invoked through while `import.meta.url` is
+ * the resolved target, so a naive string comparison makes symlinked bins
+ * (npm/pnpm on POSIX link `node_modules/.bin/pce` → `dist/cli.js`) silently
+ * do nothing. Exported for tests.
+ */
+export function isDirectEntry(argv1: string | undefined, metaUrl: string): boolean {
+	if (!argv1) return false;
+	try {
+		return fs.realpathSync(argv1) === fileURLToPath(metaUrl);
+	} catch {
+		return false; // vanished/unreadable argv path: never auto-run
+	}
+}
+
 async function main(): Promise<void> {
 	const code = await runCli(
 		process.argv.slice(2),
@@ -232,9 +256,9 @@ async function main(): Promise<void> {
 }
 
 // Direct execution only (bin entry); importing from tests never runs main.
-const invokedDirectly =
-	process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (invokedDirectly) {
+// realpath-guarded: see isDirectEntry for why a plain string compare breaks
+// symlinked bins.
+if (isDirectEntry(process.argv[1], import.meta.url)) {
 	main().catch((err: unknown) => {
 		process.stderr.write(`pce: ${err instanceof Error ? err.message : String(err)}\n`);
 		process.exitCode = 1;

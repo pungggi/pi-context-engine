@@ -1,5 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { USAGE, packageVersion, parseCliArgs, runCli, type CliEngine, type CliIO } from "../src/cli.js";
+import { afterAll, describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import {
+	USAGE,
+	isDirectEntry,
+	packageVersion,
+	parseCliArgs,
+	runCli,
+	type CliEngine,
+	type CliIO,
+} from "../src/cli.js";
 
 interface Capture {
 	io: CliIO;
@@ -67,6 +79,9 @@ describe("parseCliArgs", () => {
 	it("flags unknown options and bad values", () => {
 		expect(parseCliArgs(["search", "--bogus"]).unknown).toBe("--bogus");
 		expect(parseCliArgs(["search", "--top-k", "x"]).unknown).toContain("--top-k");
+		// A flag-looking token is the next option, not this option's value:
+		// reported as THIS flag missing its value, not as a bad number.
+		expect(parseCliArgs(["search", "--top-k", "--project", "/x"]).unknown).toBe("--top-k (missing value)");
 		expect(parseCliArgs(["--project"]).unknown).toContain("--project");
 	});
 
@@ -194,5 +209,44 @@ describe("runCli", () => {
 		expect(await r.run(["search", "q"])).toBe(1);
 		expect(r.err.join("")).toContain("pce: boom");
 		expect(state.shutdowns).toBe(1);
+	});
+});
+
+describe("isDirectEntry (bin main-guard, symlink regression)", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pce-cli-entry-"));
+	const real = path.join(dir, "real-entry.js");
+	fs.writeFileSync(real, "// test fixture");
+	// Reality check: node resolves the main module to its realpath, so the
+	// comparison target must be the real path too.
+	const realUrl = pathToFileURL(fs.realpathSync(real)).href;
+
+
+	it("matches when argv points at the same real file", () => {
+		expect(isDirectEntry(real, realUrl)).toBe(true);
+	});
+
+	it("matches when argv is a SYMLINK to the entry (npm/pnpm bin links)", () => {
+		const link = path.join(dir, "link-entry.js");
+		try {
+			fs.symlinkSync(real, link);
+		} catch {
+			return; // symlink privilege unavailable on this host — covered by the realpath path above
+		}
+		// This is the exact shape that made the old string comparison
+		// (`import.meta.url === pathToFileURL(argv[1]).href`) return false:
+		// argv keeps the link, meta.url is the target.
+		expect(isDirectEntry(link, realUrl)).toBe(true);
+	});
+
+	it("rejects a different file, a missing argv and an unreadable path", () => {
+		const other = path.join(dir, "other.js");
+		fs.writeFileSync(other, "// other");
+		expect(isDirectEntry(other, realUrl)).toBe(false);
+		expect(isDirectEntry(undefined, realUrl)).toBe(false);
+		expect(isDirectEntry(path.join(dir, "nope.js"), realUrl)).toBe(false);
+	});
+
+	afterAll(() => {
+		fs.rmSync(dir, { recursive: true, force: true });
 	});
 });

@@ -233,8 +233,10 @@ pce index [--full]                                    # build or refresh
   you to run `pce index` explicitly.
 - **Flags**: `--project <dir>` targets another workspace (default: cwd),
   `--top-k N` / `--max-tokens N` shape search output.
-- **Exit codes**: `0` ok, `1` operational failure (empty index, index
-  errors, no results), `2` usage error, so CI can assert on them.
+- **Exit codes**: `0` ok, `1` operational failure (`search`: empty index or
+  zero hits; `index`: build errors; any runtime error), `2` usage error, so
+  CI can assert on them. `recall` with no match is a normal answer (exit `0`)
+  and prints its guidance instead.
 - **Where it lives**: the `pce` bin is linked wherever the package is
   installed (`node_modules/.bin/pce`), or run it directly with
   `node <pkg>/dist/cli.js`.

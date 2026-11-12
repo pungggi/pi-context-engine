@@ -56,13 +56,28 @@ describe("listPiSessions", () => {
 				cost: { total: 0.25 },
 			}),
 		], 2000);
+		// Reverse direction: POSIX cwds must parse identically on every platform
+		// (and Windows-style cwds must split on Linux CI — path.basename() is
+		// platform-dependent and returned the whole path there before the fix).
+		writeSession("ccc.jsonl", "/home/user/proj-c", [
+			msg("user"),
+			msg("assistant", {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { total: 0.1 },
+			}),
+		], 3000);
 		const payload = await listPiSessions(root, 100, 0);
-		expect(payload.total).toBe(2);
-		expect(payload.sessions.map((s) => s.id)).toEqual(["bbb", "aaa"]); // mtime desc
+		expect(payload.total).toBe(3);
+		expect(payload.sessions.map((s) => s.id)).toEqual(["ccc", "bbb", "aaa"]); // mtime desc
 		const newest = payload.sessions[0]!;
-		expect(newest.project).toBe("proj-b");
-		expect(newest.tokens).toBe(12);
-		expect(newest.cost).toBeCloseTo(0.25, 6);
+		expect(newest.project).toBe("proj-c"); // POSIX cwd
+		expect(payload.sessions[1]!.project).toBe("proj-b"); // Windows cwd — CI regression: Linux must split on `\\`
+		expect(newest.tokens).toBe(0);
+		expect(newest.cost).toBeCloseTo(0.1, 6);
 		expect(newest.messageCount).toBe(2);
 	});
 

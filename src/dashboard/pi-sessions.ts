@@ -12,7 +12,6 @@
  * catalog cost recorded inside the session files — no network, no model init.
  */
 import { promises as fs } from "node:fs";
-import { basename } from "node:path";
 import { SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
 import { summarizeSessionJsonl, type SessionUsageSummary } from "../session-usage.js";
 
@@ -88,10 +87,18 @@ async function summarizeFile(filePath: string): Promise<SessionUsageSummary> {
 	return summary;
 }
 
+/** Last path segment of a session's cwd, splitting on BOTH separators —
+ * session files carry the creating machine's native separators, so a
+ * Windows cwd viewed on Linux must still split on `\\` (basename() alone
+ * is platform-dependent and returned the whole path in CI). */
+const projectName = (cwd: string): string => {
+	const segments = cwd.split(/[\\/]/).filter(Boolean);
+	return segments.length > 0 ? segments[segments.length - 1]! : "(unknown project)";
+};
 const toRow = (info: SessionInfo, summary: SessionUsageSummary): PiSessionRow => ({
 	id: info.id,
 	cwd: info.cwd ?? "",
-	project: info.cwd ? basename(info.cwd) : "(unknown project)",
+	project: info.cwd ? projectName(info.cwd) : "(unknown project)",
 	name: info.name,
 	created: info.created instanceof Date && !Number.isNaN(info.created.getTime()) ? info.created.toISOString() : "",
 	modified: info.modified instanceof Date && !Number.isNaN(info.modified.getTime()) ? info.modified.toISOString() : "",

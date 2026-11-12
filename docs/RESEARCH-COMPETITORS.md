@@ -1,6 +1,8 @@
 # Competitor comparison and the prose (non-code) gap
 
-Status: research only, no code changes. Date: 2026-10-25.
+Status: living design and implementation record. Shipped: P0/P1 prose
+chunking (2026-10-25), WP2 symbol PageRank ordering and P2.A doc-graph edges
+(2026-10-26). Pending: the rest of §4. Date: 2026-10-25.
 
 Companion to `docs/RESEARCH-RETRIEVAL.md`, which reviews the retrieval
 literature for **code**. This file answers two questions:
@@ -47,7 +49,8 @@ core retrieval design. The gap is in *breadth of context sources* and in
   `related_context` neighbours hub-first (deterministic tie-break, same
   lifecycle as file ranks: recompute after indexing, delete with the file).
   Still open: the token-budget "repo map" *view* (a ranked symbol-signature
-  list for architecture questions) — only build it if eval asks.
+  list for architecture questions). Opened 2026-10-26 as WP4 in the §4
+  sequence (user decision; the earlier "only if eval asks" gate was waived).
 - **Greptile / Potpie: agentic retrieval.** Iterative query loops over a full
   codebase graph, wired into PR review. Our search is one-shot with refine
   hints instead.
@@ -65,7 +68,9 @@ core retrieval design. The gap is in *breadth of context sources* and in
 product-scope features (cloud, accounts, editor plugins) and stay out. External
 docs indexing is the one competitor feature still worth a design decision,
 because the agent-proposed flow is not something Cursor/Continue do. The rest
-(centrality ranking, summary chunks) are candidates only if eval shows a win.
+(centrality ranking, summary chunks) were candidates only if eval shows a win.
+(2026-10-26: superseded. The user opened every remaining candidate including
+@Docs for implementation; §4 holds the sequence and per-item eval gates.)
 
 ---
 
@@ -84,8 +89,9 @@ Facts verified in this repo:
 - **Small-to-big degenerates.** `retrieval.expand_context` serves a hit's
   module parent, but for prose the hit *is* the whole file, so there is no
   finer context to expand from.
-- **No graph signal.** Prose files have no import edges, so
-  `related_context` always falls back to file level.
+- **No graph signal** (fixed 2026-10-26, §4 P2.A): prose files had no
+  import edges, so `related_context` always fell back to file level. Markdown
+  links now become `references` edges, so notes reach the pages they cite.
 - **Prose is unmeasured.** `tests/eval/queries.jsonl` has 76 queries, **0**
   targeting `.md` or docs paths. The README quality numbers are code-only.
 - **No markdown parser available.** `tree-sitter-wasms` ships no markdown
@@ -170,13 +176,74 @@ and the degenerate small-to-big case in one change, with no new dependencies.
   type `doc` with zero storage migration. The outline parent stays `module`,
   which is what the retriever's parent lookup and dedupe exemption key on.
 
-### P2: gated follow-ups (only if eval asks for them)
+### P2: follow-ups — opened for implementation 2026-10-26, each with its own eval A/B
 
-- **File-level prose graph edges** (heading -> file, doc -> doc links via
-  Markdown references) so `related_context` is not empty for notes.
-- **Summary chunk per large prose file**, generated via Ollama at index time
+The earlier "only if eval asks" gate was waived by the user; the order below
+is the agreed sequence (small and evidence-backed first).
+
+- **A. File-level prose graph edges** — **implemented 2026-10-26 (WP3)**.
+  Section (heading) chunks and legacy whole-file note chunks emit a
+  `references` edge to every indexed file their Markdown links resolve to:
+  - **Covered links**: inline `[text](other.md)` / `![img](...)` and
+    reference definitions `[label]: dest`; `..`, root-`/` and %-encoded
+    targets; `#fragment` and `?query` are stripped before resolution.
+    Destinations are read with a two-phase scan (destination first, then
+    the optional title), so balanced parens in either survive
+    (`./guide(v2).md`, `./hub.md "Hub (draft")`), and CommonMark
+    backslash escapes (`./guide\(v2\).md`) unescape and HTML entities
+    (`./A&amp;B.md`) decode before the lookup; whitespace before the closing
+    `)` is legal without a title.
+  - **Skipped**: URL schemes, protocol-relative `//host/path`, pure anchors,
+    self-links and targets that are not indexed; example links inside
+    fences (including blockquoted `> ~~~` fences), frontmatter, HTML
+    comments, multi-line and inline code spans, indented code blocks (but
+    NOT indented prose inside an open list item), and escaped `\[` never
+    become edges (the block mask mirrors the heading detector). Titles are
+    skipped whole, so a fake link inside a title cannot start a second scan;
+    removing a code span leaves a separator so `[x]`+`(y)` cannot glue into
+    a link the source never had; and an escaped `` \` `` is literal text
+    rather than a span delimiter, while escapes inside an OPEN span are
+    literal and never block its close.
+  - **Prose only**: a doc-link string inside a code file stays out of the
+    graph, so the code calls/imports projection keeps its meaning.
+  - **Derivation order**: links are derived AFTER all batches, over every
+    indexed prose file, from a fence-aware scan of the RAW file with line
+    attribution back into chunks (mirrors the calls-derivation design; the
+    owner is the TIGHTEST covering chunk, so the whole-file outline parent
+    cannot steal a section's links). The pass replaces rather than adds
+    (drop + re-insert), so links that vanish from the source cannot linger,
+    it honors the batch path's `MAX_FILE_BYTES` guard, and it applies the
+    same `redactSecrets` transform the chunker saw (a collapsed PEM block
+    would otherwise shift every later line's attribution). That survives
+    fences split across chunk windows and heals links whose target file
+    appears on a later run, without a source edit.
+  - **Why it helps**: the edges ride three existing consumers unchanged:
+    `related_context`'s neighbour lookup, `getRelatedFilePaths` (retriever
+    1-hop expansion and the file-level fallback), and both PageRank tables,
+    so a note linked from many notes gains hub signal like an imported code
+    file does.
+
+  A/B on the 89-query suite (same query set before/after; the ±0.05 gate
+  passed on both backends):
+
+  | metric | before | after |
+  |---|---|---|
+  | overall R@10 (fake backend = committed gate) | 0.830 | 0.852 |
+  | prose nDCG@10 (fake) | 0.269 | 0.307 |
+  | overall R@10 (real ONNX embedder) | 0.800 | 0.807 |
+  | overall nDCG@10 (real ONNX) | 0.682 | 0.711 |
+  | prose R@10 (real ONNX) | 0.308 | 0.385 |
+  | prose nDCG@10 (real ONNX) | 0.200 | 0.299 |
+  | distraction@10 (real ONNX, lower is better) | 0.733 | 0.728 |
+
+  The prose slice moves the most (nDCG +0.099 on the real embedder): linked
+  pages now expand into each other, which is exactly what whole-file notes
+  could not do before. The direct win stays `related_context` on a note
+  returning its linked pages instead of "No related context found".
+
+- **B. Summary chunk per large prose file**, generated via Ollama at index time
   (Zed-style), behind a config flag: costs an LLM call per changed file.
-- **Semantic chunking** for heading-less unstructured text, behind a flag.
+- **C. Semantic chunking** for heading-less unstructured text, behind a flag.
 
 ### What we deliberately do not chase
 

@@ -37,7 +37,7 @@ runs fixed queries. Run it yourself; nothing is cherry-picked.
 
 ## What you get
 
-Ten tools the agent can call, plus six slash commands.
+Ten tools the agent can call, plus seven slash commands.
 
 **Search**
 - **`context_search`**: hybrid vector + BM25 retrieval with confidence scores.
@@ -59,7 +59,7 @@ Ten tools the agent can call, plus six slash commands.
 - **`reindex`**: refresh a path or the whole project.
 
 Commands: `/context-index [--full] [--reset]`, `/context-status`, `/context-savings`,
-`/context-warmup`, `/context-dashboard`, `/context-decide`.
+`/context-usage`, `/context-warmup`, `/context-dashboard`, `/context-decide`.
 
 **Shipped guidance.** The package also injects a ~900-token guidance section
 into the system prompt while `context_search` is active: how to formulate
@@ -247,6 +247,10 @@ pce index [--full]                                    # build or refresh
   state (polled every 5 s), and the active configuration.
 - **Files**: every indexed file with its chunk count, largest first.
 - **Sessions**: past sessions with per-turn summaries and tool events.
+- **All pi sessions**: every pi session across all projects with message
+  count, tokens, and catalog cost parsed from each session file —
+  cross-project spend at a glance (see `/context-usage` for the current
+  session's breakdown in the TUI).
 - **Memory**: recorded decisions and code areas.
 - **Savings**: the per-bucket ledger with dollar estimates and a 30-day trend.
 - **Export**: one JSON download of all of the above.

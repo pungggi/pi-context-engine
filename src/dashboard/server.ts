@@ -19,6 +19,7 @@ import {
 	savingsPayload,
 	type ExtDashboardState,
 } from "./api.js";
+import { listPiSessions } from "./pi-sessions.js";
 import { PAGE_HTML } from "./page.js";
 
 export interface DashboardServerOptions {
@@ -28,6 +29,8 @@ export interface DashboardServerOptions {
 	indexing: () => boolean;
 	/** TCP port; 0 (default) picks a free port. */
 	port?: number;
+	/** Override pi's default session directory for /api/pi-sessions (tests). */
+	piSessionsRoot?: string;
 	log?: (msg: string, level: "info" | "warning") => void;
 }
 
@@ -143,6 +146,23 @@ export class DashboardServer {
 		if (route === "/" || route === "/index.html") {
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
 			res.end(method === "HEAD" ? undefined : PAGE_HTML);
+			return;
+		}
+
+		if (route === "/api/pi-sessions") {
+			// Engine-independent: works even before a project index exists.
+			void (async (): Promise<void> => {
+				const payload = await listPiSessions(
+					options.piSessionsRoot,
+					clampLimit(url.searchParams.get("limit"), 100, 500),
+					clampLimit(url.searchParams.get("offset"), 0, 1e9),
+				);
+				sendJson(res, 200, payload);
+			})().catch((err: unknown) => {
+				if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+				else res.end();
+				options.log?.(`pi-sessions request failed: ${(err as Error).message}`, "warning");
+			});
 			return;
 		}
 

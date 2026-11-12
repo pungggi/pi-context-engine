@@ -17,6 +17,8 @@ import { applyContextSearchGuidance } from "./guidance.js";
 import { ProjectWatcher } from "./indexer/watcher.js";
 import { AutomaticIndexFileLimitError } from "./indexer/pipeline.js";
 import { DashboardServer } from "./dashboard/server.js";
+import { estimateSessionCost, summarizeSessionUsage } from "./session-usage.js";
+import { resolvePricing } from "./pricing.js";
 
 /** Tools whose payloads are worth capturing for session timelines. */
 const CAPTURED_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
@@ -637,6 +639,62 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			const saved = Math.max(0, stats.rawTokens - stats.servedTokens);
 			const header = `${eng.projectName} · ${stats.queries} queries · ${saved.toLocaleString()} tokens saved`;
 			ctx.ui.notify([header, "", ...(rows.length > 0 ? rows : ["(no bucket events yet)"])].join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("context-usage", {
+		description: "Show token usage, cost, and context window for the current session",
+		handler: async (_args, ctx) => {
+			const eng = getEngine(ctx.cwd);
+			// Same accounting pi's /session and footer use: usage entries, nested-call
+			// tool results, compaction summaries — everything actually billed, not
+			// just what is still in context.
+			const summary = summarizeSessionUsage(ctx.sessionManager.getEntries());
+			const lines: string[] = [`Session usage · ${eng.projectName}`];
+			const hit = summary.latestCacheHitRate === null ? "" : ` · cache hit ${summary.latestCacheHitRate.toFixed(1)}%`;
+			lines.push(
+				`Tokens  ↑${summary.input.toLocaleString()} in · ↓${summary.output.toLocaleString()} out · ` +
+					`R ${summary.cacheRead.toLocaleString()} / W ${summary.cacheWrite.toLocaleString()} · ` +
+					`${summary.totalTokens.toLocaleString()} total${hit}`,
+			);
+			if (summary.cost > 0) {
+				lines.push(`Cost    $${summary.cost.toFixed(3)} (catalog)`);
+			} else if (summary.totalTokens > 0) {
+				// Some providers report no catalog cost — fall back to an estimate at
+				// the configured rates, clearly labeled as such.
+				try {
+					const { label, pricing } = await resolvePricing(eng.config, false);
+					lines.push(
+						`Cost    est. $${estimateSessionCost(summary, pricing).toFixed(3)} @ ${label} rates (provider reports no cost)`,
+					);
+				} catch {
+					lines.push("Cost    n/a (no catalog cost and no pricing available)");
+				}
+			} else {
+				lines.push("Cost    $0 (no usage recorded yet)");
+			}
+			const cu = ctx.getContextUsage();
+			if (cu && cu.contextWindow > 0) {
+				const pct = cu.percent === null ? "?" : cu.percent.toFixed(1);
+				const toks = cu.tokens === null ? "?" : cu.tokens.toLocaleString();
+				lines.push(`Context ${pct}% of ${cu.contextWindow.toLocaleString()} (${toks} tokens)`);
+			}
+			const modelRows = Object.entries(summary.byModel).map(([key, value]) => `${key} $${value.cost.toFixed(3)}`);
+			if (modelRows.length > 0) lines.push(`Models  ${modelRows.slice(0, 5).join(" · ")}`);
+			lines.push(
+				`Turns   ${summary.userMessages} user · ${summary.assistantMessages} assistant · ${summary.toolCalls} tool calls`,
+			);
+			// Savings ledger (our own accounting) — best-effort, never blocks the report.
+			try {
+				const stats = eng.getStats();
+				const saved = Math.max(0, stats.fullFileTokens - stats.servedTokens);
+				if (saved > 0) {
+					lines.push(`Saved   ${saved.toLocaleString()} tokens this project (${stats.queries} queries)${await eng.costSaved(saved)}`);
+				}
+			} catch {
+				// index not built yet — skip the savings line
+			}
+			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 

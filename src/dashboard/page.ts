@@ -107,7 +107,7 @@ export const PAGE_HTML = `<!doctype html>
 <script>
 'use strict';
 var TABS = ['overview', 'files', 'sessions', 'memory', 'savings'];
-var state = { tab: 'overview', sessionId: null, status: null, projectDir: null, filesOffset: 0, filesMax: 0 };
+var state = { tab: 'overview', sessionId: null, status: null, projectDir: null, filesOffset: 0, filesMax: 0, piOffset: 0, piTotal: 0 };
 // Monotonic request generation: every load bumps it, responses from a
 // superseded load (tab switch, project-switch refetch, away-and-back) are
 // dropped. A tab-name check alone misses same-tab supersession.
@@ -319,28 +319,106 @@ function appendFiles() {
 }
 
 /* ── sessions ─────────────────────────────────────────────────────── */
+var PI_PAGE = 100;
+function piRowsHtml(pi) {
+  return pi.sessions.map(function (s) {
+    var label = s.name || s.firstMessage || '(unnamed)';
+    return '<tr title="' + esc(s.cwd + (s.name ? ' · ' + s.name : '')) + '">' +
+      '<td class="muted" style="white-space:nowrap">' + fmtWhen(s.modified) + '</td>' +
+      '<td><b>' + esc(s.project) + '</b></td>' +
+      '<td class="path" title="' + esc(s.firstMessage) + '">' + esc(label) + '</td>' +
+      '<td class="num">' + fmt(s.messageCount) + '</td>' +
+      '<td class="num">' + fmtK(s.tokens) + '</td>' +
+      '<td class="num">' + (s.cost > 0 ? fmtUsd(s.cost) : '<span class="muted">—</span>') + '</td></tr>';
+  }).join('');
+}
+function piTableHtml(pi) {
+  if (pi.sessions.length === 0) return '<div class="empty">No pi session files found.</div>';
+  return '<table><thead><tr><th>Modified</th><th>Project</th><th>Session</th>' +
+    '<th class="num">Msgs</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead>' +
+    '<tbody id="pi-body">' + piRowsHtml(pi) + '</tbody></table>' +
+    '<div class="muted" style="font-size:11px;margin-top:6px">' + fmt(pi.total) +
+    ' sessions across all projects · cost summed from each session file\'s usage entries (catalog rates)</div>';
+}
+function morePiHtml(pi) {
+  var remaining = pi.total - (pi.offset + pi.sessions.length);
+  if (remaining <= 0) return '';
+  var label = 'Show ' + fmt(remaining) + ' more sessions';
+  return '<div style="margin-top:12px"><button class="btn" id="pi-more" data-label="' + label + '">' + label + '</button></div>';
+}
+function appendPiSessions() {
+  var gen = ++loadToken;
+  var btn = $('pi-more');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; } // double-click must not re-request the same offset
+  api('/api/pi-sessions?limit=' + PI_PAGE + '&offset=' + state.piOffset).then(function (pi) {
+    if (gen !== loadToken) return;
+    var body = $('pi-body');
+    if (!body) return;
+    body.insertAdjacentHTML('beforeend', piRowsHtml(pi));
+    state.piOffset = pi.offset + pi.sessions.length;
+    var more = $('pi-more');
+    if (more) more.parentNode.remove();
+    var panel = body.closest('.panel');
+    if (panel) panel.insertAdjacentHTML('beforeend', morePiHtml(pi));
+    var next = $('pi-more');
+    if (next) next.onclick = appendPiSessions;
+  }).catch(function (e) {
+    if (gen !== loadToken) return;
+    var failed = $('pi-more');
+    if (failed) { failed.disabled = false; failed.textContent = failed.getAttribute('data-label') || 'Show more'; }
+    toast(e && e.message ? e.message : String(e));
+  });
+}
 function loadSessions() {
   var gen = ++loadToken;
-  api('/api/sessions').then(function (d) {
+  // The all-projects table (pi session files) and the captured-turns list
+  // (this extension's memory DB) load in parallel; either failing must not
+  // take the other down.
+  Promise.all([
+    api('/api/pi-sessions?limit=' + PI_PAGE).catch(function () { return null; }),
+    api('/api/sessions').catch(function () { return null; }),
+  ]).then(function (res) {
     if (gen !== loadToken) return; // superseded by a newer load
-    if (d.sessions.length === 0) { setMain('<div class="empty">No sessions recorded yet.</div>'); return; }
-    var items = d.sessions.map(function (s) {
-      var active = s.id === d.activeSessionId;
-      return '<div class="sess-item' + (s.id === state.sessionId ? ' active' : '') + '" data-id="' + esc(s.id) + '">' +
-        '<div><b>' + esc(s.project) + '</b> <span class="muted">· ' + esc(s.status) +
-          (active ? ' · current' : '') + '</span></div>' +
-        '<div class="when">' + fmtWhen(s.started_at) + ' · ' + s.promptCount + (s.promptCount === 1 ? ' prompt' : ' prompts') +
-          (s.rollup ? ' · ' + esc(String(s.rollup).slice(0, 80)) : '') + '</div></div>';
-    }).join('');
-    setMain('<div class="grid two-col"><div class="grid" id="sess-list" style="gap:8px">' + items + '</div>' +
-            '<div class="panel" id="sess-detail"><div class="empty">Select a session</div></div></div>');
-    Array.prototype.forEach.call(document.querySelectorAll('.sess-item'), function (el) {
-      el.onclick = function () { openSession(el.getAttribute('data-id')); };
-    });
-    // Keep the selection when it is still in the list; after a project switch
-    // the old session id is gone, so fall back to the newest.
-    var keep = state.sessionId && d.sessions.some(function (s) { return s.id === state.sessionId; });
-    openSession(keep ? state.sessionId : d.sessions[0].id, true);
+    var pi = res[0], d = res[1];
+    var html = '';
+    if (pi) {
+      state.piOffset = pi.offset + pi.sessions.length;
+      state.piTotal = pi.total;
+      html += '<div class="panel"><h2>All pi sessions</h2>' + piTableHtml(pi) + '</div>' + morePiHtml(pi);
+    }
+    if (!d) {
+      if (!pi) { setMain('<div class="empty">Session data unavailable.</div>'); return; }
+    } else if (d.sessions.length === 0) {
+      html += '<div class="empty">No captured turns yet — sessions appear here once this extension records them.</div>';
+      setMain(html);
+      var more0 = $('pi-more');
+      if (more0) more0.onclick = appendPiSessions;
+      return;
+    } else {
+      var items = d.sessions.map(function (s) {
+        var active = s.id === d.activeSessionId;
+        return '<div class="sess-item' + (s.id === state.sessionId ? ' active' : '') + '" data-id="' + esc(s.id) + '">' +
+          '<div><b>' + esc(s.project) + '</b> <span class="muted">· ' + esc(s.status) +
+            (active ? ' · current' : '') + '</span></div>' +
+          '<div class="when">' + fmtWhen(s.started_at) + ' · ' + s.promptCount + (s.promptCount === 1 ? ' prompt' : ' prompts') +
+            (s.rollup ? ' · ' + esc(String(s.rollup).slice(0, 80)) : '') + '</div></div>';
+      }).join('');
+      html += '<div class="panel" style="margin-top:14px;margin-bottom:10px"><h2>Captured turns · this project</h2></div>' +
+        '<div class="grid two-col"><div class="grid" id="sess-list" style="gap:8px">' + items + '</div>' +
+        '<div class="panel" id="sess-detail"><div class="empty">Select a session</div></div></div>';
+    }
+    setMain(html);
+    var moreBtn = $('pi-more');
+    if (moreBtn) moreBtn.onclick = appendPiSessions;
+    if (d && d.sessions.length > 0) {
+      Array.prototype.forEach.call(document.querySelectorAll('.sess-item'), function (el) {
+        el.onclick = function () { openSession(el.getAttribute('data-id')); };
+      });
+      // Keep the selection when it is still in the list; after a project switch
+      // the old session id is gone, so fall back to the newest.
+      var keep = state.sessionId && d.sessions.some(function (s) { return s.id === state.sessionId; });
+      openSession(keep ? state.sessionId : d.sessions[0].id, true);
+    }
   }).catch(function (e) { if (gen === loadToken) errPanel(e); });
 }
 

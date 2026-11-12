@@ -2,6 +2,36 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## 0.10.0 - 2026-11-12
+
+### Added
+
+- **`/context-usage` command**: tokens, cost, and context window for the
+  current session in one notification. The aggregation mirrors pi's own
+  `/session` accounting (assistant messages, nested-call tool results,
+  usage entries like cache warming, compaction summaries), so totals reflect
+  what was actually billed, not just what is still in context.
+  - **Cost**: pi's catalog cost when the provider reports one; otherwise an
+    estimate at the configured `pricing.*` rates, clearly labeled `est.`.
+  - Also shows context-window percentage, per-model cost split, and the
+    project's savings ledger line. No footer replacement: the built-in pi
+    footer keeps doing its job.
+- **Dashboard "All pi sessions" table**: the Sessions tab now lists every
+  pi session across all projects (the same source as pi's `/resume`
+  picker) with per-session message count, tokens, and catalog cost parsed
+  from each session file.
+  - Why: cross-project spend was invisible: pi only shows cost for the
+    current session. This answers "where did my tokens go this week?"
+    without opening each project.
+  - **Performance**: cost/token parsing runs only for the visible page
+    (100 rows, "show more" pagination, concurrency 8) and is cached per
+    file mtime+size; the session list itself is cached for 30 s, since
+    pi's `listAll` reads every file header (~2.4 s for 821 sessions
+    measured). Cold tab open stays a one-time cost, warm opens are
+    instant.
+  - Still strictly read-only: the scanner uses `SessionManager.listAll()`
+    and file reads only.
+
 ## 0.9.0 - 2026-11-08
 
 ### Added

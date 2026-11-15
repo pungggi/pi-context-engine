@@ -11,7 +11,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { openDatabase, type SqliteHandle } from "../sqlite.js";
+import { immediateTransaction, openDatabase, type SqliteHandle } from "../sqlite.js";
 import { batchedParams } from "../utils.js";
 import { parseContextHeaderUnit } from "../indexer/context-header.js";
 import type { Chunk, ChunkType } from "../types.js";
@@ -163,7 +163,7 @@ export class VectorStore {
 			"INSERT INTO chunks_vec(rowid, embedding) SELECT rowid, ? FROM chunks WHERE id = ?",
 		);
 
-		const run = this.db.transaction((items: Chunk[]) => {
+		const run = immediateTransaction(this.db, (items: Chunk[]) => {
 			for (const chunk of items) {
 				upsert.run(...this.chunkToRow(chunk));
 				delVec.run(chunk.id);
@@ -226,7 +226,7 @@ export class VectorStore {
 			`DELETE FROM chunk_compressions WHERE chunk_id IN (SELECT id FROM chunks WHERE file_path IN (${placeholders}))`,
 		);
 		const delChunks = this.db.prepare(`DELETE FROM chunks WHERE file_path IN (${placeholders})`);
-		const run = this.db.transaction((batches: string[][]) => {
+		const run = immediateTransaction(this.db, (batches: string[][]) => {
 			for (const batch of batches) {
 				delVec?.run(...batch);
 				delComp.run(...batch);

@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { openDatabase, type SqliteHandle } from "../sqlite.js";
+import { immediateTransaction, openDatabase, type SqliteHandle } from "../sqlite.js";
 import { batchedParams } from "../utils.js";
 
 const SCHEMA = `
@@ -66,7 +66,7 @@ export class EmbeddingCache {
 		const stmt = this.db.prepare(
 			"INSERT OR REPLACE INTO embedding_cache (content_hash, dim, embedding) VALUES (?, ?, ?)",
 		);
-		const run = this.db.transaction(() => {
+		const run = immediateTransaction(this.db, () => {
 			for (const { hash, embedding } of items) {
 				stmt.run(hash, embedding.length, pack(embedding));
 			}
@@ -98,7 +98,7 @@ export class EmbeddingCache {
 		);
 		const orphans = current.filter((h) => !knownHashes.has(h));
 		if (orphans.length === 0) return 0;
-		const run = this.db.transaction((batches: string[][]) => {
+		const run = immediateTransaction(this.db, (batches: string[][]) => {
 			for (const batch of batches) {
 				const ph = batch.map(() => "?").join(",");
 				this.db.prepare(`DELETE FROM embedding_cache WHERE content_hash IN (${ph})`).run(...batch);

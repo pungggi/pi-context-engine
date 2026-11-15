@@ -244,7 +244,12 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			.autoIndexOnce()
 			.then((result) => {
 				if (!result || !notify || engine !== eng) return; // session moved on
-				if (result.errors.length > 0) {
+				if (result.skippedByOtherSession) {
+					// Another session on this project holds the index lock; its
+					// incremental run covers the same files, so skipping is correct.
+					// autoIndexOnce un-consumed its one-shot, so a later kick retries.
+					notify(`Context index: another session is indexing ${eng.projectName} — skipping this run`, "info");
+				} else if (result.errors.length > 0) {
 					notify(`Context index: background index hit ${result.errors.length} error(s)`, "warning");
 				} else if (result.indexed > 0) {
 					notify(`Context index updated: ${result.indexed} file(s), ${result.chunks} chunk(s)`, "info");
@@ -606,6 +611,16 @@ export default function contextEngineExtension(pi: ExtensionAPI) {
 			const full = args.includes("--full");
 			ctx.ui.notify(full ? "Re-indexing everything…" : "Indexing (incremental)…", "info");
 			const result = await eng.reindex({ full });
+			if (result.skippedByOtherSession) {
+				// Cross-process index lock busy (waited 10s): the other session's
+				// incremental run covers the same files — report instead of stacking
+				// a duplicate run behind it.
+				ctx.ui.notify(
+					`Skipped — another pi session is indexing ${eng.projectName}. Its run covers the same files; run /context-index again shortly if you still need this one.`,
+					"warning",
+				);
+				return;
+			}
 			ctx.ui.notify(
 				`Indexed ${result.indexed} file(s), ${result.chunks} chunk(s)` +
 					(result.errors.length > 0 ? ` · ${result.errors.length} error(s)` : ""),

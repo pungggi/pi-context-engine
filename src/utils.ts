@@ -14,6 +14,17 @@ export function* batchedParams<T>(items: readonly T[], size = SQL_PARAM_BATCH): 
 	}
 }
 
+/**
+ * Retry budget for the rename in `atomicWriteText`. Windows rename fails with
+ * EPERM/EACCES/EBUSY while another process holds the temp or the destination
+ * open without share-delete — antivirus scanners, search indexers and backup
+ * tools do this for momentary blips, and a failed rename used to fail the
+ * whole indexing run. The holds are short; a bounded retry absorbs them.
+ */
+const ATOMIC_WRITE_ATTEMPTS = 8;
+const ATOMIC_WRITE_BACKOFF_START_MS = 40;
+const ATOMIC_WRITE_BACKOFF_CAP_MS = 400;
+
 /** Write `data` to `path` via tempfile + rename so a crash can't leave a truncated file. */
 export function atomicWriteText(filePath: string, data: string): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -23,7 +34,22 @@ export function atomicWriteText(filePath: string, data: string): void {
 	);
 	try {
 		fs.writeFileSync(tmp, data, "utf-8");
-		fs.renameSync(tmp, filePath);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				fs.renameSync(tmp, filePath);
+				return;
+			} catch (err) {
+				const code = (err as NodeJS.ErrnoException).code;
+				const transient = code === "EPERM" || code === "EACCES" || code === "EBUSY";
+				if (!transient || attempt >= ATOMIC_WRITE_ATTEMPTS - 1) throw err;
+				// Synchronous exponential backoff: 40ms → 400ms, ~1.6s total budget.
+				const backoff = Math.min(
+					ATOMIC_WRITE_BACKOFF_CAP_MS,
+					ATOMIC_WRITE_BACKOFF_START_MS * 1.5 ** attempt,
+				);
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, backoff);
+			}
+		}
 	} catch (err) {
 		try {
 			fs.unlinkSync(tmp);

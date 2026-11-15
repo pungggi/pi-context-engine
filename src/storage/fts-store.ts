@@ -3,7 +3,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { openDatabase, type SqliteHandle } from "../sqlite.js";
+import { immediateTransaction, openDatabase, type SqliteHandle } from "../sqlite.js";
 import { batchedParams } from "../utils.js";
 import type { Chunk } from "../types.js";
 
@@ -95,7 +95,7 @@ export class FTSStore {
 		const ins = this.db.prepare(
 			"INSERT INTO chunks_fts(id, content, file_path, language, chunk_type) VALUES (?, ?, ?, ?, ?)",
 		);
-		const run = this.db.transaction((items: (string | number)[][]) => {
+		const run = immediateTransaction(this.db, (items: (string | number)[][]) => {
 			for (const row of items) {
 				del.run(row[0]);
 				ins.run(...row);
@@ -131,7 +131,7 @@ export class FTSStore {
 		const del = this.db.prepare(
 			`DELETE FROM chunks_fts WHERE file_path IN (${filePaths.map(() => "?").join(",")})`,
 		);
-		const run = this.db.transaction((batches: string[][]) => {
+		const run = immediateTransaction(this.db, (batches: string[][]) => {
 			for (const batch of batches) del.run(...batch);
 		});
 		run([...batchedParams(filePaths)]);

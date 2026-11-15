@@ -2,7 +2,7 @@
  * Graph store (nodes + edges) — port of upstream `storage/graph_store.py` (MIT).
  */
 import path from "node:path";
-import { openDatabase, type SqliteHandle } from "../sqlite.js";
+import { immediateTransaction, openDatabase, type SqliteHandle } from "../sqlite.js";
 import { batchedParams } from "../utils.js";
 import type { EdgeType, GraphEdge, GraphNode, NodeType } from "../types.js";
 
@@ -61,7 +61,7 @@ export class GraphStore {
 		const insEdge = this.db.prepare(
 			"INSERT OR REPLACE INTO edges (source_id, target_id, edge_type, properties) VALUES (?, ?, ?, ?)",
 		);
-		const run = this.db.transaction(() => {
+		const run = immediateTransaction(this.db, () => {
 			for (const n of nodes) {
 				insNode.run(n.id, n.nodeType, n.name, n.filePath, JSON.stringify(n.properties));
 			}
@@ -206,7 +206,7 @@ export class GraphStore {
 			set.add(tgt);
 		}
 
-		const run = this.db.transaction(() => {
+		const run = immediateTransaction(this.db, () => {
 			this.db.exec("DELETE FROM pagerank");
 			if (nodes.size === 0) return;
 			const d = 0.85;
@@ -293,7 +293,7 @@ export class GraphStore {
 			inc.push(e.source_id);
 		}
 
-		const run = this.db.transaction(() => {
+		const run = immediateTransaction(this.db, () => {
 			this.db.exec("DELETE FROM pagerank_nodes");
 			if (nodes.size === 0 || edges === 0) return;
 			const d = 0.85;
@@ -348,7 +348,7 @@ export class GraphStore {
 
 	deleteByFiles(filePaths: string[]): void {
 		if (filePaths.length === 0) return;
-		const run = this.db.transaction((batches: string[][]) => {
+		const run = immediateTransaction(this.db, (batches: string[][]) => {
 			for (const batch of batches) {
 				const ph = batch.map(() => "?").join(",");
 				const nodeIds = (

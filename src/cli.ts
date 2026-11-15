@@ -56,7 +56,14 @@ export interface CliEngine {
 	reindex(opts: {
 		full?: boolean;
 		onProgress?: (msg: string) => void;
-	}): Promise<{ indexed: number; chunks: number; deleted: number; skipped: number; errors: string[] }>;
+	}): Promise<{
+		indexed: number;
+		chunks: number;
+		deleted: number;
+		skipped: number;
+		errors: string[];
+		skippedByOtherSession?: boolean;
+	}>;
 	shutdown(): Promise<void>;
 }
 
@@ -201,6 +208,12 @@ export async function runCli(
 					full: parsed.full,
 					onProgress: (msg) => io.err(msg), // stdout stays machine-readable
 				});
+				if (result.skippedByOtherSession) {
+					// Cross-process index lock busy: a pi session is indexing this
+					// project and its incremental pass covers the same files.
+					say("Index skipped — another session is indexing this project; try again shortly");
+					return 0;
+				}
 				const parts = [`Indexed ${result.indexed} file(s), ${result.chunks} chunk(s)`];
 				if (result.deleted > 0) parts.push(`pruned stale: ${result.deleted}`);
 				if (result.skipped > 0) parts.push(`skipped: ${result.skipped}`);

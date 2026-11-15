@@ -2,6 +2,38 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## 0.10.1 - 2026-11-15
+
+### Fixed
+
+- **Multiple sessions on one project no longer fail with "database is
+  locked".** Three coordinated changes:
+  - **All write transactions now start `BEGIN IMMEDIATE`** (previously
+    deferred). A deferred read-then-write transaction fails instantly when
+    another connection grabbed the write lock in between, because SQLite
+    deliberately bypasses `busy_timeout` for lock upgrades (upgrading could
+    deadlock). Immediate transactions queue at BEGIN and the busy timeout
+    covers the wait.
+  - **`busy_timeout` raised 5 s → 15 s** (env `PCE_BUSY_TIMEOUT_MS`), so a
+    concurrent indexing burst from another session rides out instead of
+    erroring.
+  - **New cross-process index lock** (`index.lock` in the storage dir,
+    `indexer/index-lock.ts`): only one session indexes at a time, which also
+    stops the duplicated embedding work every session used to do on start.
+    Other sessions' automatic runs skip instantly with a status line and
+    retry on their next kick; manual `/context-index` waits up to 10 s
+    (`PCE_INDEX_LOCK_WAIT_MS`) and then reports the skip; `/context-index
+    --reset` reports the holder PID instead of failing per-file on locked
+    targets. Stale locks (holder process gone, or lock older than 15 min)
+    are stolen automatically, so a crashed session cannot wedge the project.
+- **Manifest/session writes survive Windows file-lock blips.** The atomic
+  write (tempfile + rename) used to fail the whole reindex with
+  `EPERM: operation not permitted, rename …` when an antivirus scanner,
+  search indexer or backup tool briefly held the temp or destination file
+  open without share-delete. The rename now retries EPERM/EACCES/EBUSY
+  with exponential backoff (~1.6 s budget, 8 attempts) before giving up,
+  so a scanner blip no longer kills an indexing run.
+
 ## 0.10.0 - 2026-11-12
 
 ### Added

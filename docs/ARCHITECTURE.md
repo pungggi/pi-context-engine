@@ -46,6 +46,7 @@ sessions/*.json       readable session archive (also feeds recall)
 manifest.json         content hash per file → incremental indexing
 embedding_cache.db    SHA-256(content) → vector, salted with backend identity
 stats.json            query and token totals
+index.lock            cross-process indexing gate (exists only mid-run)
 ```
 
 **Why several databases:** the vector store and the FTS store are written with
@@ -87,3 +88,29 @@ The package works without optional pieces instead of failing:
 - **No memory db open** → recall falls back to the JSON session archive.
 - **Empty index** → first search returns a status line and indexes in the
   background rather than blocking the turn.
+
+## Concurrency across sessions
+
+Multiple pi sessions can work on one project at the same time, and they share
+one storage dir (sqlite files + manifest). Three mechanisms keep that safe:
+
+- **BEGIN IMMEDIATE for every write transaction** (`immediateTransaction` in
+  `sqlite.ts`): a deferred read-then-write transaction fails with `database is
+  locked` instantly under writer contention, because SQLite deliberately
+  bypasses `busy_timeout` on lock upgrades (an upgrade can deadlock). Taking
+  the write lock at BEGIN means concurrent writers queue instead of erroring.
+- **`busy_timeout` of 15 s** (`PCE_BUSY_TIMEOUT_MS` overrides) so indexing
+  bursts from another session ride out instead of surfacing as errors.
+- **Cross-process index lock** (`indexer/index-lock.ts`): the whole indexing
+  run holds an `index.lock` lockfile (exclusive-create, so acquisition is
+  atomic). Stale locks are stolen when the holder's PID is dead or the lock
+  outlives 15 minutes, so a crashed session cannot wedge the project.
+  - **Automatic runs** (`autoIndexOnce`, watcher, lazy kick) skip instantly:
+    the other session's incremental pass covers the same files, and the
+    skipped engine un-consumes its one-shot so a later kick retries.
+  - **Manual `/context-index`** waits up to 10 s (`PCE_INDEX_LOCK_WAIT_MS`)
+    for the peer run, then reports the skip.
+  - **`/context-index --reset`** reports the holder PID instead of deleting
+    files out from under a live run.
+
+WAL mode means readers (search) are never blocked by any of this.

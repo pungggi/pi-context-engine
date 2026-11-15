@@ -17,6 +17,7 @@ import { EmbeddingCache } from "./embedding-cache.js";
 import { Manifest, CURRENT_SCHEMA_VERSION } from "./manifest.js";
 import { loadIgnorePatterns, matchesAny } from "./ignorefile.js";
 import { isSecretFile, redactSecrets } from "./secrets.js";
+import { acquireIndexLock } from "./index-lock.js";
 import { LocalBackend } from "../storage/local-backend.js";
 import type { Chunk, ChunkType, GraphEdge, GraphNode, NodeType } from "../types.js";
 import { resolveOllamaUrl, ROOT_ONLY_IGNORE } from "../config.js";
@@ -141,6 +142,28 @@ export interface IndexResult {
 	errors: string[];
 	cacheHits: number;
 	cacheMisses: number;
+	/**
+	 * True when the run was skipped because another pi session on this project
+	 * holds the cross-process index lock (src/indexer/index-lock.ts). All result
+	 * fields are then empty: nothing was read or written.
+	 */
+	crossProcessSkipped?: boolean;
+}
+
+/** Empty result shape, used verbatim when a run skips on the cross-process lock. */
+const EMPTY_INDEX_RESULT: IndexResult = {
+	indexedFiles: [],
+	skippedFiles: [],
+	deletedFiles: [],
+	totalChunks: 0,
+	errors: [],
+	cacheHits: 0,
+	cacheMisses: 0,
+};
+
+/** How long a manual /context-index waits for another session's run before skipping. */
+function manualLockWaitMs(): number {
+	return Math.max(0, Number(process.env.PCE_INDEX_LOCK_WAIT_MS ?? 10_000) || 10_000);
 }
 
 export interface IndexCallbacks {
@@ -407,6 +430,8 @@ export async function indexCommits(
 /**
  * Per-storage-dir indexing lock so concurrent reindex runs (auto-index kick,
  * lazy search kick, file watcher, manual /context-index) can't interleave.
+ * In-process only — `acquireIndexLock` (index-lock.ts) is the cross-process
+ * complement for multiple pi sessions on the same project.
  */
 const pipelineLocks = new Map<string, Promise<unknown>>();
 
@@ -434,6 +459,12 @@ export async function runIndexing(
 		targetPath?: string | null;
 		/** Automatic full-project runs only. Stop before migrations when the workspace exceeds this budget. */
 		maxAutoFiles?: number;
+		/**
+		 * Automatic (background) run: on cross-process lock contention, skip
+		 * immediately instead of waiting — the other session's run covers the
+		 * same files. See runIndexing's body and index-lock.ts.
+		 */
+		automatic?: boolean;
 		callbacks?: IndexCallbacks;
 		/** Reuse an already-constructed backend/embedder (the long-lived server path);
 		 * a null backend falls through to a fresh LocalBackend (used by resetIndex). */
@@ -444,9 +475,21 @@ export async function runIndexing(
 	const storageBase = projectStorageDir(config.storagePath, projectDir);
 	fs.mkdirSync(storageBase, { recursive: true });
 
-	return withPipelineLock(storageBase, () =>
-		runIndexingLocked(config, projectDir, storageBase, options, options.runtime),
-	);
+	return withPipelineLock(storageBase, async () => {
+		// Cross-process gate (the pipeline lock above only serializes THIS
+		// process): another pi session on the same project may be mid-run.
+		// Automatic runs yield instantly — the other session's incremental run
+		// covers the same files and manifest state converges, so skipping is
+		// correct, not just cheap. Manual runs wait briefly for a peer run that
+		// is about to finish, then report the skip instead of duplicating work.
+		const acquired = acquireIndexLock(storageBase, options.automatic ? 0 : manualLockWaitMs());
+		if ("busy" in acquired) return { ...EMPTY_INDEX_RESULT, crossProcessSkipped: true };
+		try {
+			return await runIndexingLocked(config, projectDir, storageBase, options, options.runtime);
+		} finally {
+			acquired.lock.release();
+		}
+	});
 }
 
 async function runIndexingLocked(

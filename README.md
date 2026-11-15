@@ -123,6 +123,13 @@ unchanged repo took 237 ms.
   Migration runs (schema reset, embedding-dimension change) are exempt: their
   manifest stays untouched on disk until the run completes, so an interrupted
   migration resumes cleanly instead of stranding stale rows.
+- **Multi-session safe**: several pi sessions on one project share one index
+  without "database is locked" errors. Write transactions start `BEGIN
+  IMMEDIATE`, so concurrent writers queue instead of failing, and a
+  cross-process `index.lock` lets only one session index at a time. Other
+  sessions' background runs skip with a status line and retry later, manual
+  `/context-index` waits up to 10 s before skipping, and `--reset` reports
+  the holder PID instead of deleting under a live run.
 - **One-command reset**: `/context-index --reset` deletes the index through the
   engine while the session is running: sqlite handles are closed first, so it
   succeeds where manual deletion of the storage directory fails with locked

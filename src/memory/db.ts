@@ -8,7 +8,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { openDatabase, type SqliteHandle } from "../sqlite.js";
+import { immediateTransaction, openDatabase, type SqliteHandle } from "../sqlite.js";
 import { batchedParams, epochSeconds } from "../utils.js";
 import { redactPii } from "../indexer/secrets.js";
 import type { Embedder } from "../indexer/embedder.js";
@@ -222,7 +222,7 @@ export class MemoryDb {
 		// migrations. Vec tables are created whenever sqlite-vec is available
 		// (and skipped when it isn't), which subsumes the old "created without
 		// vec, upgrade later" version dance.
-		const run = this.db.transaction(() => {
+		const run = immediateTransaction(this.db, () => {
 			this.db.exec(SCHEMA_V1);
 			this.applyDecisionColumns();
 			this.db.exec(SCHEMA_V3);
@@ -772,7 +772,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_vec USING vec0(embedding float
 		const update = this.db.prepare(
 			"UPDATE tool_event_payloads SET raw_input = '', raw_output = NULL, size_bytes = 0 WHERE id = ?",
 		);
-		const run = this.db.transaction(() => {
+		const run = immediateTransaction(this.db, () => {
 			for (const r of rows) update.run(r.id);
 		});
 		run();
@@ -804,7 +804,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turn_summaries_vec USING vec0(embedding float
 			return rows.length;
 		};
 
-		const run = this.db.transaction(() => {
+		const run = immediateTransaction(this.db, () => {
 			counts.turnsPruned = harvest("turn_summaries", ["id", "session_id", "prompt_number", "summary", "tier", "created_at_epoch"], now - turnDays * 86400);
 			counts.decisionsPruned = harvest("decisions", ["id", "session_id", "decision", "reason", "source", "created_at_epoch", "created_at"], now - decisionDays * 86400);
 			counts.codeAreasPruned = harvest("code_areas", ["id", "session_id", "file_path", "description", "source", "created_at_epoch"], now - codeAreaDays * 86400);

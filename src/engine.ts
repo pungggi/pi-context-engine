@@ -21,6 +21,7 @@ import { drainOne, enqueueSessionRollup, enqueueTurn, type CompressionDeps } fro
 import { compress, expand, compressWithCounts, DEFAULT_LEVEL } from "./memory/grammar.js";
 import { cosine } from "./memory/extractive.js";
 import { AutomaticIndexFileLimitError, runIndexing, withPipelineLock } from "./indexer/pipeline.js";
+import { acquireIndexLock } from "./indexer/index-lock.js";
 import { getModelPricing } from "./pricing.js";
 import type { Chunk } from "./types.js";
 
@@ -382,7 +383,27 @@ export class ContextEngine {
 	 * instead of failing the whole reset.
 	 */
 	async resetIndex(): Promise<{ deletedFiles: number; freedBytes: number; errors: string[] }> {
-		return withPipelineLock(this.storageBase, () => this.resetIndexLocked());
+		return withPipelineLock(this.storageBase, async () => {
+			// Cross-process gate: deleting db files out from under another
+			// session's indexing run just fails per-file with locked-target
+			// errors. Detect the holder up front and report precisely instead.
+			const acquired = acquireIndexLock(this.storageBase, 0);
+			if ("busy" in acquired) {
+				const holder = acquired.busy.holderPid != null ? ` (pid ${acquired.busy.holderPid})` : "";
+				return {
+					deletedFiles: 0,
+					freedBytes: 0,
+					errors: [
+						`index lock held by another session${holder} — wait for its indexing to finish, then run /context-index --reset again`,
+					],
+				};
+			}
+			try {
+				return await this.resetIndexLocked();
+			} finally {
+				acquired.lock.release();
+			}
+		});
 	}
 
 	private async resetIndexLocked(): Promise<{ deletedFiles: number; freedBytes: number; errors: string[] }> {
@@ -463,6 +484,7 @@ export class ContextEngine {
 		deleted: number;
 		skipped: number;
 		errors: string[];
+		skippedByOtherSession?: boolean;
 	}> {
 		const result = await runIndexing(this.config, this.projectDir, {
 			full: options.full,
@@ -471,9 +493,22 @@ export class ContextEngine {
 				options.automatic && !options.targetPath && this.config.indexerMaxAutoFiles > 0
 					? this.config.indexerMaxAutoFiles
 					: undefined,
+			automatic: options.automatic,
 			callbacks: { phase: options.onProgress },
 			runtime: this.injectedRuntime,
 		});
+		if (result.crossProcessSkipped) {
+			// Nothing ran; do not touch backend/retriever state (recomputePriors
+			// would even lazily open sqlite handles just to recompute nothing).
+			return {
+				indexed: 0,
+				chunks: 0,
+				deleted: 0,
+				skipped: 0,
+				errors: [],
+				skippedByOtherSession: true,
+			};
+		}
 		// R7: graph edges changed → refresh the PageRank prior and force the
 		// retriever to pick it up on the next query.
 		this.backend.recomputePriors();
@@ -505,11 +540,17 @@ export class ContextEngine {
 		deleted: number;
 		skipped: number;
 		errors: string[];
+		skippedByOtherSession?: boolean;
 	} | null> {
 		if (!this.config.indexerAutoIndex || this.autoIndexDone) return null;
 		this.autoIndexDone = true;
 		try {
-			return await this.reindex({ automatic: true });
+			const result = await this.reindex({ automatic: true });
+			// A cross-process skip is NOT a completed run: another session was
+			// indexing, so this engine may still have files to pick up later.
+			// Un-consume the one-shot so a later search or watcher kick retries.
+			if (result.skippedByOtherSession) this.autoIndexDone = false;
+			return result;
 		} catch (err) {
 			// A workspace-size refusal is a stable policy decision, not a
 			// transient embedding failure. Do not retry it on every lazy search.

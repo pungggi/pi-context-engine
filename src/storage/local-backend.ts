@@ -28,6 +28,13 @@ export class LocalBackend {
 		this.graphStore.ingest(nodes, edges);
 	}
 
+	/** Best-effort passive WAL checkpoints on all three stores (after a finished indexing run). */
+	checkpointWals(): void {
+		this.vectorStore.checkpointWal();
+		this.ftsStore.checkpointWal();
+		this.graphStore.checkpointWal();
+	}
+
 	vectorSearch(queryEmbedding: readonly number[], topK = 10, filters?: { filePath?: string }): Chunk[] {
 		return this.vectorStore.search(queryEmbedding, topK, filters);
 	}

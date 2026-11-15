@@ -21,7 +21,7 @@ import { drainOne, enqueueSessionRollup, enqueueTurn, type CompressionDeps } fro
 import { compress, expand, compressWithCounts, DEFAULT_LEVEL } from "./memory/grammar.js";
 import { cosine } from "./memory/extractive.js";
 import { AutomaticIndexFileLimitError, runIndexing, withPipelineLock } from "./indexer/pipeline.js";
-import { acquireIndexLock } from "./indexer/index-lock.js";
+import { acquireIndexLock, readIndexLockState } from "./indexer/index-lock.js";
 import { getModelPricing } from "./pricing.js";
 import type { Chunk } from "./types.js";
 
@@ -121,6 +121,8 @@ export interface SessionStats {
 	rawTokens: number;
 	servedTokens: number;
 	fullFileTokens: number;
+	/** Times an indexing run was skipped because another session held the index lock. */
+	crossProcessSkips?: number;
 }
 
 export interface EngineOptions {
@@ -325,12 +327,13 @@ export class ContextEngine {
 					rawTokens: data.rawTokens ?? 0,
 					servedTokens: data.servedTokens ?? 0,
 					fullFileTokens: data.fullFileTokens ?? 0,
+					crossProcessSkips: data.crossProcessSkips ?? 0,
 				};
 			}
 		} catch {
 			// fall through to defaults
 		}
-		return { queries: 0, rawTokens: 0, servedTokens: 0, fullFileTokens: 0 };
+		return { queries: 0, rawTokens: 0, servedTokens: 0, fullFileTokens: 0, crossProcessSkips: 0 };
 	}
 
 	private saveStats(): void {
@@ -387,7 +390,7 @@ export class ContextEngine {
 			// Cross-process gate: deleting db files out from under another
 			// session's indexing run just fails per-file with locked-target
 			// errors. Detect the holder up front and report precisely instead.
-			const acquired = acquireIndexLock(this.storageBase, 0);
+			const acquired = await acquireIndexLock(this.storageBase, 0);
 			if ("busy" in acquired) {
 				const holder = acquired.busy.holderPid != null ? ` (pid ${acquired.busy.holderPid})` : "";
 				return {
@@ -498,6 +501,10 @@ export class ContextEngine {
 			runtime: this.injectedRuntime,
 		});
 		if (result.crossProcessSkipped) {
+			// Count and persist the skip so statusText can show how often another
+			// session's run won the lock (observability for multi-session setups).
+			this.stats.crossProcessSkips = (this.stats.crossProcessSkips ?? 0) + 1;
+			this.saveStats();
 			// Nothing ran; do not touch backend/retriever state (recomputePriors
 			// would even lazily open sqlite handles just to recompute nothing).
 			return {
@@ -513,6 +520,13 @@ export class ContextEngine {
 		// retriever to pick it up on the next query.
 		this.backend.recomputePriors();
 		this.retrieverInstance = null;
+		// Bound the -wal files after a write-heavy run. Passive checkpoints never
+		// block readers; journal_size_limit (openDatabase) caps what survives.
+		try {
+			this.backend.checkpointWals();
+		} catch {
+			// best-effort
+		}
 		return {
 			indexed: result.indexedFiles.length,
 			chunks: result.totalChunks,
@@ -1477,6 +1491,19 @@ export class ContextEngine {
 			);
 		} else {
 			parts.push("Token savings: waiting for the first context_search call.");
+		}
+		// Cross-process lock visibility: this is where a multi-session setup shows
+		// whether indexing is currently serialized (and by whom) without opening
+		// the lockfile by hand.
+		const lockState = readIndexLockState(this.storageBase);
+		if (lockState) {
+			const age = lockState.ageMs < 60_000 ? `${Math.round(lockState.ageMs / 1000)}s` : `${Math.round(lockState.ageMs / 60_000)}m`;
+			parts.push(`Index lock: held by pid ${lockState.holderPid} (${age})`);
+		} else {
+			parts.push("Index lock: free");
+		}
+		if ((stats.crossProcessSkips ?? 0) > 0) {
+			parts.push(`Index runs skipped for the other session's lock: ${stats.crossProcessSkips}`);
 		}
 		return parts.join("\n");
 	}

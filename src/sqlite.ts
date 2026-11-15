@@ -83,6 +83,10 @@ export function openDatabase(file: string): { db: SqliteHandle; hasVec: boolean 
 	db.pragma("journal_mode = WAL");
 	db.pragma("synchronous = NORMAL");
 	db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+	// Keep the -wal file bounded: embedding batches are multi-MB and busy
+	// periods can outpace the auto-checkpoint. The limit truncates the WAL
+	// after checkpoints (passive checkpoints after indexing runs do the rest).
+	db.pragma("journal_size_limit = 33554432");
 	let hasVec = false;
 	const vecPath = sqliteVecPath();
 	if (vecPath) {

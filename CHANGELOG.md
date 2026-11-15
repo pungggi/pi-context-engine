@@ -2,6 +2,33 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## 0.10.2 - 2026-11-15
+
+### Added
+
+- **Pipelined indexing batches**: batch N+1's prep (file reads, tree-sitter
+  parsing) now runs inside batch N's embed wait, and batch N's sqlite ingest
+  slots between the two embeds (one embed in flight at a time). Cold-start
+  index time is embed-bound, so this shortens wall time meaningfully and
+  shrinks the cross-process lock hold for everyone else. Manifest
+  checkpointing still happens only after a batch's ingest, so interrupted
+  runs resume exactly as before.
+- **Lock observability**: `/context-status` (and `status_text`) now shows the
+  cross-process index lock state — `held by pid N (age)` or `free` — plus a
+  counter of how many indexing runs were skipped because another session
+  held the lock. Why: multi-session setups could only diagnose a stuck
+  holder by opening `index.lock` by hand.
+
+### Changed
+
+- **Async lock wait**: while a manual `/context-index` waits up to 10 s for
+  another session's indexing run, pi's event loop now stays responsive
+  (the poll used to block it with a synchronous sleep).
+- **WAL hygiene**: every sqlite handle now sets `journal_size_limit` (32 MB)
+  and each finished indexing run issues passive checkpoints on the vector,
+  FTS and graph stores. Why: multi-MB embedding batches could balloon the
+  `-wal` files between auto-checkpoints.
+
 ## 0.10.1 - 2026-11-15
 
 ### Fixed

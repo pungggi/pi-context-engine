@@ -392,6 +392,19 @@ export class GraphStore {
 		this.db.exec("DELETE FROM pagerank_nodes");
 	}
 
+	/**
+	 * Best-effort passive WAL checkpoint after a finished indexing run: bounds
+	 * the -wal file without ever blocking readers (journal_size_limit in
+	 * openDatabase caps what survives when a checkpoint can't run).
+	 */
+	checkpointWal(): void {
+		try {
+			this.db.pragma("wal_checkpoint(PASSIVE)");
+		} catch {
+			// another connection may hold the WAL — best-effort
+		}
+	}
+
 	close(): void {
 		this.db.close();
 	}

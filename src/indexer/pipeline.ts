@@ -166,6 +166,17 @@ function manualLockWaitMs(): number {
 	return Math.max(0, Number(process.env.PCE_INDEX_LOCK_WAIT_MS ?? 10_000) || 10_000);
 }
 
+/** One batch, prepped (read, chunked, graph arrays built) but not yet embedded/ingested. */
+interface PreparedBatch {
+	batchChunks: Chunk[];
+	batchNodes: GraphNode[];
+	batchEdges: GraphEdge[];
+	batchFilesToReplace: string[];
+	batchManifestUpdates: [string, string][];
+	batchIndexed: string[];
+	toChunk: { filePath: string; relPath: string; content: string; contentHash: string; language: string }[];
+}
+
 export interface IndexCallbacks {
 	log?: (msg: string) => void;
 	progress?: (current: number, total: number) => void;
@@ -482,7 +493,7 @@ export async function runIndexing(
 		// covers the same files and manifest state converges, so skipping is
 		// correct, not just cheap. Manual runs wait briefly for a peer run that
 		// is about to finish, then report the skip instead of duplicating work.
-		const acquired = acquireIndexLock(storageBase, options.automatic ? 0 : manualLockWaitMs());
+		const acquired = await acquireIndexLock(storageBase, options.automatic ? 0 : manualLockWaitMs());
 		if ("busy" in acquired) return { ...EMPTY_INDEX_RESULT, crossProcessSkipped: true };
 		try {
 			return await runIndexingLocked(config, projectDir, storageBase, options, options.runtime);
@@ -769,7 +780,12 @@ async function runIndexingLocked(
 			lastManifestCheckpoint = now;
 		};
 
-		for (let batchIndex = 0; batchIndex < fileList.length; batchIndex += BATCH) {
+		/**
+		 * Prep one batch (reads, chunking, graph arrays) without embedding it.
+		 * The caller keeps at most one embed in flight so this prep — the
+		 * expensive sync work — runs inside the previous batch's embed wait.
+		 */
+		const prepBatch = async (batchIndex: number): Promise<PreparedBatch> => {
 			// Cooperative yield: the loops below do sync I/O, tree-sitter parsing
 			// and ONNX inference on the main thread. Without a breather per unit
 			// of work the pi UI starves for the whole run (bench-event-loop.mts:
@@ -950,31 +966,67 @@ async function runIndexingLocked(
 
 			progress?.(Math.min(batchIndex + batchPaths.length, fileList.length), fileList.length);
 
-			if (batchChunks.length > 0) {
+			return { batchChunks, batchNodes, batchEdges, batchFilesToReplace, batchManifestUpdates, batchIndexed, toChunk };
+		};
+
+		/** Ingest a prepared batch. Its embed already resolved (or was not needed). */
+		const finishBatch = (b: PreparedBatch, stats: { hits: number; misses: number }): void => {
+			totalCacheHits += stats.hits;
+			totalCacheMisses += stats.misses;
+			if (b.batchChunks.length > 0) {
+				// Per-batch deletes happen AFTER embed succeeds, so an embed failure
+				// can never wipe previously-indexed rows.
+				backend.deleteByFiles(b.batchFilesToReplace);
+				backend.ingest(b.batchChunks, b.batchNodes, b.batchEdges);
+			} else if (b.batchFilesToReplace.length > 0) {
+				backend.deleteByFiles(b.batchFilesToReplace);
+			}
+			if (b.batchChunks.length > 0 || b.batchFilesToReplace.length > 0) {
+				for (const [rel, hash] of b.batchManifestUpdates) manifest.update(rel, hash);
+				result.indexedFiles.push(...b.batchIndexed);
+				result.totalChunks += b.batchChunks.length;
+			}
+			result.skippedFiles.push(...b.toChunk.filter((t) => !b.batchIndexed.includes(t.relPath)).map((t) => t.relPath));
+			if (b.batchManifestUpdates.length > 0) checkpointManifest();
+		};
+
+		/** Start the embed WITHOUT awaiting it: its wait is where the next batch's prep runs. */
+		const startEmbed = (b: PreparedBatch, batchIndex: number): Promise<{ hits: number; misses: number }> => {
+			return (async () => {
 				const { embedder: emb, cache: cch } = await ensureEmbedder();
 				manifest.embeddingDim = emb.dimension;
 				if (phase && !announced) {
-					phase(`Embedding ${batchChunks.length.toLocaleString()} chunks${totalBatches > 1 ? ` (batch ${Math.floor(batchIndex / BATCH) + 1}/${totalBatches})` : ""}…`);
+					phase(`Embedding ${b.batchChunks.length.toLocaleString()} chunks${totalBatches > 1 ? ` (batch ${Math.floor(batchIndex / BATCH) + 1}/${totalBatches})` : ""}…`);
 					announced = true;
 				}
-				const stats = await embedChunks(batchChunks, emb, cch);
-				totalCacheHits += stats.hits;
-				totalCacheMisses += stats.misses;
-				// Per-batch deletes happen AFTER embed succeeds, so an embed failure
-				// can never wipe previously-indexed rows.
-				backend.deleteByFiles(batchFilesToReplace);
-				backend.ingest(batchChunks, batchNodes, batchEdges);
-				for (const [rel, hash] of batchManifestUpdates) manifest.update(rel, hash);
-				result.indexedFiles.push(...batchIndexed);
-				result.totalChunks += batchChunks.length;
-			} else if (batchFilesToReplace.length > 0) {
-				backend.deleteByFiles(batchFilesToReplace);
-				for (const [rel, hash] of batchManifestUpdates) manifest.update(rel, hash);
-				result.indexedFiles.push(...batchIndexed);
+				return embedChunks(b.batchChunks, emb, cch);
+			})();
+		};
+
+		// Pipelined driver: while batch N's embed is in flight (the network/CPU
+		// wait), batch N+1's prep — file reads and tree-sitter parsing — runs on
+		// the main thread, and batch N's sqlite ingest happens between embeds.
+		// One embed in flight at a time; manifest is only updated after ingest,
+		// so an interrupted run resumes exactly like the sequential version.
+		let carry: { prepared: PreparedBatch; embedPromise: Promise<{ hits: number; misses: number }> } | null = null;
+		for (let batchIndex = 0; batchIndex < fileList.length; batchIndex += BATCH) {
+			const prepared = await prepBatch(batchIndex);
+			if (carry) {
+				finishBatch(carry.prepared, await carry.embedPromise);
+				carry = null;
 			}
-			if (batchManifestUpdates.length > 0) checkpointManifest();
-			result.skippedFiles.push(...toChunk.filter((t) => !batchIndexed.includes(t.relPath)).map((t) => t.relPath));
+			if (prepared.batchChunks.length > 0) {
+				const embedPromise = startEmbed(prepared, batchIndex);
+				// Attach a no-op catch NOW: if the embed rejects mid-prep of the
+				// next batch, it must not fire as an unhandled rejection before
+				// its real await below (which still throws the original error).
+				embedPromise.catch(() => undefined);
+				carry = { prepared, embedPromise };
+			} else {
+				finishBatch(prepared, { hits: 0, misses: 0 });
+			}
 		}
+		if (carry) finishBatch(carry.prepared, await carry.embedPromise);
 
 		// ── R7: emit chunk→chunk calls edges ──────────────────────────────────
 		// Runs AFTER all batches so the symbol table is complete regardless of

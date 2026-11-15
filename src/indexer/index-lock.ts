@@ -99,9 +99,11 @@ export function indexLockPath(storageBase: string): string {
 /**
  * Try to acquire the indexing lock for `storageBase`, waiting up to `waitMs`
  * for the current holder to release. `waitMs = 0` = single-shot try (the
- * automatic path); manual runs pass a short wait before giving up.
+ * automatic path); manual runs pass a short wait before giving up. Async on
+ * purpose: pi's extension process must stay responsive during the wait, so
+ * the poll uses setTimeout instead of blocking the event loop.
  */
-export function acquireIndexLock(storageBase: string, waitMs = 0): AcquireResult {
+export async function acquireIndexLock(storageBase: string, waitMs = 0): Promise<AcquireResult> {
 	const file = lockPath(storageBase);
 	const deadline = Date.now() + Math.max(0, waitMs);
 	for (;;) {
@@ -129,8 +131,17 @@ export function acquireIndexLock(storageBase: string, waitMs = 0): AcquireResult
 		}
 		stealIfStale(storageBase);
 		const sleepMs = Math.min(250, Math.max(1, deadline - Date.now()));
-		// Synchronous sleep: pi extension code is sync here anyway (better-sqlite3
-		// is), and a blocking poll keeps the lock logic free of async ordering bugs.
-		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
+		await new Promise<void>((resolve) => setTimeout(resolve, sleepMs));
 	}
+}
+
+/**
+ * Current lock holder, for observability (statusText, dashboard). Returns
+ * null when no lockfile exists or its contents are unreadable. Does NOT
+ * judge staleness — a crashed holder's lock still shows here until stolen.
+ */
+export function readIndexLockState(storageBase: string): { holderPid: number; ageMs: number } | null {
+	const contents = readLockContents(lockPath(storageBase));
+	if (!contents || !Number.isFinite(contents.acquiredAtEpoch)) return null;
+	return { holderPid: contents.pid, ageMs: Math.max(0, Date.now() - contents.acquiredAtEpoch) };
 }

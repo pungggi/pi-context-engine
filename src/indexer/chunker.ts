@@ -10,8 +10,49 @@ import { makeChunk, type Chunk, type ChunkType } from "../types.js";
 // web-tree-sitter is CJS; loaded through require so the same code path works
 // under jiti (pi) and vitest.
 const require = createRequire(import.meta.url);
+
+// The upstream build exports conditionally: `"object"==typeof exports &&
+// (module.exports=TreeSitter)`. When a loader evaluates it in a non-CJS
+// context (seen with jiti's ESM-path variants in pi), the guard never fires
+// and `require()` silently returns `{}` — every later `Parser.init()` then
+// throws "Parser.init is not a function" for the rest of the process.
+// Resolve lazily, validate, and drop a poisoned require-cache entry once
+// before failing with a fingerprint that identifies which shape we got.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const Parser: any = require("web-tree-sitter");
+let cachedParser: any;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function unwrapParser(mod: any): any {
+	if (mod && typeof mod.init === "function") return mod;
+	// ESM-interop shape: { default: TreeSitter }
+	if (mod && mod.default && typeof mod.default.init === "function") return mod.default;
+	return undefined;
+}
+
+function getParser(): any {
+	if (cachedParser) return cachedParser;
+	const resolved = require.resolve("web-tree-sitter");
+	let parser = unwrapParser(require(resolved));
+	if (!parser) {
+		// Poisoned require-cache entry (partial/foreign evaluation context).
+		// Drop it and re-require once through a clean native load.
+		try {
+			delete require.cache[resolved];
+		} catch {
+			// best effort — fall through to the diagnostic below
+		}
+		parser = unwrapParser(require(resolved));
+	}
+	if (!parser) {
+		const mod = require(resolved);
+		throw new Error(
+			`web-tree-sitter malformed: keys=[${Object.keys(mod ?? {}).join(",")}] ` +
+			`typeof=${typeof mod} node=${process.version} resolve=${resolved}`,
+		);
+	}
+	cachedParser = parser;
+	return parser;
+}
 
 const FUNCTION_TYPES = new Set([
 	"function_definition", "function_declaration", "generator_function_declaration",
@@ -96,7 +137,17 @@ let parserInitPromise: Promise<void> | undefined;
 const languageCache = new Map<string, Promise<unknown>>();
 
 function ensureParserInit(): Promise<void> {
-	parserInitPromise ??= Parser.init().then(() => undefined);
+	if (!parserInitPromise) {
+		parserInitPromise = getParser()
+			.init()
+			.then(() => undefined, (err: unknown) => {
+				// Never cache a rejection: a transient failure (model/wasm load,
+				// poisoned module) must not brick the watcher for the whole
+				// session — drop the promise so the next reindex retries.
+				parserInitPromise = undefined;
+				throw err;
+			});
+	}
 	return parserInitPromise as Promise<void>;
 }
 
@@ -108,8 +159,12 @@ function loadLanguage(language: string): Promise<unknown> | null {
 		p = (async () => {
 			await ensureParserInit();
 			const wasmPath = require.resolve(`tree-sitter-wasms/out/${stem}.wasm`);
-			return Parser.Language.load(wasmPath);
-		})();
+			return getParser().Language.load(wasmPath);
+		})().catch((err: unknown) => {
+			// Same rule as ensureParserInit: don't pin a rejected load forever.
+			languageCache.delete(language);
+			throw err;
+		});
 		languageCache.set(language, p);
 	}
 	return p;
@@ -123,7 +178,7 @@ export class Chunker {
 		// small pool. tree-sitter wasm parsers are not safe to share across
 		// concurrent parses, and ours are strictly synchronous, so one is
 		// enough — the pool exists for future parallel workers.
-		return this.parserPool.pop() ?? new Parser();
+		return this.parserPool.pop() ?? new (getParser() as new () => unknown)();
 	}
 
 	private releaseParser(p: unknown): void {

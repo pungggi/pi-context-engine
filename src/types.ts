@@ -23,7 +23,7 @@ export type NodeType =
 	| "session"
 	| "decision";
 
-export type EdgeType = "calls" | "imports" | "defines" | "modifies" | "discussed_in" | "decided";
+export type EdgeType = "calls" | "imports" | "defines" | "modifies" | "discussed_in" | "decided" | "references";
 
 export type ConfidenceLevel = "high" | "medium" | "low";
 

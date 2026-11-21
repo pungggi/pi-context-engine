@@ -2,6 +2,31 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## 0.10.3 - 2026-11-21
+
+### Fixed
+
+- **Watchdog dimension-mismatch loop**: a project whose `chunks_vec` table
+  existed but was EMPTY (all rows deleted) kept its old embedding dimension,
+  and the code only learned a table's dimension from its ROWS. After an
+  embedder switch (e.g. Ollama `nomic-embed-text` 768-dim picked up because
+  Ollama came up, vs the 384-dim local fallback), every watcher reindex died
+  with `Dimension mismatch for inserted vector ... Expected 384 dimensions
+  but received 768` and repeated forever — nothing ever healed the table.
+  The declared dimension now comes from the table DDL (works for empty
+  tables), and `ensureVecTable` re-verifies the DDL after create, so a
+  stale-dimension table is dropped and rebuilt on the next ingest.
+- **Mixed-dim stores**: the full-reindex migration gate now also compares
+  the store's declared dimension against the embedder (not just the
+  manifest's). Without this, a store rebuilt at another dim behind the
+  manifest's back would wipe chunk metadata while file hashes still matched,
+  silently stranding those files out of the index.
+- **Embedding-cache dimension poisoning**: cache hits are now validated
+  against the live embedder's dimension; a stale-dim hit is re-embedded and
+  replaced instead of being ingested (which could throw the same dimension
+  mismatch mid-batch or silently keep the index in the old vector space).
+  Stale entries no longer count as cache hits during the transition run.
+
 ## 0.10.2 - 2026-11-15
 
 ### Added

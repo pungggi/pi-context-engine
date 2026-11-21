@@ -128,6 +128,16 @@ export class LocalBackend {
 		return this.vectorStore.fileChunkCounts();
 	}
 
+	/**
+	 * Dimension declared by the on-disk chunks_vec DDL (null when absent). The
+	 * pipeline's dim-migration gate compares this against the live embedder so a
+	 * stale-dimension store forces a full reindex even when the manifest agrees
+	 * with the embedder (mixed-dim stores from backend switches).
+	 */
+	declaredVecDim(): number | null {
+		return this.vectorStore.declaredVecDim();
+	}
+
 	getCachedCompression(chunkId: string, level: string): string | null {
 		return this.vectorStore.getCachedCompression(chunkId, level);
 	}

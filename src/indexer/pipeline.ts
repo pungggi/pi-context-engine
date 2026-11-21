@@ -315,11 +315,20 @@ async function embedChunks(
 ): Promise<{ hits: number; misses: number }> {
 	if (chunks.length === 0) return { hits: 0, misses: 0 };
 	const hashes = chunks.map((c) => cache.contentHash(c.content));
-	const cached = cache.getBatch(hashes);
+	// expectedDim: stale-dim entries must surface as misses here (and in the
+	// cache's own hit/miss counters), never as ingestible vectors.
+	const cached = cache.getBatch(hashes, { expectedDim: embedder.dimension });
 	const missIndices: number[] = [];
 	for (let i = 0; i < chunks.length; i++) {
 		const hit = cached.get(hashes[i]!);
-		if (hit) chunks[i]!.embedding = hit;
+		// A hit whose dimension no longer matches the embedder is poison, not a
+		// hit: the salt keys backend identity, which usually encodes the model —
+		// but a backend can change dimension under the same identity (re-pulled
+		// Ollama model variant, updated local model, test backends). Ingesting the
+		// stale vector would either throw the sqlite-vec dimension mismatch or
+		// silently keep the table in the old space. Re-embed and let the put below
+		// REPLACE the entry under the same key.
+		if (hit && hit.length === embedder.dimension) chunks[i]!.embedding = hit;
 		else missIndices.push(i);
 	}
 	if (missIndices.length > 0) {
@@ -747,11 +756,21 @@ async function runIndexingLocked(
 	try {
 
 		// Dimension migration: a backend swap invalidates every stored vector.
-		if (fileList.length > 0 && manifest.embeddingDim !== null && manifest.hasEntries) {
+		// Both signals count: the manifest dim (recorded at the last run) AND the
+		// dim declared by the on-disk chunks_vec DDL. The store can disagree with
+		// the manifest in either direction (stores from a mixed-backend past, or a
+		// wiped-rows table); catching it here clears the manifest too, so the
+		// table rebuild ensureVecTable() performs cannot strand metadata for files
+		// whose content hashes would otherwise skip re-chunking.
+		if (fileList.length > 0 && manifest.hasEntries) {
 			const { embedder: emb } = await ensureEmbedder();
-			if (manifest.embeddingDim !== emb.dimension) {
+			const storeDim = backend.declaredVecDim();
+			if (
+				(manifest.embeddingDim !== null && manifest.embeddingDim !== emb.dimension) ||
+				(storeDim !== null && storeDim !== emb.dimension)
+			) {
 				log?.(
-					`  [migration] embedding dim changed (${manifest.embeddingDim} → ${emb.dimension}, backend=${emb.backendName}) — forcing full reindex`,
+					`  [migration] embedding dim changed (manifest=${manifest.embeddingDim ?? "?"}, store=${storeDim ?? "?"} → ${emb.dimension}, backend=${emb.backendName}) — forcing full reindex`,
 				);
 				manifest.clearEntries();
 				// The dim swap dropped stored vectors (git history included); reset

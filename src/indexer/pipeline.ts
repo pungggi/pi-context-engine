@@ -315,7 +315,9 @@ async function embedChunks(
 ): Promise<{ hits: number; misses: number }> {
 	if (chunks.length === 0) return { hits: 0, misses: 0 };
 	const hashes = chunks.map((c) => cache.contentHash(c.content));
-	const cached = cache.getBatch(hashes);
+	// expectedDim: stale-dim entries must surface as misses here (and in the
+	// cache's own hit/miss counters), never as ingestible vectors.
+	const cached = cache.getBatch(hashes, { expectedDim: embedder.dimension });
 	const missIndices: number[] = [];
 	for (let i = 0; i < chunks.length; i++) {
 		const hit = cached.get(hashes[i]!);

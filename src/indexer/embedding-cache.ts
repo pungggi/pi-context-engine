@@ -74,7 +74,13 @@ export class EmbeddingCache {
 		run();
 	}
 
-	getBatch(contentHashes: string[]): Map<string, number[]> {
+	/**
+	 * Batch lookup with optional dimension filter: entries stored at another
+	 * dimension are skipped (and NOT counted as hits) — they are stale under a
+	 * backend that changed dimension while keeping its identity, and the caller
+	 * re-embeds and REPLACES them.
+	 */
+	getBatch(contentHashes: string[], opts: { expectedDim?: number } = {}): Map<string, number[]> {
 		const results = new Map<string, number[]>();
 		if (contentHashes.length === 0) return results;
 		for (const batch of batchedParams(contentHashes)) {
@@ -84,7 +90,10 @@ export class EmbeddingCache {
 					`SELECT content_hash, dim, embedding FROM embedding_cache WHERE content_hash IN (${ph})`,
 				)
 				.all(...batch) as { content_hash: string; dim: number; embedding: Buffer }[];
-			for (const row of rows) results.set(row.content_hash, unpack(row.embedding, row.dim));
+			for (const row of rows) {
+				if (opts.expectedDim !== undefined && row.dim !== opts.expectedDim) continue;
+				results.set(row.content_hash, unpack(row.embedding, row.dim));
+			}
 		}
 		this.hits += results.size;
 		this.misses += contentHashes.length - results.size;

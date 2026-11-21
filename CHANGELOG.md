@@ -25,6 +25,7 @@ All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX
   against the live embedder's dimension; a stale-dim hit is re-embedded and
   replaced instead of being ingested (which could throw the same dimension
   mismatch mid-batch or silently keep the index in the old vector space).
+  Stale entries no longer count as cache hits during the transition run.
 
 ## 0.10.2 - 2026-11-15
 

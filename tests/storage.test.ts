@@ -222,3 +222,26 @@ describe("VectorStore dimension handling", () => {
 		reopened.close();
 	});
 });
+
+describe("EmbeddingCache dimension filter", () => {
+	it("getBatch skips stale-dim entries, counting them as misses", () => {
+		// Review finding #2: during a dim transition the stale entries must not
+		// inflate hitCount — they are misses the caller re-embeds and replaces.
+		const dir = makeTempDir("pce-cachedim-");
+		dirs.push(dir);
+		const cache = new EmbeddingCache(path.join(dir, "embedding_cache.db"), { modelSalt: "s" });
+		cache.put("h64", new Array(64).fill(0.5));
+		cache.put("h32", new Array(32).fill(0.5));
+
+		const got = cache.getBatch(["h64", "h32", "missing"], { expectedDim: 32 });
+		expect(got.size).toBe(1);
+		expect(got.get("h32")!).toHaveLength(32);
+		expect(cache.hitCount).toBe(1);
+		expect(cache.missCount).toBe(2); // h64 (stale dim) + missing
+
+		// Unfiltered lookup still returns both entries.
+		const all = cache.getBatch(["h64", "h32"]);
+		expect(all.size).toBe(2);
+		cache.close();
+	});
+});

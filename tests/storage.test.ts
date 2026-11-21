@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { LocalBackend } from "../src/storage/local-backend.js";
+import { VectorStore } from "../src/storage/vector-store.js";
 import { EmbeddingCache } from "../src/indexer/embedding-cache.js";
 import { makeChunk, type Chunk } from "../src/types.js";
 import { makeTempDir, rmrf, FakeEmbeddingBackend } from "./helpers.js";
@@ -188,5 +189,36 @@ describe("storage layout", () => {
 		} finally {
 			rmrf(dir);
 		}
+	});
+});
+
+describe("VectorStore dimension handling", () => {
+	it("declaredVecDim reads an EMPTY table DDL; ingest rebuilds a stale dim instead of throwing", () => {
+		// Regression: the row-based dim read returned null for an empty table, so
+		// a later embedder swap skipped the drop branch and the first insert threw
+		// sqlite-vec's "Dimension mismatch" — wedging every future run.
+		const dir = makeTempDir("pce-vecdim-");
+		dirs.push(dir);
+		const store = new VectorStore(dir);
+		expect(store.declaredVecDim()).toBeNull(); // no table yet
+
+		const emb64 = new Array<number>(64).fill(0);
+		emb64[0] = 1;
+		store.ingest([chunk("v64", "a.py", "sixty four dim vector", emb64)]);
+		expect(store.declaredVecDim()).toBe(64);
+		store.deleteByFile("a.py");
+		store.close();
+
+		// Fresh instance over an EMPTY but declared table (new session semantics).
+		const reopened = new VectorStore(dir);
+		expect(reopened.declaredVecDim()).toBe(64);
+
+		const emb32 = new Array<number>(32).fill(0);
+		emb32[0] = 1;
+		reopened.ingest([chunk("v32", "b.py", "thirty two dim vector", emb32)]);
+		expect(reopened.declaredVecDim()).toBe(32);
+		expect(reopened.count()).toBe(1);
+		expect(reopened.search(emb32, 1)).toHaveLength(1);
+		reopened.close();
 	});
 });

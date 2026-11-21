@@ -66,32 +66,74 @@ export class VectorStore {
 		`);
 
 		if (this.vecTableExists()) {
-			// The table exists — read its dimension. There is no migration path
-			// for tables this package did not write (older metric/column shapes):
-			// an unrecognized shape cannot occur from our own DDL, and foreign
-			// stores are unsupported by design.
-			const r = this.db.prepare("SELECT rowid FROM chunks_vec LIMIT 1").get() as
-				| { rowid: number }
-				| undefined;
-			if (r) {
-				const len = this.db
-					.prepare("SELECT vec_length(embedding) AS len FROM chunks_vec LIMIT 1")
-					.get() as { len: number };
-				this.dim = len.len;
+			// Prefer the dimension declared in the DDL: an EMPTY vec table still
+			// declares float[N], while the row-based vec_length read below is
+			// blind to it. That blindness wedged real projects: a store emptied by
+			// deletes kept its old-dim table, a later embedder swap skipped the
+			// drop branch (dim null), CREATE IF NOT EXISTS kept the stale table,
+			// and every ingest threw "Dimension mismatch" on repeat forever.
+			const declared = this.declaredVecDim();
+			if (declared !== null) {
+				this.dim = declared;
+			} else {
+				// Fallback for unrecognized DDL shapes (foreign stores): learn the
+				// dimension from a stored vector, if any exists.
+				const r = this.db.prepare("SELECT rowid FROM chunks_vec LIMIT 1").get() as
+					| { rowid: number }
+					| undefined;
+				if (r) {
+					const len = this.db
+						.prepare("SELECT vec_length(embedding) AS len FROM chunks_vec LIMIT 1")
+						.get() as { len: number };
+					this.dim = len.len;
+				}
 			}
 		}
+	}
+
+	/**
+	 * Dimension declared by the chunks_vec DDL (`float[N]`), or null when the
+	 * table is absent or its SQL is unrecognized. Unlike the row-based read,
+	 * this works for empty tables, the exact state a stale store is left in
+	 * after all its rows were deleted.
+	 */
+	declaredVecDim(): number | null {
+		const row = this.db
+			.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_vec'")
+			.get() as { sql: string | null } | undefined;
+		if (!row?.sql) return null;
+		const m = /float\[(\d+)\]/.exec(row.sql);
+		return m ? Number(m[1]) : null;
+	}
+
+	private dropVecTable(): void {
+		this.db.exec("DROP TABLE IF EXISTS chunks_vec");
+		// The vec rows are keyed to chunks.rowid; without the metadata wipe a
+		// recreated table would silently miss every previously indexed chunk.
+		this.db.exec("DELETE FROM chunks");
+		this.db.exec("DELETE FROM chunk_compressions");
 	}
 
 	private ensureVecTable(dim: number): void {
 		if (this.dim === dim) return;
 		if (this.dim !== null && this.dim !== dim) {
-			this.db.exec("DROP TABLE IF EXISTS chunks_vec");
-			this.db.exec("DELETE FROM chunks");
-			this.db.exec("DELETE FROM chunk_compressions");
+			this.dropVecTable();
 		}
 		this.db.exec(
 			`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[${dim}] distance_metric=cosine)`,
 		);
+		// IF NOT EXISTS cannot upgrade an existing table to a new dimension:
+		// when this.dim was null (empty stale table), the CREATE above is a
+		// no-op and the table still declares the OLD dim. Verify against the
+		// DDL and rebuild, or the first insert below throws and every future
+		// run dies the same way (the loop that motivated this check).
+		const declared = this.declaredVecDim();
+		if (declared !== null && declared !== dim) {
+			this.dropVecTable();
+			this.db.exec(
+				`CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[${dim}] distance_metric=cosine)`,
+			);
+		}
 		this.dim = dim;
 	}
 

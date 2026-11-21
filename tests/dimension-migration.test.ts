@@ -9,6 +9,8 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ContextEngine } from "../src/engine.js";
 import { defaultConfig, type Config } from "../src/config.js";
 import { LocalBackend } from "../src/storage/local-backend.js";
+import { makeChunk } from "../src/types.js";
+import { projectStorageDir } from "../src/utils.js";
 import { makeFakeEmbedder, makeTempDir, rmrf, writeFiles } from "./helpers.js";
 
 const dirs: string[] = [];
@@ -111,5 +113,105 @@ describe("R11: dimension-change migration", () => {
 		await engine.reindex({ full: true });
 		const again = await engine.reindex({});
 		expect(again.indexed).toBe(0); // unchanged content + same model = nothing re-indexed
+	});
+
+	// The two regressions below reproduce a real-world failure loop (seen on a
+	// project whose store was emptied while the embedder later changed):
+	// "Context index: watcher reindex failed (Dimension mismatch for inserted
+	// vector for the \"embedding\" column. Expected N dimensions but received M.)"
+	// repeating on every change burst, with the index permanently dead.
+
+	it("recovers when an EMPTY chunks_vec declares a stale dimension", async () => {
+		// Store state: table exists at float[64] with ZERO rows, manifest empty.
+		// The old row-based dim read returned null for an empty table, so the
+		// ingest skipped the drop branch, CREATE IF NOT EXISTS kept float[64],
+		// and the very first 32-dim insert threw — rolling the run back and
+		// repeating the failure forever (nothing ever healed the table).
+		const projectDir = makeTempDir("pce-r11e-");
+		dirs.push(projectDir);
+		writeFiles(projectDir, FILES);
+		const storageRoot = makeTempDir("pce-r11estore-");
+		dirs.push(storageRoot);
+		const config: Config = { ...defaultConfig(), storagePath: storageRoot };
+
+		const backend1 = new LocalBackend(storageRoot);
+		const engine1 = new ContextEngine({ projectDir, config, runtime: { backend: backend1, embedder: makeFakeEmbedder(64) } });
+		engines.push(engine1);
+		await engine1.reindex({ full: true });
+		await engine1.shutdown();
+
+		// Empty the store (rows deleted, table NOT dropped) and reset the manifest
+		// — exactly the on-disk state the wedged project presented.
+		const wiper = new LocalBackend(storageRoot);
+		wiper.deleteByFiles(Object.keys(FILES));
+		wiper.close();
+		fs.rmSync(path.join(projectStorageDir(storageRoot, projectDir), "manifest.json"));
+
+		const backend2 = new LocalBackend(storageRoot);
+		expect(backend2.declaredVecDim()).toBe(64); // empty table still declares 64
+		const engine2 = new ContextEngine({ projectDir, config, runtime: { backend: backend2, embedder: makeFakeEmbedder(32) } });
+		engines.push(engine2);
+		const second = await engine2.reindex({}); // must NOT throw a dimension mismatch
+		expect(second.errors).toHaveLength(0);
+		expect(second.indexed).toBe(3);
+		expect(backend2.declaredVecDim()).toBe(32);
+
+		const out = await engine2.search("alphaOne", { topK: 3 });
+		expect(out.inline.length + out.overflow.length).toBeGreaterThan(0);
+	});
+
+	it("re-indexes everything when the STORE dim disagrees with the embedder (manifest agrees)", async () => {
+		// Store state: manifest.embeddingDim == embedder dim (64), but the table
+		// was rebuilt at another dim (32) by an interrupted past. Without the
+		// store-dim signal in the migration gate, the run would skip everything
+		// as unchanged while ensureVecTable wiped the chunk metadata — leaving
+		// files whose hashes match stranded out of the index.
+		const projectDir = makeTempDir("pce-r11s-");
+		dirs.push(projectDir);
+		writeFiles(projectDir, FILES);
+		const storageRoot = makeTempDir("pce-r11sstore-");
+		dirs.push(storageRoot);
+		const config: Config = { ...defaultConfig(), storagePath: storageRoot };
+
+		const backend1 = new LocalBackend(storageRoot);
+		const engine1 = new ContextEngine({ projectDir, config, runtime: { backend: backend1, embedder: makeFakeEmbedder(64) } });
+		engines.push(engine1);
+		await engine1.reindex({ full: true });
+		await engine1.shutdown();
+
+		// Swap the table to 32 dims behind the manifest's back (one synthetic
+		// 32-dim chunk: ensureVecTable rebuilds the table at 32 and wipes rows).
+		const swapBackend = new LocalBackend(storageRoot);
+		swapBackend.ingest(
+			[
+				makeChunk({
+					id: "synthetic32",
+					content: "synthetic chunk that swaps the table dim",
+					chunkType: "module",
+					filePath: "synthetic/swap.txt",
+					startLine: 1,
+					endLine: 1,
+					language: "plaintext",
+					embedding: new Array<number>(32).fill(0).map((_, i) => (i === 0 ? 1 : 0)),
+				}),
+			],
+			[],
+			[],
+		);
+		swapBackend.close();
+
+		const backend2 = new LocalBackend(storageRoot);
+		expect(backend2.declaredVecDim()).toBe(32); // store now disagrees with the manifest (64)
+		const engine2 = new ContextEngine({ projectDir, config, runtime: { backend: backend2, embedder: makeFakeEmbedder(64) } });
+		engines.push(engine2);
+		const second = await engine2.reindex({});
+		expect(second.errors).toHaveLength(0);
+		expect(second.indexed).toBe(3); // gate cleared the manifest: full re-chunk
+		expect(backend2.declaredVecDim()).toBe(64);
+
+		// Nothing stranded: all three files have live chunk metadata again.
+		const counts = backend2.fileChunkCounts();
+		for (const rel of Object.keys(FILES)) expect(counts[rel]).toBeGreaterThan(0);
+		expect(counts["synthetic/swap.txt"]).toBeUndefined(); // wiped by the table rebuild
 	});
 });

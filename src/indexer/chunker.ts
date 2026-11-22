@@ -42,8 +42,36 @@ let cachedParserError: Error | undefined;
 // instead of throwing the cached error forever. Keeps the no-spam guarantee
 // (at most PARSE_RETRY_LIMIT attempts per process) while not bricking a
 // session whose cache healed after the first failure.
+//
+// Budget is TIME-WINDOWED, not a per-process total: a persistent poison must
+// not re-run the full resolve cycle on every watcher tick (spam), but a require
+// cache repaired out-of-band (no stash filled) must still be able to recover
+// after the window rolls over. So we allow at most PARSER_RESOLVE_RETRY_LIMIT
+// attempts per PARSER_RESOLVE_RETRY_WINDOW_MS; once the window has elapsed the
+// budget resets automatically.
 let parserResolveRetries = 0;
+let parserResolveWindowStart = 0;
 const PARSER_RESOLVE_RETRY_LIMIT = 3;
+const PARSER_RESOLVE_RETRY_WINDOW_MS = 30_000;
+
+function retryBudgetAllows(): boolean {
+	const now = Date.now();
+	if (now - parserResolveWindowStart >= PARSER_RESOLVE_RETRY_WINDOW_MS) {
+		// Window rolled over: start a fresh budget so a healed cache can recover.
+		parserResolveRetries = 0;
+		parserResolveWindowStart = now;
+	}
+	return parserResolveRetries < PARSER_RESOLVE_RETRY_LIMIT;
+}
+
+function noteResolveFailure(): void {
+	const now = Date.now();
+	if (now - parserResolveWindowStart >= PARSER_RESOLVE_RETRY_WINDOW_MS) {
+		parserResolveRetries = 0;
+		parserResolveWindowStart = now;
+	}
+	parserResolveRetries++;
+}
 
 function stashParser(parser: any): any {
 	const g = globalThis as Record<PropertyKey, unknown>;
@@ -56,9 +84,12 @@ function unwrapParser(mod: any): any {
 	// The clean export is the TreeSitter CLASS (a function with a static init).
 	// The Emscripten Module poison (init()'s `module.exports=Module`) is a plain
 	// OBJECT with HEAP8/HEAP16… and no `init`, so a function-with-init check
-	// accepts the class and rejects the Module. Do NOT require `Language.load`
-	// here: it is only assigned in onRuntimeInitialized, so it is undefined
-	// before init() runs and would reject the legitimate pre-init class.
+	// accepts the class and rejects the Module. Verified empirically: post-init
+	// require() yields `typeof object, .init undefined, .HEAP8 object` (the
+	// Module), while the class is `typeof function, .init function, .HEAP8
+	// undefined`. Do NOT require `Language.load` here: it is only assigned in
+	// onRuntimeInitialized, so it is undefined before init() runs and would
+	// reject the legitimate pre-init class.
 	const isParser = (m: any): boolean => typeof m === "function" && typeof m.init === "function";
 	if (isParser(mod)) return mod;
 	// ESM-interop / namespace shapes: { default: TreeSitter } or { Parser: TreeSitter }
@@ -85,18 +116,22 @@ function getParser(): any {
 	if (stashed) {
 		cachedParser = stashParser(stashed);
 		cachedParserError = undefined;
-		// A successful stash-heal is a fresh cycle too: reset the retry budget so
+		// A successful stash-heal is a fresh cycle: reset the retry budget so
 		// switching between stash-heals and require-failures never drains it.
 		parserResolveRetries = 0;
+		parserResolveWindowStart = Date.now();
 		return cachedParser;
 	}
 	if (cachedParserError) {
-		if (parserResolveRetries >= PARSER_RESOLVE_RETRY_LIMIT) throw cachedParserError;
+		// Only keep throwing the cached error while the windowed budget is
+		// exhausted; once the window rolls over, retryBudgetAllows() resets it so
+		// an out-of-band-repaired cache recovers instead of staying dead.
+		if (!retryBudgetAllows()) throw cachedParserError;
 		// Bounded retry: allow a fresh attempt in case the require cache was
 		// repaired since the cached failure (the stash path above already covers
 		// the common case). Each failed attempt re-caches the error below, so the
-		// spam budget stays capped at PARSER_RESOLVE_RETRY_LIMIT.
-		parserResolveRetries++;
+		// spam budget stays capped at PARSER_RESOLVE_RETRY_LIMIT per window.
+		noteResolveFailure();
 		cachedParserError = undefined;
 	}
 	const resolved = require.resolve("web-tree-sitter");
@@ -145,6 +180,7 @@ function getParser(): any {
 	cachedParser = stashParser(parser);
 	cachedParserError = undefined;
 	parserResolveRetries = 0;
+	parserResolveWindowStart = Date.now();
 	return cachedParser;
 }
 

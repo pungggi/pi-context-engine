@@ -86,15 +86,19 @@ describe("chunker web-tree-sitter loading", () => {
 		realCache[wtsPath] = poisonEntry();
 
 		const { warmupLanguages } = await import("../src/indexer/chunker.js");
-		// warmupLanguages → ensureParserInit → getParser(): both the first require
-		// and the post-drop re-require are poisoned, so it must throw the
-		// fingerprint (keys=[…]) instead of recovering.
-		await expect(warmupLanguages(new Set(["javascript"]))).rejects.toThrow(
-			/web-tree-sitter malformed: keys=/,
-		);
-
-		// Restore the real cache for later tests.
-		Object.defineProperty(ModuleCtor, "_cache", { value: realCache, configurable: true });
-		delete realCache[wtsPath];
+		try {
+			// warmupLanguages → ensureParserInit → getParser(): both the first require
+			// and the post-drop re-require are poisoned, so it must throw the
+			// fingerprint (keys=[…]) instead of recovering.
+			await expect(warmupLanguages(new Set(["javascript"]))).rejects.toThrow(
+				/web-tree-sitter malformed: keys=/,
+			);
+		} finally {
+			// Restore the real cache for later tests — even if the assertion above
+			// throws, or the Proxy would stay on Module._cache and poison every
+			// subsequent test in this process.
+			Object.defineProperty(ModuleCtor, "_cache", { value: realCache, configurable: true });
+			delete realCache[wtsPath];
+		}
 	});
 });

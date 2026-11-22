@@ -78,15 +78,21 @@ function getParser(): any {
 	if (!parser) {
 		// Permanent for this context (the re-require was poisoned too): cache the
 		// failure so watcher ticks do not repeat the full cycle, then throw a
-		// fingerprint that splits the hypotheses on the next occurrence.
-		let keys = "";
+		// fingerprint that splits the hypotheses on the next occurrence. Every
+		// diagnostic require() stays inside try/catch — a throwing third require
+		// must not discard the fingerprint we are building.
+		let keys = "<unavailable>";
+		let shape = "<unavailable>";
 		try {
-			keys = Object.keys(require(resolved) ?? {}).join(",");
-		} catch {
-			keys = "<require threw>";
+			const diag = require(resolved);
+			keys = Object.keys(diag ?? {}).join(",");
+			shape = typeof diag;
+		} catch (diagErr) {
+			keys = `<require threw: ${diagErr instanceof Error ? diagErr.message : String(diagErr)}>`;
+			shape = "<require threw>";
 		}
 		cachedParserError = new Error(
-			`web-tree-sitter malformed: keys=[${keys}] typeof=${typeof require(resolved)} ` +
+			`web-tree-sitter malformed: keys=[${keys}] typeof=${shape} ` +
 			`node=${process.version} resolve=${resolved}`,
 		);
 		throw cachedParserError;
@@ -205,7 +211,13 @@ function loadLanguage(language: string): Promise<unknown> | null {
 		})().catch((err: unknown) => {
 			// Same rule as ensureParserInit: don't pin a rejected load forever.
 			languageCache.delete(language);
-			throw err;
+			// Keep the language in the message: a watcher toast showing only
+			// "web-tree-sitter malformed: …" does not say which grammar failed.
+			const wrapped = new Error(
+				`failed to load tree-sitter language "${language}": ${err instanceof Error ? err.message : String(err)}`,
+			);
+			wrapped.cause = err;
+			throw wrapped;
 		});
 		languageCache.set(language, p);
 	}

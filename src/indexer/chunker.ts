@@ -68,8 +68,15 @@ function getParser(): any {
 	// module instance, engine swap) may have populated the stash since the
 	// failure, and we must self-heal instead of throwing forever.
 	const g = globalThis as Record<PropertyKey, unknown>;
-	if (g[PARSER_STASH]) {
-		cachedParser = g[PARSER_STASH];
+	// Validate the stash through unwrapParser before trusting it: the symbol is
+	// global and could hold a bad shape (the Emscripten Module itself has an
+	// `init`, or a half-formed object from another module instance). A blind
+	// truthy check would cement that poison forever and the cache-drop retry
+	// would never run. An invalid stash is ignored and we fall through to the
+	// require path below.
+	const stashed = unwrapParser(g[PARSER_STASH]);
+	if (stashed) {
+		cachedParser = stashParser(stashed);
 		cachedParserError = undefined;
 		return cachedParser;
 	}
@@ -118,6 +125,10 @@ function getParser(): any {
 			`web-tree-sitter malformed: keys=[${keys}] typeof=${shape} ` +
 			`node=${process.version} resolve=${shortPath}`,
 		);
+		// Budget is per failure cycle, not per process: a later healed cache
+		// (after an engine swap re-poisons then repairs) must still get its
+		// bounded retries instead of throwing the stale error forever.
+		parserResolveRetries = 0;
 		throw cachedParserError;
 	}
 	cachedParser = stashParser(parser);

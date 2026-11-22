@@ -55,4 +55,46 @@ describe("chunker web-tree-sitter loading", () => {
 		// which only happens if the grammar actually loaded and parsed.
 		expect(chunks.some((c) => c.chunkType === "function")).toBe(true);
 	});
+
+	it("throws the fingerprint and caches it when the poison survives the cache-drop", async () => {
+		// Make the poison IMMUNE to the cache-drop: swap the shared Module._cache
+		// (=== require.cache) for a Proxy that re-plants the empty-exports entry
+		// every time it is deleted, so getParser()'s re-require is poisoned too
+		// and it falls through to the fingerprint + cachedParserError path.
+		const ModuleCtor = require("module") as unknown as {
+			_cache: Record<string, unknown>;
+		};
+		const realCache = ModuleCtor._cache;
+		const poisonEntry = (): NodeModule =>
+			({
+				exports: {},
+				loaded: true,
+				id: wtsPath,
+				filename: wtsPath,
+				path: wtsPath,
+				children: [],
+				paths: [],
+			}) as unknown as NodeModule;
+		const proxy = new Proxy(realCache, {
+			deleteProperty(target, prop) {
+				Reflect.deleteProperty(target, prop);
+				if (prop === wtsPath) target[prop] = poisonEntry(); // re-plant after drop
+				return true;
+			},
+		});
+		Object.defineProperty(ModuleCtor, "_cache", { value: proxy, configurable: true });
+		realCache[wtsPath] = poisonEntry();
+
+		const { warmupLanguages } = await import("../src/indexer/chunker.js");
+		// warmupLanguages → ensureParserInit → getParser(): both the first require
+		// and the post-drop re-require are poisoned, so it must throw the
+		// fingerprint (keys=[…]) instead of recovering.
+		await expect(warmupLanguages(new Set(["javascript"]))).rejects.toThrow(
+			/web-tree-sitter malformed: keys=/,
+		);
+
+		// Restore the real cache for later tests.
+		Object.defineProperty(ModuleCtor, "_cache", { value: realCache, configurable: true });
+		delete realCache[wtsPath];
+	});
 });

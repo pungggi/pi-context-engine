@@ -34,8 +34,16 @@ const PARSER_STASH = Symbol.for("pce.web-tree-sitter.Parser");
 let cachedParser: any;
 // Cache a permanent resolution failure so a broken evaluation context does not
 // re-require + throw on every watcher tick (that is the toast-spam from the
-// incident). Cleared only by a successful resolve below.
+// incident). Cleared only by a successful resolve below, or when the bounded
+// retry budget (below) allows a fresh attempt after the cache healed.
 let cachedParserError: Error | undefined;
+// The stash usually self-heals a later load, but if it stays empty while the
+// require cache gets repaired out-of-band, retry a bounded number of times
+// instead of throwing the cached error forever. Keeps the no-spam guarantee
+// (at most PARSE_RETRY_LIMIT attempts per process) while not bricking a
+// session whose cache healed after the first failure.
+let parserResolveRetries = 0;
+const PARSER_RESOLVE_RETRY_LIMIT = 3;
 
 function stashParser(parser: any): any {
 	const g = globalThis as Record<PropertyKey, unknown>;
@@ -65,7 +73,15 @@ function getParser(): any {
 		cachedParserError = undefined;
 		return cachedParser;
 	}
-	if (cachedParserError) throw cachedParserError;
+	if (cachedParserError) {
+		if (parserResolveRetries >= PARSER_RESOLVE_RETRY_LIMIT) throw cachedParserError;
+		// Bounded retry: allow a fresh attempt in case the require cache was
+		// repaired since the cached failure (the stash path above already covers
+		// the common case). Each failed attempt re-caches the error below, so the
+		// spam budget stays capped at PARSER_RESOLVE_RETRY_LIMIT.
+		parserResolveRetries++;
+		cachedParserError = undefined;
+	}
 	const resolved = require.resolve("web-tree-sitter");
 	let parser = unwrapParser(require(resolved));
 	if (!parser) {
@@ -106,6 +122,7 @@ function getParser(): any {
 	}
 	cachedParser = stashParser(parser);
 	cachedParserError = undefined;
+	parserResolveRetries = 0;
 	return cachedParser;
 }
 

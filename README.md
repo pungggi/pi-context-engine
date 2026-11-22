@@ -108,6 +108,10 @@ unchanged repo took 237 ms.
 - **Switches**: `indexer.auto_index: false` disables the session-start and
   lazy kicks; `indexer.watch: false` disables the file watcher. Use
   `/context-index` for manual builds.
+- **Failure toasts**: watcher/background errors surface as a toast with the
+  message truncated to 240 characters (up from 120), so the diagnostic
+  fingerprint (e.g. `web-tree-sitter malformed: keys=[…]`) is not cut off
+  before the part that identifies the cause.
 - **Large-workspace guard**: automatic indexing and the watcher pause with a
   warning above `indexer.max_auto_files` (default 10,000). The check uses the
   normal directory walk and stops at the first file above the limit, so it does

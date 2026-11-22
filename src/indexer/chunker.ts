@@ -10,8 +10,192 @@ import { makeChunk, type Chunk, type ChunkType } from "../types.js";
 // web-tree-sitter is CJS; loaded through require so the same code path works
 // under jiti (pi) and vitest.
 const require = createRequire(import.meta.url);
+
+// The upstream build exports conditionally: `"object"==typeof exports &&
+// (module.exports=TreeSitter)`. Two distinct poisons can hand us a bad
+// export, both observed in the field:
+//   1. `{}` — a loader evaluating it in a non-CJS context (jiti's ESM-path
+//      variant) never fires the UMD guard, so require() returns an empty
+//      object with no SyntaxError.
+//   2. the Emscripten Module (`HEAP8|HEAP16|…`) — web-tree-sitter 0.22.6
+//      reassigns `module.exports = Module` INSIDE `init()`, mutating node's
+//      require cache; a later re-evaluated chunker module re-requires and
+//      receives the Module instead of the Parser class.
+// Resolve lazily, recover via a global stash (survives a poisoned re-require),
+// drop a poisoned require-cache entry once before failing with a fingerprint
+// that identifies which shape we got.
+//
+// The stash lives on globalThis under a well-known symbol so a chunker module
+// that is re-evaluated (engine swap on session_start, jiti re-instantiation)
+// recovers the good class even when its own require() hits a poisoned cache.
+const PARSER_STASH = Symbol.for("pce.web-tree-sitter.Parser");
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const Parser: any = require("web-tree-sitter");
+let cachedParser: any;
+// Cache a permanent resolution failure so a broken evaluation context does not
+// re-require + throw on every watcher tick (that is the toast-spam from the
+// incident). Cleared only by a successful resolve below, or when the bounded
+// retry budget (below) allows a fresh attempt after the cache healed.
+let cachedParserError: Error | undefined;
+// The stash usually self-heals a later load, but if it stays empty while the
+// require cache gets repaired out-of-band, retry a bounded number of times
+// instead of throwing the cached error forever. Keeps the no-spam guarantee
+// (at most PARSE_RETRY_LIMIT attempts per process) while not bricking a
+// session whose cache healed after the first failure.
+//
+// Budget is TIME-WINDOWED, not a per-process total: a persistent poison must
+// not re-run the full resolve cycle on every watcher tick (spam), but a require
+// cache repaired out-of-band (no stash filled) must still be able to recover
+// after the window rolls over. So we allow at most PARSER_RESOLVE_RETRY_LIMIT
+// attempts per PARSER_RESOLVE_RETRY_WINDOW_MS; once the window has elapsed the
+// budget resets automatically.
+let parserResolveRetries = 0;
+let parserResolveWindowStart = 0;
+const PARSER_RESOLVE_RETRY_LIMIT = 3;
+const PARSER_RESOLVE_RETRY_WINDOW_MS = 30_000;
+
+/** Roll the window forward when it has elapsed, keeping the retry budget in sync. */
+function rollWindowIfStale(now: number): void {
+	if (now - parserResolveWindowStart >= PARSER_RESOLVE_RETRY_WINDOW_MS) {
+		parserResolveRetries = 0;
+		parserResolveWindowStart = now;
+	}
+}
+
+/** True while the current window still has budget for another resolve attempt. */
+function retryBudgetAllows(): boolean {
+	const now = Date.now();
+	rollWindowIfStale(now);
+	return parserResolveRetries < PARSER_RESOLVE_RETRY_LIMIT;
+}
+
+/** Record one failed resolve cycle against the current window's budget. */
+function noteResolveFailure(): void {
+	const now = Date.now();
+	rollWindowIfStale(now);
+	parserResolveRetries++;
+}
+
+/** Mark a fresh success/heal: clear the cached error and reset the budget. */
+function noteResolveSuccess(): void {
+	parserResolveRetries = 0;
+	parserResolveWindowStart = Date.now();
+}
+
+function stashParser(parser: any): any {
+	const g = globalThis as Record<PropertyKey, unknown>;
+	g[PARSER_STASH] ??= parser;
+	return g[PARSER_STASH];
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function unwrapParser(mod: any): any {
+	// The clean export is the TreeSitter CLASS (a function with a static init).
+	// The Emscripten Module poison (init()'s `module.exports=Module`) is a plain
+	// OBJECT with HEAP8/HEAP16… and no `init`, so a function-with-init check
+	// accepts the class and rejects the Module. Verified empirically: post-init
+	// require() yields `typeof object, .init undefined, .HEAP8 object` (the
+	// Module), while the class is `typeof function, .init function, .HEAP8
+	// undefined`. Do NOT require `Language.load` here: it is only assigned in
+	// onRuntimeInitialized, so it is undefined before init() runs and would
+	// reject the legitimate pre-init class.
+	const isParser = (m: any): boolean => typeof m === "function" && typeof m.init === "function";
+	if (isParser(mod)) return mod;
+	// ESM-interop / namespace shapes: { default: TreeSitter } or { Parser: TreeSitter }
+	if (mod && isParser(mod.default)) return mod.default;
+	if (mod && isParser(mod.Parser)) return mod.Parser;
+	return undefined;
+}
+
+function getParser(): any {
+	if (cachedParser) return cachedParser;
+	// Recover from a prior clean load first — the only source guaranteed to be a
+	// good class binding — before touching a possibly-poisoned require cache.
+	// Checked BEFORE the cached error too: a later successful load (another
+	// module instance, engine swap) may have populated the stash since the
+	// failure, and we must self-heal instead of throwing forever.
+	const g = globalThis as Record<PropertyKey, unknown>;
+	// Validate the stash through unwrapParser before trusting it: the symbol is
+	// global and could hold a bad shape (the Emscripten Module itself has an
+	// `init`, or a half-formed object from another module instance). A blind
+	// truthy check would cement that poison forever and the cache-drop retry
+	// would never run. An invalid stash is ignored and we fall through to the
+	// require path below.
+	const stashed = unwrapParser(g[PARSER_STASH]);
+	if (stashed) {
+		cachedParser = stashParser(stashed);
+		cachedParserError = undefined;
+		// Deliberately NOT noteResolveSuccess() here: a stash-heal is cheap (no
+		// require cycle) and must not refill the budget, or a process that
+		// ping-pongs between stash-heals and require-failures would reset the
+		// counter every tick and re-run full resolve cycles indefinitely.
+		return cachedParser;
+	}
+	if (cachedParserError) {
+		// Only keep throwing the cached error while the windowed budget is
+		// exhausted; once the window rolls over, retryBudgetAllows() resets it so
+		// an out-of-band-repaired cache recovers instead of staying dead. The
+		// budget is spent by noteResolveFailure() at the failure site (below), so
+		// the FIRST failed cycle counts too — this branch only gates retries.
+		if (!retryBudgetAllows()) throw cachedParserError;
+		cachedParserError = undefined;
+	}
+	const resolved = require.resolve("web-tree-sitter");
+	const firstMod = require(resolved);
+	let parser = unwrapParser(firstMod);
+	let secondMod: unknown = firstMod;
+	if (!parser) {
+		// Poisoned require-cache entry (empty `{}` from a non-CJS eval, or the
+		// Emscripten Module left behind by init()). Drop it and re-require once
+		// through a clean native load.
+		try {
+			delete require.cache[resolved];
+		} catch {
+			// best effort — fall through to the diagnostic below
+		}
+		secondMod = require(resolved);
+		parser = unwrapParser(secondMod);
+	}
+	if (!parser) {
+		// Permanent for this context (the re-require was poisoned too): cache the
+		// failure so watcher ticks do not repeat the full cycle, then throw a
+		// fingerprint that splits the hypotheses on the next occurrence. Every
+		// diagnostic require() stays inside try/catch — a throwing third require
+		// must not discard the fingerprint we are building. The resolve path is
+		// shortened to its last two segments: a deep Windows node_modules path
+		// would push the keys=[…] diagnosis past the 240-char toast limit.
+		let keys = "<unavailable>";
+		let shape = "<unavailable>";
+		// Diagnose from the ALREADY-LOADED module (secondMod, the post-drop
+		// result) instead of a third require(): re-executing the poisoned module
+		// a third time can run side effects (e.g. init() mutating the cache) for
+		// no diagnostic benefit — the shape we care about is what the drop
+		// produced. Only fall back to a fresh require if even that threw.
+		try {
+			const diag = secondMod ?? require(resolved);
+			keys = Object.keys(diag ?? {}).join(",");
+			shape = typeof diag;
+		} catch (diagErr) {
+			keys = `<require threw: ${diagErr instanceof Error ? diagErr.message : String(diagErr)}>`;
+			shape = "<require threw>";
+		}
+		const shortPath = resolved.split(/[\\/]/).slice(-2).join("/");
+		cachedParserError = new Error(
+			`web-tree-sitter malformed: keys=[${keys}] typeof=${shape} ` +
+			`node=${process.version} resolve=${shortPath}`,
+		);
+		// Count this failed cycle against the windowed budget HERE — including the
+		// first failure, which never passes through the cachedParserError gate — so
+		// PARSER_RESOLVE_RETRY_LIMIT caps the per-window work exactly (the gate only
+		// limits RETRIES; every failure, first or repeat, spends budget).
+		noteResolveFailure();
+		throw cachedParserError;
+	}
+	cachedParser = stashParser(parser);
+	cachedParserError = undefined;
+	noteResolveSuccess();
+	return cachedParser;
+}
 
 const FUNCTION_TYPES = new Set([
 	"function_definition", "function_declaration", "generator_function_declaration",
@@ -96,7 +280,29 @@ let parserInitPromise: Promise<void> | undefined;
 const languageCache = new Map<string, Promise<unknown>>();
 
 function ensureParserInit(): Promise<void> {
-	parserInitPromise ??= Parser.init().then(() => undefined);
+	if (!parserInitPromise) {
+		// Capture the promise in a local first so the rejection handler can tell
+		// whether it is still the active one before clearing. getParser() can throw
+		// synchronously (cachedParserError); keep the function's Promise-returning
+		// contract by converting that into a rejection.
+		let self: Promise<void>;
+		try {
+			self = getParser()
+				.init()
+				.then(() => undefined, (err: unknown) => {
+					// Never cache a rejection: a transient failure (model/wasm load,
+					// poisoned module) must not brick the watcher for the whole
+					// session — drop the promise so the next reindex retries. Only
+					// clear it if it is still this promise (a concurrent caller may
+					// already have replaced it), so we never clobber a newer attempt.
+					if (parserInitPromise === self) parserInitPromise = undefined;
+					throw err;
+				});
+		} catch (err) {
+			return Promise.reject(err);
+		}
+		parserInitPromise = self;
+	}
 	return parserInitPromise as Promise<void>;
 }
 
@@ -108,8 +314,18 @@ function loadLanguage(language: string): Promise<unknown> | null {
 		p = (async () => {
 			await ensureParserInit();
 			const wasmPath = require.resolve(`tree-sitter-wasms/out/${stem}.wasm`);
-			return Parser.Language.load(wasmPath);
-		})();
+			return getParser().Language.load(wasmPath);
+		})().catch((err: unknown) => {
+			// Same rule as ensureParserInit: don't pin a rejected load forever.
+			languageCache.delete(language);
+			// Keep the language in the message: a watcher toast showing only
+			// "web-tree-sitter malformed: …" does not say which grammar failed.
+			const wrapped = new Error(
+				`failed to load tree-sitter language "${language}": ${err instanceof Error ? err.message : String(err)}`,
+			);
+			wrapped.cause = err;
+			throw wrapped;
+		});
 		languageCache.set(language, p);
 	}
 	return p;
@@ -123,7 +339,7 @@ export class Chunker {
 		// small pool. tree-sitter wasm parsers are not safe to share across
 		// concurrent parses, and ours are strictly synchronous, so one is
 		// enough — the pool exists for future parallel workers.
-		return this.parserPool.pop() ?? new Parser();
+		return this.parserPool.pop() ?? new (getParser() as new () => unknown)();
 	}
 
 	private releaseParser(p: unknown): void {

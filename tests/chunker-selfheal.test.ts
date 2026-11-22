@@ -134,4 +134,60 @@ describe("chunker web-tree-sitter loading", () => {
 			else realCache[wtsPath] = priorEntry;
 		}
 	});
+
+	it("caps full resolve cycles per window (no toast-spam under persistent poison)", async () => {
+		// Persistent poison that survives the cache-drop (re-planted on delete),
+		// counted by deleteProperty. Over many watcher ticks the windowed budget
+		// must limit full resolve cycles (delete → re-require → diagnostics) to
+		// PARSER_RESOLVE_RETRY_LIMIT, after which getParser() throws the CACHED
+		// error cheaply instead of re-running the cycle every tick.
+		const ModuleCtor = require("module") as unknown as { _cache: Record<string, unknown> };
+		const realCache = ModuleCtor._cache;
+		let fullCycles = 0;
+		const poisonEntry = (): NodeModule =>
+			({
+				exports: {},
+				loaded: true,
+				id: wtsPath,
+				filename: wtsPath,
+				path: wtsPath,
+				children: [],
+				paths: [],
+			}) as unknown as NodeModule;
+		const proxy = new Proxy(realCache, {
+			deleteProperty(target, prop) {
+				Reflect.deleteProperty(target, prop);
+				if (prop === wtsPath) {
+					fullCycles++;
+					target[prop] = poisonEntry(); // re-plant so every retry is poisoned
+				}
+				return true;
+			},
+		});
+		Object.defineProperty(ModuleCtor, "_cache", { value: proxy, configurable: true });
+		const priorEntry = realCache[wtsPath];
+		realCache[wtsPath] = poisonEntry();
+
+		const { warmupLanguages } = await import("../src/indexer/chunker.js");
+		try {
+			const TICKS = 8; // well past PARSER_RESOLVE_RETRY_LIMIT (3)
+			let caught = 0;
+			for (let i = 0; i < TICKS; i++) {
+				try {
+					await warmupLanguages(new Set(["javascript"]));
+				} catch {
+					caught++;
+				}
+			}
+			// Every tick fails (poison never clears), but full resolve cycles are
+			// capped at the retry limit — not one per tick.
+			expect(caught).toBe(TICKS);
+			expect(fullCycles).toBeLessThanOrEqual(3);
+			expect(fullCycles).toBeGreaterThan(0); // it did retry at least once
+		} finally {
+			Object.defineProperty(ModuleCtor, "_cache", { value: realCache, configurable: true });
+			if (priorEntry === undefined) delete realCache[wtsPath];
+			else realCache[wtsPath] = priorEntry;
+		}
+	});
 });

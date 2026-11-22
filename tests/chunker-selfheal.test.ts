@@ -46,6 +46,36 @@ describe("chunker web-tree-sitter loading", () => {
 		await expect(warmupLanguages(new Set(["javascript"]))).resolves.toBeUndefined();
 	});
 
+	it("actually performs the cache-drop retry (spy: poison deleted, clean module loaded)", async () => {
+		// Isolate the DROP step itself: plant the poison, then observe that
+		// getParser() deletes that exact entry (the cache-drop) before the
+		// re-require returns a clean module. Without the drop this test fails,
+		// proving the recovery depends on the drop and not on a lucky clean load.
+		let droppedPath: string | undefined;
+		const handler: ProxyHandler<Record<string, unknown>> = {
+			deleteProperty(target, prop) {
+				if (prop === wtsPath) droppedPath = String(prop);
+				return Reflect.deleteProperty(target, prop);
+			},
+		};
+		const ModuleCtor = require("module") as unknown as { _cache: Record<string, unknown> };
+		const realCache = ModuleCtor._cache;
+		const spyCache = new Proxy(realCache, handler);
+		Object.defineProperty(ModuleCtor, "_cache", { value: spyCache, configurable: true });
+		try {
+			const { warmupLanguages } = await import("../src/indexer/chunker.js");
+			await expect(warmupLanguages(new Set(["javascript"]))).resolves.toBeUndefined();
+			// The drop must have targeted the poisoned web-tree-sitter entry.
+			expect(droppedPath).toBe(wtsPath);
+			// And the cache now holds a real module (not our fake poison).
+			const loaded = realCache[wtsPath] as NodeModule | undefined;
+			expect(loaded).toBeDefined();
+			expect(loaded?.exports).not.toEqual({}); // clean export, not the empty poison
+		} finally {
+			Object.defineProperty(ModuleCtor, "_cache", { value: realCache, configurable: true });
+		}
+	});
+
 	it("actually parsed the grammar, not just resolved the module", async () => {
 		const { Chunker, warmupLanguages } = await import("../src/indexer/chunker.js");
 		await warmupLanguages(new Set(["javascript"]));

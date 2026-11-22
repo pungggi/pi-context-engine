@@ -83,6 +83,7 @@ describe("chunker web-tree-sitter loading", () => {
 			},
 		});
 		Object.defineProperty(ModuleCtor, "_cache", { value: proxy, configurable: true });
+		const priorEntry = realCache[wtsPath]; // preserve whatever was there before
 		realCache[wtsPath] = poisonEntry();
 
 		const { warmupLanguages } = await import("../src/indexer/chunker.js");
@@ -96,9 +97,11 @@ describe("chunker web-tree-sitter loading", () => {
 		} finally {
 			// Restore the real cache for later tests — even if the assertion above
 			// throws, or the Proxy would stay on Module._cache and poison every
-			// subsequent test in this process.
+			// subsequent test in this process. Put back the prior entry rather than
+			// unconditionally deleting, so we do not clobber state another test needs.
 			Object.defineProperty(ModuleCtor, "_cache", { value: realCache, configurable: true });
-			delete realCache[wtsPath];
+			if (priorEntry === undefined) delete realCache[wtsPath];
+			else realCache[wtsPath] = priorEntry;
 		}
 	});
 });

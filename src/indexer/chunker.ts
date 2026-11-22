@@ -54,23 +54,32 @@ let parserResolveWindowStart = 0;
 const PARSER_RESOLVE_RETRY_LIMIT = 3;
 const PARSER_RESOLVE_RETRY_WINDOW_MS = 30_000;
 
-function retryBudgetAllows(): boolean {
-	const now = Date.now();
+/** Roll the window forward when it has elapsed, keeping the retry budget in sync. */
+function rollWindowIfStale(now: number): void {
 	if (now - parserResolveWindowStart >= PARSER_RESOLVE_RETRY_WINDOW_MS) {
-		// Window rolled over: start a fresh budget so a healed cache can recover.
 		parserResolveRetries = 0;
 		parserResolveWindowStart = now;
 	}
+}
+
+/** True while the current window still has budget for another resolve attempt. */
+function retryBudgetAllows(): boolean {
+	const now = Date.now();
+	rollWindowIfStale(now);
 	return parserResolveRetries < PARSER_RESOLVE_RETRY_LIMIT;
 }
 
+/** Record one failed resolve cycle against the current window's budget. */
 function noteResolveFailure(): void {
 	const now = Date.now();
-	if (now - parserResolveWindowStart >= PARSER_RESOLVE_RETRY_WINDOW_MS) {
-		parserResolveRetries = 0;
-		parserResolveWindowStart = now;
-	}
+	rollWindowIfStale(now);
 	parserResolveRetries++;
+}
+
+/** Mark a fresh success/heal: clear the cached error and reset the budget. */
+function noteResolveSuccess(): void {
+	parserResolveRetries = 0;
+	parserResolveWindowStart = Date.now();
 }
 
 function stashParser(parser: any): any {
@@ -118,20 +127,16 @@ function getParser(): any {
 		cachedParserError = undefined;
 		// A successful stash-heal is a fresh cycle: reset the retry budget so
 		// switching between stash-heals and require-failures never drains it.
-		parserResolveRetries = 0;
-		parserResolveWindowStart = Date.now();
+		noteResolveSuccess();
 		return cachedParser;
 	}
 	if (cachedParserError) {
 		// Only keep throwing the cached error while the windowed budget is
 		// exhausted; once the window rolls over, retryBudgetAllows() resets it so
-		// an out-of-band-repaired cache recovers instead of staying dead.
+		// an out-of-band-repaired cache recovers instead of staying dead. The
+		// budget is spent by noteResolveFailure() at the failure site (below), so
+		// the FIRST failed cycle counts too — this branch only gates retries.
 		if (!retryBudgetAllows()) throw cachedParserError;
-		// Bounded retry: allow a fresh attempt in case the require cache was
-		// repaired since the cached failure (the stash path above already covers
-		// the common case). Each failed attempt re-caches the error below, so the
-		// spam budget stays capped at PARSER_RESOLVE_RETRY_LIMIT per window.
-		noteResolveFailure();
 		cachedParserError = undefined;
 	}
 	const resolved = require.resolve("web-tree-sitter");
@@ -170,17 +175,16 @@ function getParser(): any {
 			`web-tree-sitter malformed: keys=[${keys}] typeof=${shape} ` +
 			`node=${process.version} resolve=${shortPath}`,
 		);
-		// Deliberately do NOT reset parserResolveRetries here: the budget must
-		// survive failed cycles so PARSER_RESOLVE_RETRY_LIMIT actually caps the
-		// per-watcher-tick work (require → drop → re-require → diagnostics → alloc).
-		// Resetting on failure would make the bounded retry a no-op under a
-		// persistent poison — exactly the spam the negative cache prevents.
+		// Count this failed cycle against the windowed budget HERE — including the
+		// first failure, which never passes through the cachedParserError gate — so
+		// PARSER_RESOLVE_RETRY_LIMIT caps the per-window work exactly (the gate only
+		// limits RETRIES; every failure, first or repeat, spends budget).
+		noteResolveFailure();
 		throw cachedParserError;
 	}
 	cachedParser = stashParser(parser);
 	cachedParserError = undefined;
-	parserResolveRetries = 0;
-	parserResolveWindowStart = Date.now();
+	noteResolveSuccess();
 	return cachedParser;
 }
 

@@ -53,10 +53,17 @@ function stashParser(parser: any): any {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function unwrapParser(mod: any): any {
-	if (mod && typeof mod.init === "function") return mod;
+	// The clean export is the TreeSitter CLASS (a function with a static init).
+	// The Emscripten Module poison (init()'s `module.exports=Module`) is a plain
+	// OBJECT with HEAP8/HEAP16… and no `init`, so a function-with-init check
+	// accepts the class and rejects the Module. Do NOT require `Language.load`
+	// here: it is only assigned in onRuntimeInitialized, so it is undefined
+	// before init() runs and would reject the legitimate pre-init class.
+	const isParser = (m: any): boolean => typeof m === "function" && typeof m.init === "function";
+	if (isParser(mod)) return mod;
 	// ESM-interop / namespace shapes: { default: TreeSitter } or { Parser: TreeSitter }
-	if (mod && mod.default && typeof mod.default.init === "function") return mod.default;
-	if (mod && typeof mod.Parser === "function" && typeof mod.Parser.init === "function") return mod.Parser;
+	if (mod && isParser(mod.default)) return mod.default;
+	if (mod && isParser(mod.Parser)) return mod.Parser;
 	return undefined;
 }
 
@@ -128,10 +135,11 @@ function getParser(): any {
 			`web-tree-sitter malformed: keys=[${keys}] typeof=${shape} ` +
 			`node=${process.version} resolve=${shortPath}`,
 		);
-		// Budget is per failure cycle, not per process: a later healed cache
-		// (after an engine swap re-poisons then repairs) must still get its
-		// bounded retries instead of throwing the stale error forever.
-		parserResolveRetries = 0;
+		// Deliberately do NOT reset parserResolveRetries here: the budget must
+		// survive failed cycles so PARSER_RESOLVE_RETRY_LIMIT actually caps the
+		// per-watcher-tick work (require → drop → re-require → diagnostics → alloc).
+		// Resetting on failure would make the bounded retry a no-op under a
+		// persistent poison — exactly the spam the negative cache prevents.
 		throw cachedParserError;
 	}
 	cachedParser = stashParser(parser);

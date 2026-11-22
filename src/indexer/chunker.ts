@@ -10,8 +10,54 @@ import { makeChunk, type Chunk, type ChunkType } from "../types.js";
 // web-tree-sitter is CJS; loaded through require so the same code path works
 // under jiti (pi) and vitest.
 const require = createRequire(import.meta.url);
+
+// web-tree-sitter 0.22.6 reassigns `module.exports = Module` (the raw Emscripten
+// module, keys HEAP8|HEAP16|…) INSIDE `init()`. That mutates node's require
+// cache, so any later `require("web-tree-sitter")` — e.g. a re-evaluated chunker
+// module after a session/engine swap — receives the Module instead of the
+// Parser class and throws `Parser.init is not a function` (watcher reindex
+// failure). Resolve the class once and stash it on a global symbol so a
+// poisoned re-eval recovers the good binding instead of the Emscripten Module.
+const PARSER_STASH = Symbol.for("pce.web-tree-sitter.Parser");
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const Parser: any = require("web-tree-sitter");
+function loadParser(): any {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const resolve = (): any => {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const mod: any = require("web-tree-sitter");
+		// Clean export: the TreeSitter class (a function with a static init).
+		if (typeof mod === "function" && typeof mod.init === "function") return mod;
+		return mod;
+	};
+	const mod = resolve();
+	if (typeof mod === "function" && typeof mod.init === "function") {
+		const g = globalThis as Record<PropertyKey, unknown>;
+		g[PARSER_STASH] ??= mod;
+		return g[PARSER_STASH];
+	}
+	// Poisoned (Emscripten Module, no .Parser/.default) or a first-load-after-poison.
+	// Recover the stashed class from a prior clean load if we have it.
+	const g = globalThis as Record<PropertyKey, unknown>;
+	if (g[PARSER_STASH]) return g[PARSER_STASH];
+	if (mod && typeof mod.Parser === "function") return mod.Parser;
+	if (mod && typeof mod.default === "function") return mod.default;
+	// No stash (this is the first load and the cache is already poisoned): evict the
+	// module so node re-executes it to its initial `module.exports = TreeSitter`, then
+	// stash the recovered class. Without this the watcher would still throw
+	// `Parser.init is not a function` on a re-evaluated module.
+	const file = require.resolve("web-tree-sitter");
+	delete require.cache[file];
+	const fresh = require("web-tree-sitter");
+	if (typeof fresh === "function" && typeof fresh.init === "function") {
+		g[PARSER_STASH] ??= fresh;
+		return g[PARSER_STASH];
+	}
+	throw new Error("web-tree-sitter: cannot resolve Parser (module poisoned by init?)");
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const Parser: any = loadParser();
 
 const FUNCTION_TYPES = new Set([
 	"function_definition", "function_declaration", "generator_function_declaration",

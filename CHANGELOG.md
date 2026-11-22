@@ -2,6 +2,22 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## Unreleased
+
+### Fixed
+
+- **Watcher `Parser.init is not a function` crash**: web-tree-sitter 0.22.6
+  reassigns `module.exports = Module` (the raw Emscripten module, keys
+  `HEAP8|HEAP16|…`) *inside* `init()`, mutating node's require cache. The
+  first (clean) load captured the `Parser` class, but a later re-evaluation
+  of the chunker module (engine swap on `session_start`, jiti module
+  re-instantiation) re-required the poisoned cache and got the Emscripten
+  Module instead — so its `Parser.init()` threw and the whole watcher reindex
+  aborted. The chunker now resolves the class robustly: it stashes the good
+  class on a global symbol at first clean load, recovers it (or unwraps
+  `.Parser`/`.default`) on a poisoned re-eval, and as a last resort evicts
+  `require.cache` to re-execute the module to its clean export.
+
 ## 0.10.3 - 2026-11-21
 
 ### Fixed

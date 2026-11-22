@@ -54,14 +54,18 @@ function unwrapParser(mod: any): any {
 
 function getParser(): any {
 	if (cachedParser) return cachedParser;
-	if (cachedParserError) throw cachedParserError;
 	// Recover from a prior clean load first — the only source guaranteed to be a
 	// good class binding — before touching a possibly-poisoned require cache.
+	// Checked BEFORE the cached error too: a later successful load (another
+	// module instance, engine swap) may have populated the stash since the
+	// failure, and we must self-heal instead of throwing forever.
 	const g = globalThis as Record<PropertyKey, unknown>;
 	if (g[PARSER_STASH]) {
 		cachedParser = g[PARSER_STASH];
+		cachedParserError = undefined;
 		return cachedParser;
 	}
+	if (cachedParserError) throw cachedParserError;
 	const resolved = require.resolve("web-tree-sitter");
 	let parser = unwrapParser(require(resolved));
 	if (!parser) {
@@ -80,7 +84,9 @@ function getParser(): any {
 		// failure so watcher ticks do not repeat the full cycle, then throw a
 		// fingerprint that splits the hypotheses on the next occurrence. Every
 		// diagnostic require() stays inside try/catch — a throwing third require
-		// must not discard the fingerprint we are building.
+		// must not discard the fingerprint we are building. The resolve path is
+		// shortened to its last two segments: a deep Windows node_modules path
+		// would push the keys=[…] diagnosis past the 240-char toast limit.
 		let keys = "<unavailable>";
 		let shape = "<unavailable>";
 		try {
@@ -91,9 +97,10 @@ function getParser(): any {
 			keys = `<require threw: ${diagErr instanceof Error ? diagErr.message : String(diagErr)}>`;
 			shape = "<require threw>";
 		}
+		const shortPath = resolved.split(/[\\/]/).slice(-2).join("/");
 		cachedParserError = new Error(
 			`web-tree-sitter malformed: keys=[${keys}] typeof=${shape} ` +
-			`node=${process.version} resolve=${resolved}`,
+			`node=${process.version} resolve=${shortPath}`,
 		);
 		throw cachedParserError;
 	}
@@ -186,15 +193,21 @@ const languageCache = new Map<string, Promise<unknown>>();
 
 function ensureParserInit(): Promise<void> {
 	if (!parserInitPromise) {
-		parserInitPromise = getParser()
+		// Capture the promise in a local first so the rejection handler can tell
+		// whether it is still the active one before clearing.
+		let self: Promise<void>;
+		self = getParser()
 			.init()
 			.then(() => undefined, (err: unknown) => {
 				// Never cache a rejection: a transient failure (model/wasm load,
 				// poisoned module) must not brick the watcher for the whole
-				// session — drop the promise so the next reindex retries.
-				parserInitPromise = undefined;
+				// session — drop the promise so the next reindex retries. Only
+				// clear it if it is still this promise (a concurrent caller may
+				// already have replaced it), so we never clobber a newer attempt.
+				if (parserInitPromise === self) parserInitPromise = undefined;
 				throw err;
 			});
+		parserInitPromise = self;
 	}
 	return parserInitPromise as Promise<void>;
 }

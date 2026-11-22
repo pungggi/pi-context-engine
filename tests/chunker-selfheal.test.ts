@@ -31,6 +31,11 @@ function plantPoison(): void {
 describe("chunker web-tree-sitter loading", () => {
 	beforeEach(() => {
 		vi.resetModules();
+		// resetModules does NOT clear a globalThis Symbol.for stash (it survives
+		// module re-evaluation), so a stash filled by an earlier test would let
+		// getParser() return early and the poison path would never run. Clear it
+		// so this test genuinely exercises the cache-drop recovery.
+		delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for("pce.web-tree-sitter.Parser")];
 		plantPoison();
 	});
 

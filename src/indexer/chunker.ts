@@ -194,19 +194,25 @@ const languageCache = new Map<string, Promise<unknown>>();
 function ensureParserInit(): Promise<void> {
 	if (!parserInitPromise) {
 		// Capture the promise in a local first so the rejection handler can tell
-		// whether it is still the active one before clearing.
+		// whether it is still the active one before clearing. getParser() can throw
+		// synchronously (cachedParserError); keep the function's Promise-returning
+		// contract by converting that into a rejection.
 		let self: Promise<void>;
-		self = getParser()
-			.init()
-			.then(() => undefined, (err: unknown) => {
-				// Never cache a rejection: a transient failure (model/wasm load,
-				// poisoned module) must not brick the watcher for the whole
-				// session — drop the promise so the next reindex retries. Only
-				// clear it if it is still this promise (a concurrent caller may
-				// already have replaced it), so we never clobber a newer attempt.
-				if (parserInitPromise === self) parserInitPromise = undefined;
-				throw err;
-			});
+		try {
+			self = getParser()
+				.init()
+				.then(() => undefined, (err: unknown) => {
+					// Never cache a rejection: a transient failure (model/wasm load,
+					// poisoned module) must not brick the watcher for the whole
+					// session — drop the promise so the next reindex retries. Only
+					// clear it if it is still this promise (a concurrent caller may
+					// already have replaced it), so we never clobber a newer attempt.
+					if (parserInitPromise === self) parserInitPromise = undefined;
+					throw err;
+				});
+		} catch (err) {
+			return Promise.reject(err);
+		}
 		parserInitPromise = self;
 	}
 	return parserInitPromise as Promise<void>;

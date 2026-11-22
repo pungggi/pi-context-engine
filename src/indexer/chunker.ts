@@ -125,9 +125,10 @@ function getParser(): any {
 	if (stashed) {
 		cachedParser = stashParser(stashed);
 		cachedParserError = undefined;
-		// A successful stash-heal is a fresh cycle: reset the retry budget so
-		// switching between stash-heals and require-failures never drains it.
-		noteResolveSuccess();
+		// Deliberately NOT noteResolveSuccess() here: a stash-heal is cheap (no
+		// require cycle) and must not refill the budget, or a process that
+		// ping-pongs between stash-heals and require-failures would reset the
+		// counter every tick and re-run full resolve cycles indefinitely.
 		return cachedParser;
 	}
 	if (cachedParserError) {
@@ -140,7 +141,9 @@ function getParser(): any {
 		cachedParserError = undefined;
 	}
 	const resolved = require.resolve("web-tree-sitter");
-	let parser = unwrapParser(require(resolved));
+	const firstMod = require(resolved);
+	let parser = unwrapParser(firstMod);
+	let secondMod: unknown = firstMod;
 	if (!parser) {
 		// Poisoned require-cache entry (empty `{}` from a non-CJS eval, or the
 		// Emscripten Module left behind by init()). Drop it and re-require once
@@ -150,7 +153,8 @@ function getParser(): any {
 		} catch {
 			// best effort — fall through to the diagnostic below
 		}
-		parser = unwrapParser(require(resolved));
+		secondMod = require(resolved);
+		parser = unwrapParser(secondMod);
 	}
 	if (!parser) {
 		// Permanent for this context (the re-require was poisoned too): cache the
@@ -162,8 +166,13 @@ function getParser(): any {
 		// would push the keys=[…] diagnosis past the 240-char toast limit.
 		let keys = "<unavailable>";
 		let shape = "<unavailable>";
+		// Diagnose from the ALREADY-LOADED module (secondMod, the post-drop
+		// result) instead of a third require(): re-executing the poisoned module
+		// a third time can run side effects (e.g. init() mutating the cache) for
+		// no diagnostic benefit — the shape we care about is what the drop
+		// produced. Only fall back to a fresh require if even that threw.
 		try {
-			const diag = require(resolved);
+			const diag = secondMod ?? require(resolved);
 			keys = Object.keys(diag ?? {}).join(",");
 			shape = typeof diag;
 		} catch (diagErr) {

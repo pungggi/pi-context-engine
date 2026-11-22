@@ -12,30 +12,62 @@ import { makeChunk, type Chunk, type ChunkType } from "../types.js";
 const require = createRequire(import.meta.url);
 
 // The upstream build exports conditionally: `"object"==typeof exports &&
-// (module.exports=TreeSitter)`. When a loader evaluates it in a non-CJS
-// context (seen with jiti's ESM-path variants in pi), the guard never fires
-// and `require()` silently returns `{}` — every later `Parser.init()` then
-// throws "Parser.init is not a function" for the rest of the process.
-// Resolve lazily, validate, and drop a poisoned require-cache entry once
-// before failing with a fingerprint that identifies which shape we got.
+// (module.exports=TreeSitter)`. Two distinct poisons can hand us a bad
+// export, both observed in the field:
+//   1. `{}` — a loader evaluating it in a non-CJS context (jiti's ESM-path
+//      variant) never fires the UMD guard, so require() returns an empty
+//      object with no SyntaxError.
+//   2. the Emscripten Module (`HEAP8|HEAP16|…`) — web-tree-sitter 0.22.6
+//      reassigns `module.exports = Module` INSIDE `init()`, mutating node's
+//      require cache; a later re-evaluated chunker module re-requires and
+//      receives the Module instead of the Parser class.
+// Resolve lazily, recover via a global stash (survives a poisoned re-require),
+// drop a poisoned require-cache entry once before failing with a fingerprint
+// that identifies which shape we got.
+//
+// The stash lives on globalThis under a well-known symbol so a chunker module
+// that is re-evaluated (engine swap on session_start, jiti re-instantiation)
+// recovers the good class even when its own require() hits a poisoned cache.
+const PARSER_STASH = Symbol.for("pce.web-tree-sitter.Parser");
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let cachedParser: any;
+// Cache a permanent resolution failure so a broken evaluation context does not
+// re-require + throw on every watcher tick (that is the toast-spam from the
+// incident). Cleared only by a successful resolve below.
+let cachedParserError: Error | undefined;
+
+function stashParser(parser: any): any {
+	const g = globalThis as Record<PropertyKey, unknown>;
+	g[PARSER_STASH] ??= parser;
+	return g[PARSER_STASH];
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function unwrapParser(mod: any): any {
 	if (mod && typeof mod.init === "function") return mod;
-	// ESM-interop shape: { default: TreeSitter }
+	// ESM-interop / namespace shapes: { default: TreeSitter } or { Parser: TreeSitter }
 	if (mod && mod.default && typeof mod.default.init === "function") return mod.default;
+	if (mod && typeof mod.Parser === "function" && typeof mod.Parser.init === "function") return mod.Parser;
 	return undefined;
 }
 
 function getParser(): any {
 	if (cachedParser) return cachedParser;
+	if (cachedParserError) throw cachedParserError;
+	// Recover from a prior clean load first — the only source guaranteed to be a
+	// good class binding — before touching a possibly-poisoned require cache.
+	const g = globalThis as Record<PropertyKey, unknown>;
+	if (g[PARSER_STASH]) {
+		cachedParser = g[PARSER_STASH];
+		return cachedParser;
+	}
 	const resolved = require.resolve("web-tree-sitter");
 	let parser = unwrapParser(require(resolved));
 	if (!parser) {
-		// Poisoned require-cache entry (partial/foreign evaluation context).
-		// Drop it and re-require once through a clean native load.
+		// Poisoned require-cache entry (empty `{}` from a non-CJS eval, or the
+		// Emscripten Module left behind by init()). Drop it and re-require once
+		// through a clean native load.
 		try {
 			delete require.cache[resolved];
 		} catch {
@@ -44,14 +76,24 @@ function getParser(): any {
 		parser = unwrapParser(require(resolved));
 	}
 	if (!parser) {
-		const mod = require(resolved);
-		throw new Error(
-			`web-tree-sitter malformed: keys=[${Object.keys(mod ?? {}).join(",")}] ` +
-			`typeof=${typeof mod} node=${process.version} resolve=${resolved}`,
+		// Permanent for this context (the re-require was poisoned too): cache the
+		// failure so watcher ticks do not repeat the full cycle, then throw a
+		// fingerprint that splits the hypotheses on the next occurrence.
+		let keys = "";
+		try {
+			keys = Object.keys(require(resolved) ?? {}).join(",");
+		} catch {
+			keys = "<require threw>";
+		}
+		cachedParserError = new Error(
+			`web-tree-sitter malformed: keys=[${keys}] typeof=${typeof require(resolved)} ` +
+			`node=${process.version} resolve=${resolved}`,
 		);
+		throw cachedParserError;
 	}
-	cachedParser = parser;
-	return parser;
+	cachedParser = stashParser(parser);
+	cachedParserError = undefined;
+	return cachedParser;
 }
 
 const FUNCTION_TYPES = new Set([

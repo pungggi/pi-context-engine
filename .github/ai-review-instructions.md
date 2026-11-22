@@ -26,11 +26,11 @@ Der Bot liest diese Datei vom PR-Head. Kurze, konkrete Regeln, eine pro Zeile.
 ## Bekannte Kontexte (nicht als Finding melden)
 
 - `.github/workflows/ai-review.yml` ist ein bewusst dünner Stub; Logik + `pr_number`-Vertrag liegen zentral in `pungggi/ai-review`.
-- `web-tree-sitter` wird per nativem `createRequire` geladen (jiti- und vitest-parität) inkl. `unwrapParser`-Fallback, Cache-Drop-Retry und Fingerprint-Diagnose — bewusster Hardening-Fix, kein Duplikat.
+- `web-tree-sitter` wird per nativem `createRequire` geladen (jiti- und vitest-parität) mit kombiniertem Hardening gegen ZWEI beobachtete Poison-Formen: (a) `{}` wenn die UMD-Guard in einem nicht-CJS-Kontext nie feuert, (b) der Emscripten-Module (`HEAP8|…`) den `init()` in `module.exports` zurück schreibt und den require-cache mutiert. `getParser()` = globaler Stash (`Symbol.for("pce.web-tree-sitter.Parser")`, prüft ZUERST, überlebt re-eval) + `unwrapParser` (`.init`/`.default`/`.Parser`, stashed gefundene Klassen) + einmaliger Cache-Drop-Retry + Fingerprint-Diagnose + Negative-Result-Cache (`cachedParserError`, verhindert Re-Require+Throw pro Watcher-Tick) — bewusster Hardening-Fix, kein Duplikat.
 - `eslint-disable @typescript-eslint/no-explicit-any` bei tree-sitter-Interop ist gesetzt, weil die WASM-Grammatik-API ungetypt ist.
 - Manifest-Checkpoints werden während Migration/Store-Reset unterdrückt (Review-Fix PR #21) — Absicht, kein vergessener Save.
 - Der automatische Index-Lauf hat eine Dateibudget-Grenze (`indexer.max_auto_files`); manuelle `/context-index` umgeht sie bewusst.
 - `realpathSync.native` im Watcher ist Windows-8.3-Hardening (sonst libuv-Absturz) — nicht refactorbar.
 - Dashboard ist read-only und nur an 127.0.0.1 gebunden (Host-Header-Guard gegen DNS-Rebinding) — kein fehlendes Auth-Feature.
-- `parserInitPromise`/`languageCache` setzen abgelehnte Promises zurück (Self-Heal) — Absicht, kein Race.
+- `parserInitPromise`/`languageCache`/`cachedParserError` setzen abgelehnte bzw. fehlgeschlagene Ergebnisse zurück bzw. caching bewusst (Self-Heal, kein Toast-Spam) — Absicht, kein Race.
 - Kein `pi`/`web-tree-sitter`-Version-Bump im PR-Window erwarten: Loader-Kontext-Fixes sind Teil des Stubs-Themas.

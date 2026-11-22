@@ -78,6 +78,9 @@ function getParser(): any {
 	if (stashed) {
 		cachedParser = stashParser(stashed);
 		cachedParserError = undefined;
+		// A successful stash-heal is a fresh cycle too: reset the retry budget so
+		// switching between stash-heals and require-failures never drains it.
+		parserResolveRetries = 0;
 		return cachedParser;
 	}
 	if (cachedParserError) {

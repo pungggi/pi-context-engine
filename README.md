@@ -362,7 +362,12 @@ Environment overrides:
 an ~80 MB cross-encoder model on first use (into the same models dir as the
 embedder) and adds CPU latency per query. It reorders only the top 30 fused
 candidates; if the model cannot load, retrieval falls back to the fused order
-instead of failing.
+instead of failing. Measured on this package's 89-query eval with the real
+ONNX embedder (2026-11-23): sharper top of the list (R@5 +0.05, bug-report
+R@5 +0.29) but weaker deep recall (cross-file R@10 0.67→0.33, prose
+0.46→0.31) at ~6× query latency (p50 112→675 ms) — overall within the eval
+tolerance, so the default stays `off`; opt in when the first hit matters
+more than covering the full result set.
 
 **Chunking caveat**: `indexer.chunking: ast-density` (cAST-style budgeted
 split-merge) is experimental and measured WORSE than the legacy walk on this

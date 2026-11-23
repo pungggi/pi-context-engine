@@ -51,6 +51,11 @@ before the changes lets us prove each improvement instead of guessing.
 R4's baseline so its impact can be measured.
 
 **Status history**
+- 2026-11-23: R10 real-model A/B run (ms-marco cross-encoder, 89 queries,
+  real embedder): mixed result within tolerance, 6× latency — default `off`
+  confirmed with data (details under R10). @Docs external doc-site indexing
+  rejected by owner decision; design sketch in RESEARCH-COMPETITORS.md
+  updated to "Rejected". Eval script gained `--rerank` / `--rerank-model`.
 - 2026-10-18: all items R1-R13 implemented and measured. Eval (fake
   embedder, 76 queries): R@10 .910-.936, nDCG .813-.825, distraction
   ~.695-.699 across the run series (gate green at every step; final
@@ -370,6 +375,30 @@ default-on if the eval shows a win and latency budget holds.
   the PR; default stays `off` unless quality wins justify the download.
 - **Risks:** CPU latency; ONNX export availability for the chosen model.
   **Dependencies:** R4 mandatory. **Effort:** M.
+- **Real-model A/B (2026-11-23, closes the "eval not run" gap):** the default
+  `Xenova/ms-marco-MiniLM-L-6-v2` cross-encoder loads fine via
+  `@huggingface/transformers` (~17 s first download, then cached; ~18 ms for
+  2 docs). The earlier blockers were only the code-specialized candidates
+  (jina gated/offline, unixcoder ONNX layout broken) — the general model was
+  never the problem. 89-query suite, real ONNX embedder, `--rerank` flag:
+
+  | metric | rerank off | rerank on | delta |
+  |---|---|---|---|
+  | fileRecall@5 | 0.678 | 0.730 | +0.052 |
+  | fileRecall@10 | 0.805 | 0.779 | −0.026 |
+  | nDCG@10 | 0.707 | 0.681 | −0.026 |
+  | distraction@10 | 0.712 | 0.647 | −0.065 (better) |
+  | served tokens | 823 | 429 | −48% |
+  | p50/p95 latency | 112/175 ms | 675/764 ms | ~6× slower |
+
+  Per-kind: `nl` R@5 +0.20 and `bug-report` R@5 +0.29 (sharper top of the
+  list) vs `cross-file` R@10 0.667→0.333 and `prose` R@10 0.462→0.308
+  (deep recall collapses; tiny n). Verdict: mixed, within the ±0.05 gate on
+  the overall metrics — **default stays `off`**, now on measured evidence
+  rather than "model would not load". Opt-in `retrieval.rerank: local`
+  remains for the sharper-top use case. A code-specialized reranker
+  (jina-code / unixcoder ONNX) would need a working ONNX port before a
+  re-run is worth it.
 
 ### R11. Code-specialized embedder option
 

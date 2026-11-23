@@ -251,11 +251,12 @@ is the agreed sequence (small and evidence-backed first).
   other pi packages/solutions, not by this engine (user decision, 2026-10-25).
 - **Remote multi-repo search (Cody-style) and hosted graph reviews**: product
   scope of cloud tools; out of local pi scope.
-- **Not decided yet**: @Docs-style indexing of external doc sites with the
-  agent proposing new sources on low retrieval confidence. Design discussed
-  2026-10-25 (separate docs corpus under `~/.pi-context-engine/docs/`,
-  `docs_search` tool, crawl guardrails, static HTML only); awaiting a
-  go/no-go before entering the plan.
+- **Rejected (2026-11-23, owner decision)**: @Docs-style indexing of external
+  doc sites with the agent proposing new sources on low retrieval confidence.
+  Design was discussed 2026-10-25 (separate docs corpus under
+  `~/.pi-context-engine/docs/`, `docs_search` tool, crawl guardrails,
+  static HTML only); owner decided no-go — context providers stay with other
+  pi packages, the engine's scope remains the local repo (code + prose).
 - **LLM contextual retrieval**: Anthropic's prompt-per-chunk costs an LLM
   call per chunk at index time. The deterministic heading breadcrumb (P0.B)
   captures most of the benefit for free; revisit only if eval plateaus.

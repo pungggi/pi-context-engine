@@ -2,6 +2,31 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## 0.10.4 - 2026-11-23
+
+### Fixed
+
+- **Permanent per-session `Parser.init is not a function` failures** (#29):
+  `require("web-tree-sitter")` can silently return `{}` when the UMD gate at
+  the end of `tree-sitter.js` never fires (jiti ESM-path evaluation), and the
+  parser init cached the **rejected** promise — turning a transient cause
+  into a permanent per-session failure with a re-toast on every watcher tick.
+  The chunker now unwraps ESM-interop shapes, retries once after dropping the
+  poisoned require-cache entry, never caches rejections (watcher reindex
+  self-heals for any transient cause), and fails loud with a diagnostic
+  fingerprint, shown in a longer toast slice when the cause persists.
+- **Automatic indexing never stole an orphaned index lock** (#41):
+  automatic (watcher / session-start) runs acquire the cross-process lock
+  with a zero wait budget, and that single-shot path returned `busy` on its
+  first failed create — **before** the staleness takeover (`stealIfStale`)
+  was ever reached. A lock orphaned by a crashed session (dead pid, or past
+  the 15-minute stale age) was therefore only ever stolen by a *manual*
+  `/context-index`; background runs skipped forever while the skip counter
+  climbed (`Index lock: held by pid … (2868m)`, 114 skips). Every acquire —
+  including zero-budget ones — now performs a staleness pass **before**
+  reporting busy, so automatic runs take over orphaned locks and self-heal,
+  while still skipping instantly when the holder is alive.
+
 ## 0.10.3 - 2026-11-21
 
 ### Fixed

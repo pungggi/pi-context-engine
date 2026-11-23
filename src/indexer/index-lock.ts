@@ -102,10 +102,19 @@ export function indexLockPath(storageBase: string): string {
  * automatic path); manual runs pass a short wait before giving up. Async on
  * purpose: pi's extension process must stay responsive during the wait, so
  * the poll uses setTimeout instead of blocking the event loop.
+ *
+ * Every attempt — including zero-budget single-shot ones — performs a
+ * staleness pass before reporting busy, so a lock orphaned by a dead owner
+ * (or past STALE_LOCK_MS) is taken over by automatic runs too, not only by
+ * manual ones (issue #41).
  */
 export async function acquireIndexLock(storageBase: string, waitMs = 0): Promise<AcquireResult> {
 	const file = lockPath(storageBase);
 	const deadline = Date.now() + Math.max(0, waitMs);
+	// Staleness pass BEFORE the loop: with waitMs = 0 the deadline check below
+	// returns busy on the first failed create, and the in-loop stealIfStale
+	// would never run — leaving orphaned locks unstealable by background runs.
+	stealIfStale(storageBase);
 	for (;;) {
 		if (createLockFile(file)) {
 			return {

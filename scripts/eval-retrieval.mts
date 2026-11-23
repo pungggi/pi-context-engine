@@ -23,6 +23,7 @@
  *   npm run eval                    # run + gate against tests/eval/baseline.json
  *   npm run eval -- --write-baseline
  *   npm run eval -- --local         # real ONNX embedder (downloads once)
+ *   npm run eval -- --local --rerank  # R10 A/B: cross-encoder reranker ON
  *   npm run eval -- --json          # machine-readable summary line
  */
 import fs from "node:fs";
@@ -210,6 +211,11 @@ async function main(): Promise<void> {
 	const modelOverride = modelIdx >= 0 ? args[modelIdx + 1] : undefined;
 	// R12: `--ast-density` runs the A/B with the new chunking strategy.
 	const useAstDensity = args.includes("--ast-density");
+	// R10: `--rerank` runs the A/B with the opt-in local cross-encoder on
+	// (default model from config unless `--rerank-model <hf-id>` overrides).
+	const useRerank = args.includes("--rerank");
+	const rerankModelIdx = args.indexOf("--rerank-model");
+	const rerankModelOverride = rerankModelIdx >= 0 ? args[rerankModelIdx + 1] : undefined;
 	const repoRoot = fs.realpathSync(process.cwd());
 
 	const queries = loadQueries(repoRoot);
@@ -228,6 +234,12 @@ async function main(): Promise<void> {
 		ollamaUrl: "http://127.0.0.1:1",
 		compressionLevel: "standard" as const,
 		...(useAstDensity ? { indexerChunking: "ast-density" as const } : {}),
+		...(useRerank
+			? {
+					retrievalRerank: "local" as const,
+					...(rerankModelOverride ? { retrievalRerankModel: rerankModelOverride } : {}),
+			}
+			: {}),
 	};
 
 	let embedder: Embedder;
@@ -238,7 +250,7 @@ async function main(): Promise<void> {
 	} else {
 		embedder = new Embedder(new FakeEmbeddingBackend());
 	}
-	const backendName = `${embedder.backendName}/${embedder.modelName}`;
+	const backendName = `${embedder.backendName}/${embedder.modelName}${useRerank ? ` + rerank=${rerankModelOverride ?? "default"}` : ""}`;
 
 	const engine = new ContextEngine({
 		projectDir: repoRoot,

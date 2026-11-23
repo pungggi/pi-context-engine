@@ -243,7 +243,30 @@ is the agreed sequence (small and evidence-backed first).
 
 - **B. Summary chunk per large prose file**, generated via Ollama at index time
   (Zed-style), behind a config flag: costs an LLM call per changed file.
-- **C. Semantic chunking** for heading-less unstructured text, behind a flag.
+- **C. Semantic chunking** for heading-less unstructured text, behind a flag —
+  **implemented 2026-11-23 (P2-C)**.
+  - **Scope gate**: heading-less prose only (`.txt`, Markdown with no ATX
+    heading anywhere). Files with headings keep heading sections (header-aware
+    chunking is the measured markdown winner); code keeps the legacy walk;
+    `legacy` stays the default everywhere.
+  - **Mechanics** (`src/indexer/semantic-chunker.ts`): paragraph units → one
+    extra embedding pass per eligible file (through the same embedder +
+    embedding cache as the chunk pass, unit-level caching, stale-dim
+    validation) → breakpoints at consecutive-unit cosine distances above the
+    75th percentile of the file's own distances → budget-greedy grouping →
+    undersize groups (<320 nw chars) merge into the closer neighbour; chunks
+    tile the file byte-exactly (same conventions as `chunkProse`). Embedder
+    failure, <3 units, or sub-budget files fall back to `chunkProse`
+    deterministically. Config: `indexer.chunking: semantic-prose`.
+  - **Eval A/B** (suite extended to 95 queries with a 3k-char heading-less
+    fixture + 6 prose queries; baseline re-recorded on the default config):
+    fake-backend gate NEUTRAL/identical aggregates; real ONNX embedder neutral
+    overall — R@5 0.625→0.665, nDCG@10 0.681→0.687, R@10 0.777→0.749,
+    distraction 0.756→0.748, latency ~unchanged (39→40 ms p50). The fixture
+    queries miss the file in BOTH configs (fusion-level ranking, not chunk
+    granularity), so no chunking-attributable win could be shown on this
+    corpus — same honest outcome class as R12: ships flag-gated for
+    notes-heavy workloads, default unchanged.
 
 ### What we deliberately do not chase
 

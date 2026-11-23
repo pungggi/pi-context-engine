@@ -10,7 +10,8 @@ import { promisify } from "node:util";
 import type { Config } from "../config.js";
 import { projectStorageDir, sha256Hex, yieldToEventLoop } from "../utils.js";
 import { Chunker, isAstLanguage, warmupLanguages } from "./chunker.js";
-import { chunkProse, extractDocLinkTargets, isProseLanguage } from "./prose-chunker.js";
+import { chunkProse, extractDocLinkTargets, isProseLanguage, proseHasStructure } from "./prose-chunker.js";
+import { chunkSemanticProse } from "./semantic-chunker.js";
 import { applyContextHeaderToChunk, stripContextHeader } from "./context-header.js";
 import { Embedder, selectBackend } from "./embedder.js";
 import { EmbeddingCache } from "./embedding-cache.js";
@@ -748,6 +749,34 @@ async function runIndexingLocked(
 		return { embedder: holders.embedder, cache: holders.cache };
 	};
 
+	/**
+	 * P2-C: embed plain texts (semantic-chunker units) through the same embedder
+	 * + cache the chunk pass uses. Cache hits with a stale dimension surface as
+	 * misses and get re-embedded — same anti-poison rule as embedChunks,
+	 * because a unit vector is only ever consumed relatively (distances to
+	 * neighbours).
+	 */
+	const embedTexts = async (texts: string[]): Promise<number[][]> => {
+		const { embedder: emb, cache: cch } = await ensureEmbedder();
+		const hashes = texts.map((t) => cch.contentHash(t));
+		const cached = cch.getBatch(hashes, { expectedDim: emb.dimension });
+		const out: number[][] = texts.map(() => []);
+		const missIndices: number[] = [];
+		for (let i = 0; i < texts.length; i++) {
+			const hit = cached.get(hashes[i]!);
+			if (hit && hit.length === emb.dimension) out[i] = hit;
+			else missIndices.push(i);
+		}
+		if (missIndices.length > 0) {
+			const vectors = await emb.embedTexts(missIndices.map((i) => texts[i]!));
+			missIndices.forEach((mi, k) => {
+				out[mi] = vectors[k]!;
+				cch.put(hashes[mi]!, vectors[k]!);
+			});
+		}
+		return out;
+	};
+
 	// Everything after this point can reject (embed failures, backend
 	// crashes, IO). The finally at the end of the function releases the
 	// cache/backend handles on every path: an open handle wedges re-runs
@@ -860,7 +889,9 @@ async function runIndexingLocked(
 				try {
 					if (isAstLanguage(item.language)) {
 						const out = chunker.chunkWithImports(item.content, item.relPath, item.language, {
-								chunking: config.indexerChunking,
+								// AST files never see "semantic-prose": it is a prose-only
+								// strategy, so map it to the legacy walk for code.
+								chunking: config.indexerChunking === "ast-density" ? "ast-density" : "legacy",
 								budgetChars: config.indexerChunkBudgetChars,
 							});
 						chunks = out.chunks;
@@ -868,10 +899,28 @@ async function runIndexingLocked(
 						importSpecs = out.importSpecs;
 					}
 					if (chunks.length === 0 && isProseLanguage(item.language)) {
-						// Prose P0: heading/paragraph sections instead of one whole-file
-						// chunk (docs/RESEARCH-COMPETITORS.md §4). Yields [] for empty
-						// files, which fall through to the legacy whole-file fallback.
-						chunks = chunkProse(item.content, item.relPath, item.language, config.indexerChunkBudgetChars);
+						// P2-C: heading-less unstructured prose may chunk by embedding-
+						// similarity breakpoints (extra embed pass per file). Falls back
+						// to chunkProse when not eligible, structured, or embed fails.
+						if (config.indexerChunking === "semantic-prose" && !proseHasStructure(item.content, item.language)) {
+							try {
+								chunks = await chunkSemanticProse(
+									item.content,
+									item.relPath,
+									item.language,
+									config.indexerChunkBudgetChars,
+									embedTexts,
+								);
+							} catch {
+								chunks = []; // embedder hiccups degrade to deterministic packing
+							}
+						}
+						if (chunks.length === 0) {
+							// Prose P0: heading/paragraph sections instead of one whole-file
+							// chunk (docs/RESEARCH-COMPETITORS.md §4). Yields [] for empty
+							// files, which fall through to the legacy whole-file fallback.
+							chunks = chunkProse(item.content, item.relPath, item.language, config.indexerChunkBudgetChars);
+						}
 					}
 					if (chunks.length === 0) {
 						// Fallback: module-level chunk (upstream _fallback_chunk).

@@ -211,6 +211,9 @@ async function main(): Promise<void> {
 	const modelOverride = modelIdx >= 0 ? args[modelIdx + 1] : undefined;
 	// R12: `--ast-density` runs the A/B with the new chunking strategy.
 	const useAstDensity = args.includes("--ast-density");
+	// P2-C: `--semantic-prose` runs the A/B with semantic chunking for
+	// heading-less prose (extra unit-embedding pass per file).
+	const useSemanticProse = args.includes("--semantic-prose");
 	// R10: `--rerank` runs the A/B with the opt-in local cross-encoder on
 	// (default model from config unless `--rerank-model <hf-id>` overrides).
 	const useRerank = args.includes("--rerank");
@@ -234,6 +237,7 @@ async function main(): Promise<void> {
 		ollamaUrl: "http://127.0.0.1:1",
 		compressionLevel: "standard" as const,
 		...(useAstDensity ? { indexerChunking: "ast-density" as const } : {}),
+		...(useSemanticProse ? { indexerChunking: "semantic-prose" as const } : {}),
 		...(useRerank
 			? {
 					retrievalRerank: "local" as const,

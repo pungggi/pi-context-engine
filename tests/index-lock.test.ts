@@ -104,6 +104,26 @@ describe("acquireIndexLock", () => {
 		expect("lock" in acquired).toBe(true);
 	});
 
+	it("steals an orphaned lock even on a zero-budget (automatic) attempt", async () => {
+		const dir = makeTempDir("pce-lock-unit-");
+		tempDirs.push(dir);
+		const child = spawnSync(process.execPath, ["-e", ""], { timeout: 10_000 });
+		expect(child.pid).toBeGreaterThan(0);
+		forgeLock(dir, { pid: child.pid!, acquiredAtEpoch: Date.now() });
+		// waitMs = 0 is the automatic-run budget: it must still take over a lock
+		// whose owner is dead instead of reporting busy forever (issue #41).
+		const acquired = await acquireIndexLock(dir, 0);
+		expect("lock" in acquired).toBe(true);
+	});
+
+	it("steals a stale-age lock even on a zero-budget (automatic) attempt", async () => {
+		const dir = makeTempDir("pce-lock-unit-");
+		tempDirs.push(dir);
+		forgeLock(dir, { pid: process.pid, acquiredAtEpoch: Date.now() - 16 * 60_000 });
+		const acquired = await acquireIndexLock(dir, 0);
+		expect("lock" in acquired).toBe(true);
+	});
+
 	it("never steals a fresh lock held by a live pid", async () => {
 		const dir = makeTempDir("pce-lock-unit-");
 		tempDirs.push(dir);
@@ -133,6 +153,23 @@ describe("runIndexing × cross-process lock", () => {
 		const now = await engine.autoIndexOnce();
 		expect(now!.skippedByOtherSession).toBeFalsy();
 		expect(now!.indexed).toBeGreaterThanOrEqual(3);
+	});
+
+	it("automatic runs steal an orphaned lock instead of skipping forever", async () => {
+		const { engine, storageBase } = await harness();
+		// A previous session crashed mid-index and left its lock behind: the
+		// pid is dead and the lock will never be released by its owner.
+		const child = spawnSync(process.execPath, ["-e", ""], { timeout: 10_000 });
+		expect(child.pid).toBeGreaterThan(0);
+		forgeLock(storageBase, { pid: child.pid!, acquiredAtEpoch: Date.now() });
+
+		// The watcher's automatic run must take the orphaned lock over and
+		// index, not skip (issue #41: skip-forever until a manual run).
+		const result = await engine.autoIndexOnce();
+		expect(result).not.toBeNull();
+		expect(result!.skippedByOtherSession).toBeFalsy();
+		expect(result!.indexed).toBeGreaterThanOrEqual(3);
+		expect(engine.chunkCount()).toBeGreaterThanOrEqual(3);
 	});
 
 	it("manual runs wait for the configured window, then skip", async () => {

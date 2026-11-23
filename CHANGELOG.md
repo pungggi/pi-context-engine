@@ -2,6 +2,36 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## 0.11.0 - 2026-11-23
+
+### Added
+
+- **`indexer.chunking: semantic-prose`** (P2-C): opt-in semantic chunking for
+  heading-less unstructured prose (`.txt`, Markdown with no ATX heading).
+  Paragraph units get one extra embedding pass per eligible file (unit-level
+  cached, stale-dimension validated) and chunk boundaries land at
+  cosine-distance breakpoints (top quartile of the file's own boundary
+  distances); undersize groups merge into the closer neighbour. Files with
+  headings, code, and sub-budget files are untouched, and every failure mode
+  (embedder down, <3 units, length mismatch) falls back deterministically to
+  the existing prose chunker. Measured neutral on this package's eval
+  (95 queries, real embedder: R@5 +0.04, nDCG@10 +0.006, R@10 −0.03), so the
+  default stays `legacy` — the flag targets notes-heavy workloads where
+  budget packing visibly blurs topics. Flipping the flag requires a full
+  reindex (unchanged-file hashes skip re-chunking).
+
+### Changed
+
+- **R10 reranker default `off` now carries measured evidence**: the default
+  cross-encoder (`Xenova/ms-marco-MiniLM-L-6-v2`) loads fine — the original
+  blockers were only the code-specialized candidates — and the real-embedder
+  A/B (89 queries) is mixed within the eval tolerance: sharper top of the
+  list (R@5 +0.05, bug-report R@5 +0.29, served tokens −48%) but weaker deep
+  recall (cross-file R@10 0.67→0.33, prose 0.46→0.31) at ~6× query latency
+  (p50 112→675 ms). README documents the numbers.
+- **Retrieval eval suite extended to 95 queries** (heading-less prose fixture
+  + 6 prose queries); baseline re-recorded on the default config.
+
 ## 0.10.4 - 2026-11-23
 
 ### Fixed

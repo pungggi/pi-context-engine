@@ -338,7 +338,8 @@ embedding:
 indexer:
   redact_secrets: true
   context_headers: true  # prepend `// file: ... | unit: ... | imports: ...` to chunk text
-  chunking: legacy        # legacy (default) | ast-density — cAST-style budgeted split-merge (experimental)
+  chunking: legacy        # legacy (default) | ast-density | semantic-prose — ast-density: cAST-style split-merge (experimental);
+                          # semantic-prose: legacy code walk + embedding-similarity breakpoints for heading-less prose (P2-C)
   chunk_budget_chars: 1200 # non-whitespace budget per ast-density chunk
   auto_index: true        # incremental background reindex shortly after session start
   max_auto_files: 10000   # automatic full-project file budget; 0 disables the guard
@@ -375,6 +376,21 @@ package's eval (R@10 0.818 vs 0.936 with the deterministic embedder): tiling
 trivia into chunks dilutes fixed-size result sets. It stays behind a flag for
 A/B on other workloads; chunks concatenate byte-for-byte back to the source,
 so it is safe to try on a branch.
+
+**Semantic-prose chunking** (`indexer.chunking: semantic-prose`, P2-C): for
+heading-less unstructured prose only (`.txt`, Markdown without any heading),
+paragraph units are embedded once per file and chunk boundaries land at
+cosine-distance breakpoints (top quartile of the file's own boundary
+distances), with undersize groups merged into the closer neighbour. Files with
+headings keep heading sections; code keeps the legacy walk; anything under
+the budget stays one chunk. Measured on this package's eval (95 queries, real
+embedder): neutral overall (R@5 +0.04, nDCG +0.006, R@10 −0.03) — no default
+win on a corpus with a single heading-less file, so it ships opt-in for
+notes-heavy workloads where budget packing visibly blurs topics. Cost: one
+extra embedding pass per eligible file (cached per unit, so unchanged
+paragraphs re-hit the cache). Flipping the flag requires a full reindex
+(`/context-index` with reset) because unchanged files keep their manifest
+hashes.
 
 **Embedding backends**: two options, picked automatically per project.
 

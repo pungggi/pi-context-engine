@@ -323,6 +323,16 @@ export function chunkProse(source: string, filePath: string, language: string, b
 	return chunks;
 }
 
+/** True when the prose file carries heading structure — semantic chunking
+ * (P2-C) stays OFF for those files: header-aware sections are the measured
+ * markdown default, embedding-similarity breakpoints are only the fallback
+ * for heading-less unstructured text. */
+export function proseHasStructure(source: string, language: string): boolean {
+        if (language !== "markdown") return false;
+        const { headings } = segmentMarkdown(source.split("\n"));
+        return headings.length > 0;
+}
+
 /** Reference definition `[label]: dest` at the start of a line. */
 const LINK_REFDEF = /^ {0,3}\[[^\]]+\]:\s*(<[^>\n]*>|\S+)/;
 

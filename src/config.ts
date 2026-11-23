@@ -86,8 +86,12 @@ export interface Config {
 	retrievalRerankModel: string;
 	/** R10: how many fused candidates the reranker may reorder. */
 	retrievalRerankTopn: number;
-	/** R12: chunking strategy — `legacy` function/class walk (default) or `ast-density` split-merge. */
-	indexerChunking: "legacy" | "ast-density";
+	/** R12/P2-C: chunking strategy — `legacy` function/class walk (default),
+	 * `ast-density` split-merge (code), or `semantic-prose` (legacy code walk +
+	 * embedding-similarity breakpoints for heading-less prose). Opt-in values
+	 * change chunk content: flipping the flag requires a full reindex to
+	 * re-chunk unchanged files. */
+	indexerChunking: "legacy" | "ast-density" | "semantic-prose";
 	/** R12: non-whitespace char budget per ast-density chunk. */
 	indexerChunkBudgetChars: number;
 	indexerIgnore: string[];

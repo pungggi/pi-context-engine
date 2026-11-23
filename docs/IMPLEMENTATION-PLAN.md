@@ -51,6 +51,12 @@ before the changes lets us prove each improvement instead of guessing.
 R4's baseline so its impact can be measured.
 
 **Status history**
+- 2026-11-23 (later): P2-C semantic chunking implemented flag-gated
+  (`indexer.chunking: semantic-prose`): heading-less prose only, unit-embed
+  breakpoints at the 75th-percentile cosine distance, undersize merge. Eval
+  suite extended to 95 queries (heading-less fixture + 6 prose queries,
+  baseline re-recorded on defaults). A/B neutral on both backends → default
+  stays `legacy`; details in RESEARCH-COMPETITORS.md §4-C.
 - 2026-11-23: R10 real-model A/B run (ms-marco cross-encoder, 89 queries,
   real embedder): mixed result within tolerance, 6× latency — default `off`
   confirmed with data (details under R10). @Docs external doc-site indexing

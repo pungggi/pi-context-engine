@@ -1,0 +1,60 @@
+Unreleased field notes from the Fernwaerme district heating controller rollout.
+Collected by the on-site technicians during the pilot winter. No structure yet,
+these are raw diary entries that will be edited into proper release notes later.
+
+The calibration routine for the flow sensor drifts whenever the district water
+temperature drops below forty degrees. We measured a drift of up to two
+percent per week on sensor bank A. The fix so far is a nightly recalibration
+job that writes offset tables into the controller EEPROM. Technicians should
+not hand-edit those offset tables because the nightly job overwrites manual
+changes without warning.
+
+Sensor bank B uses a different die and barely drifts at all, maybe a tenth of
+a percent over the same week. The purchase order for bank B cited the tighter
+datasheet tolerance. We now route the nightly recalibration only at bank A
+controllers and skip bank B entirely, which cut the EEPROM write cycles by
+about half. Write endurance on the bank A EEPROM is rated for one hundred
+thousand cycles and we were burning through roughly forty cycles a night
+before the split.
+
+The valve maintenance schedule follows the manufacturer table for the Vorex
+2500 series. Grease intervals are every six months for actuator shafts and
+every two years for the gearbox. Districts with hard water should halve the
+gearbox interval because mineral deposits stiffen the packing gland. We keep
+per-district interval overrides in the maintenance ledger, keyed by the
+district short code.
+
+During the cold snap in February two Vorex actuators seized after the packing
+gland dried out. The emergency procedure is to open the bypass loop first,
+then cut the actuator power, then unbolt the gland cover. Reversing those
+steps once pressurised the bonnet and blew a gasket across the plant room.
+Nobody was hurt but the gasket inventory rule now requires two spares per
+district on site at all times.
+
+The firmware update procedure for the controller line starts with a memory
+dump from the running image. The dump goes onto a USB stick formatted with
+FAT32, anything else is invisible to the bootloader. The bootloader then
+verifies the image signature against the factory key burned into the secure
+element. Unsigned images drop the controller into a rescue shell that only
+speaks serial at 115200 baud.
+
+Rescue shell access needs a null modem cable and a terminal that renders
+seven data bits, even parity. The factory terminal profile for that is stored
+in the toolkit as profile F7E. Technicians keep bricking the serial settings
+because the controller ignores eight data bit profiles silently. The rescue
+shell can mount the USB stick, reflash the image, and reboot, which takes
+about eleven minutes end to end.
+
+Error code 4100 means the primary loop pump lost prime. Error code 4101 means
+the secondary loop pump lost prime. Error code 4200 means the expansion
+vessel precharge is below the datasheet floor. Error code 5100 means the
+flue gas temperature sensor reads open circuit. These four codes cover most
+of the winter callouts and the on-call rota keeps a laminated card with the
+pump priming steps clipped next to it.
+
+The callout rota itself is week based, Monday to Sunday, with a handover
+meeting at eight on Monday mornings. Handover notes go into the shared ledger
+under the outgoing week number. If a callout happens during handover the
+outgoing technician keeps the ticket. This rule exists because two winters
+ago a ticket sat unassigned for a day while both technicians assumed the
+other one had taken it, and a school building went a full day without heat.

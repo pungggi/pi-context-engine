@@ -85,7 +85,9 @@ and the index lifecycle.
 2. **Embed**: a content-hash cache skips unchanged code. Ollama is used when it
    is reachable; otherwise a local ONNX model runs in-process.
 3. **Search**: vector similarity and BM25 are merged with Reciprocal Rank
-   Fusion, then scored by similarity, keyword match and recency.
+   Fusion — the BM25 list head gets extra weight when the query's own tokens
+   are corpus-rare, so one distinctive prose term can outvote generic noise —
+   then scored by similarity, keyword match and recency.
 4. **Compress**: chunks are cut to signatures and docstrings, or summarised by
    a local LLM when one is available.
 5. **Remember**: decisions and turn summaries persist in SQLite, keyed for both

@@ -351,6 +351,45 @@ R4's baseline so its impact can be measured.
   session telemetry later). **Dependencies:** R5, R7 for better symbol/family
   hints (can ship with weaker heuristics first). **Effort:** S.
 
+### R14. Rarity-weighted FTS fusion (issue #45)
+
+- **Objective:** stop corpus-unique query terms from being buried in RRF
+  fusion. Added after R13; ships **default-on** (it is a fusion weighting
+  change, not a gated experiment — the eval gate must stay green for it to
+  ship at all).
+- **Problem:** flat RRF gives the FTS rank-1 the same 1/(k+1) as every other
+  list vote. A prose query with a near-unique term ("fernwaerme" matched one
+  fixture file, BM25 rank 1) therefore tied with — and lost to — vector-noise
+  hits from hub code files: the fixture served at rank 16/20, and common-token
+  variants missed the top-10 entirely. Identifier queries never noticed
+  because the symbol path (R5) gives them a second evidence route; prose has
+  none.
+- **Mechanism:** `FTSStore` gains `docCount()` and `termDocCount()` (real df
+  counts). The retriever computes the query's corpus rarity as the mean over
+  `ftsQueryTokens()` of normalised Lucene-smooth IDF, and adds up to
+  `FTS_UNIQUE_WEIGHT_MAX = 3.0` of extra weight to the FTS head, decaying with
+  the candidate's FTS rank (`1/(1+fRank)`). Head-concentration matters: a
+  flat whole-list boost measurably demoted a well-ranked fixture on mixed
+  queries by amplifying common-token matches deep in the BM25 list. Skipped
+  below `FTS_RARITY_MIN_DOCS = 50` rows (df stats lie in tiny corpora), which
+  keeps every small-index unit test on the old behaviour.
+- **Files:** `src/storage/fts-store.ts` (df primitives + `ftsQueryTokens`),
+  `src/storage/local-backend.ts` (passthroughs), `src/retrieval/retriever.ts`
+  (rarity computation, fusion loop, exported `queryTokenRarity`).
+- **Measured (95-query eval, 2026-11-24):** fake backend R@5 0.719→0.789,
+  R@10 0.814→0.854, nDCG 0.705→0.779, distraction 0.735→0.708, identifier
+  R@5 unchanged 0.922; real ONNX backend R@5 0.707→0.818, R@10 0.789→0.879,
+  nDCG 0.712→0.818, prose slice R@10 0.421→0.789. Known cost: identifier
+  R@10 −0.023 on the fake backend (q30-pipeline-locks hit→miss) — the boost
+  can outvote a symbol-path hit when the query mixes a rare term with common
+  co-tokens; accepted as a favourable net trade (+4 prose hits, −1 identifier
+  hit), and identifier results are unharmed on the real embedder.
+- **Tests:** `tests/fts-rarity.test.ts` — df primitives, rarity maths, and a
+  71-chunk corpus that reproduces the burial deterministically (the filler
+  token is chosen to collide with the unique term's fake-embedder hash
+  bucket, so the prose chunk is genuinely absent from the vector list).
+  Baseline re-recorded.
+
 ---
 
 ## Phase 3: gated experiments (P2)

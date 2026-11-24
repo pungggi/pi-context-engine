@@ -69,6 +69,21 @@ export function escapeFts5(query: string): string {
 	return tokenExpr;
 }
 
+/**
+ * Query tokens for rarity weighting: the same tokenisation escapeFts5 uses
+ * (quoted spans keep their words), lowercased, stopwords and single-character
+ * noise dropped. Exported so the retriever's rarity maths and its tests
+ * measure df over exactly the tokens the FTS query will match on.
+ */
+export function ftsQueryTokens(query: string): string[] {
+	const rest = query.replace(/"([^"]+)"/g, (_match, inner: string) => inner);
+	return rest
+		.split(/[^\p{L}\p{N}]+/u)
+		.filter((w) => /[\p{L}\p{N}]/u.test(w))
+		.map((w) => w.toLowerCase())
+		.filter((w) => w.length > 1 && !STOPWORDS.has(w));
+}
+
 type Sqlite = SqliteHandle;
 
 export class FTSStore {
@@ -119,6 +134,37 @@ export class FTSStore {
 			return rows;
 		} catch {
 			return [];
+		}
+	}
+
+	/**
+	 * Total rows in the FTS table — the N for IDF-style rarity maths.
+	 */
+	docCount(): number {
+		try {
+			const rows = this.db.prepare("SELECT count(*) AS n FROM chunks_fts").all() as { n: number }[];
+			return rows[0]?.n ?? 0;
+		} catch {
+			return 0;
+		}
+	}
+
+	/**
+	 * Document frequency of one term: how many indexed chunks contain it.
+	 * Building block for corpus-rarity weighting — a term that matches nearly
+	 * every chunk is noise, a term that matches one chunk is a pointer to that
+	 * file. Quoted so FTS5 never parses the term as query syntax.
+	 */
+	termDocCount(term: string): number {
+		const t = term.trim();
+		if (!t || !/[\p{L}\p{N}]/u.test(t)) return 0;
+		try {
+			const rows = this.db
+				.prepare("SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH ?")
+				.all(`"${t.replace(/"/g, '""')}"`) as { n: number }[];
+			return rows[0]?.n ?? 0;
+		} catch {
+			return 0;
 		}
 	}
 

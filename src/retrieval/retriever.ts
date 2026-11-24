@@ -6,6 +6,7 @@ import type { Chunk } from "../types.js";
 import type { LocalBackend } from "../storage/local-backend.js";
 import type { Embedder } from "../indexer/embedder.js";
 import { parseContextHeaderUnit } from "../indexer/context-header.js";
+import { ftsQueryTokens } from "../storage/fts-store.js";
 import { ConfidenceScorer } from "./confidence.js";
 import { elaborateQuery, QueryParser, type ParsedQuery } from "./query-parser.js";
 import type { RerankerLike } from "./reranker.js";
@@ -15,6 +16,17 @@ const RRF_K = 60;
 const CONFIDENCE_WEIGHT = 0.5;
 const MAX_CHUNKS_PER_FILE = 3;
 const FTS_BOOST_CODE_LOOKUP = 1.5;
+/**
+ * R14 (issue #45): when a query's own tokens are corpus-near-unique, the FTS
+ * list head gets up to this much EXTRA weight (scaled by rarity, decaying
+ * with the candidate's FTS rank, see the fusion loop). Flat RRF gives an FTS
+ * rank-1 the same 1/(k+1) as every vector-noise hit — or less than a chunk
+ * that rides BOTH lists via a common co-token — so a single prose term that
+ * matches one chunk gets buried under hub code files.
+ */
+const FTS_UNIQUE_WEIGHT_MAX = 3.0;
+/** Rarity needs a corpus worth measuring: below this, df stats say nothing. */
+const FTS_RARITY_MIN_DOCS = 50;
 const WORST_COSINE_DISTANCE = 2.0;
 /** R2: reweight near-ties toward the chunk that defines an exact query symbol. */
 const SYMBOL_MATCH_BONUS = 0.06;
@@ -178,8 +190,33 @@ export class HybridRetriever {
 			}
 		}
 
-		const ftsWeight = parsed.intent === "code_lookup" ? FTS_BOOST_CODE_LOOKUP : 1.0;
+		// R14 (issue #45): rarity-weighted FTS fusion. Measure how rare the
+		// query's own tokens are in this corpus (normalised IDF over real df
+		// counts) and add extra FTS weight toward FTS_UNIQUE_WEIGHT_MAX. Why: flat
+		// RRF treats the FTS rank-1 like any other single list vote, so a
+		// near-unique prose term — the strongest possible evidence — loses to
+		// three vector-noise hits from hub code files. The extra weight DECAYS
+		// with the candidate's FTS rank (head-concentrated): BM25's own IDF
+		// already ordered the list, so its head is the trustworthy part; a flat
+		// boost measurably demoted the well-ranked fixture on mixed queries by
+		// amplifying common-token matches deeper in the list ("profile F7E null
+		// modem" 1 → 9). Common words → rarity ~0 → today's behaviour; tiny
+		// corpora are skipped entirely (df stats lie there).
+		const baseFtsWeight = parsed.intent === "code_lookup" ? FTS_BOOST_CODE_LOOKUP : 1.0;
 		const symbolWeight = parsed.intent === "code_lookup" ? FTS_BOOST_CODE_LOOKUP : 1.0;
+		let ftsHeadBoost = 0;
+		const rarityTokens = ftsQueryTokens(query);
+		if (ftsResults.length > 0 && rarityTokens.length > 0) {
+			const docs = this.backend.ftsDocCount();
+			if (docs >= FTS_RARITY_MIN_DOCS) {
+				const rarity = queryTokenRarity(
+					rarityTokens,
+					docs,
+					rarityTokens.map((t) => this.backend.ftsTermDocCount(t)),
+				);
+				ftsHeadBoost = FTS_UNIQUE_WEIGHT_MAX * rarity;
+			}
+		}
 		const pageRanks = this.backend.pageRanks();
 		const allIds = new Set([
 			...vectorRanks.keys(),
@@ -194,7 +231,9 @@ export class HybridRetriever {
 			const vRank = vectorRanks.get(id);
 			if (vRank !== undefined) score += 1 / (RRF_K + vRank);
 			const fRank = ftsIds.get(id);
-			if (fRank !== undefined) score += ftsWeight * (1 / (RRF_K + fRank));
+			if (fRank !== undefined) {
+				score += (baseFtsWeight + ftsHeadBoost / (1 + fRank)) * (1 / (RRF_K + fRank));
+			}
 			const sRank = symbolRanks.get(id);
 			if (sRank !== undefined) score += symbolWeight * (1 / (RRF_K + sRank));
 			const hRank = hintRanks.get(id);
@@ -560,4 +599,22 @@ function estimateKeywordDistance(chunk: Chunk, parsed: ParsedQuery): number {
 
 function identifierLike(keyword: string): boolean {
 	return keyword.length >= 3 && (/[A-Z]/.test(keyword) || keyword.includes("_"));
+}
+
+/**
+ * R14: corpus rarity of a query, 0..1 — mean over tokens of normalised
+ * Lucene-smooth IDF (ln(1 + (N − df + 0.5)/(df + 0.5)), scaled by ln(1+N)) so
+ * a token in every chunk scores ~0 and a token matching one chunk of a large
+ * repo ~0.9+. Exported for unit tests; the retriever combines it with
+ * FTS_UNIQUE_WEIGHT_MAX into the fusion weight.
+ */
+export function queryTokenRarity(tokens: string[], docCount: number, docFreqs: number[]): number {
+	if (tokens.length === 0 || tokens.length !== docFreqs.length || docCount <= 0) return 0;
+	const norm = Math.log(1 + docCount);
+	let sum = 0;
+	for (const df of docFreqs) {
+		const idf = Math.log(1 + (docCount - df + 0.5) / (Math.max(0, df) + 0.5));
+		sum += Math.max(0, Math.min(1, idf / norm));
+	}
+	return sum / tokens.length;
 }

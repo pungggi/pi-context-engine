@@ -399,6 +399,22 @@ steps, tests, acceptance criteria and a status table, lives in
 - **Verify:** a small recall test: seed N decisions, query for each by topic,
   measure whether its linked neighbours surface too.
 
+**R14 (2026-11-24, shipped for issue #45). Rarity-weighted FTS fusion.**
+- **Do:** measure the query's token rarity against real df counts
+  (`FTSStore.docCount()` / `termDocCount()`, normalised Lucene-smooth IDF) and
+  add up to +3.0 of extra weight to the BM25 list head in RRF, decaying with
+  the candidate's FTS rank.
+- **Why:** RRF's vote-per-list design treats a corpus-unique term's FTS
+  rank-1 as one vote among many, so a prose term matching exactly one file
+  tied with — and lost to — vector-noise hits from hub code files (issue #45:
+  fixture at rank 16 despite BM25 rank 1). The decay is load-bearing: a flat
+  whole-list boost amplified common-token matches deeper in the BM25 list and
+  demoted well-ranked hits on mixed queries ("profile F7E null modem" fell
+  from rank 1 to 9 in the repro).
+- **Verify:** the 95-query gate must stay green (it improved: fake R@10
+  0.814→0.854, nDCG 0.705→0.779; real ONNX prose R@10 0.421→0.789), plus the
+  deterministic 71-chunk burial corpus in `tests/fts-rarity.test.ts`.
+
 ---
 
 ## 4. What the literature says not to do

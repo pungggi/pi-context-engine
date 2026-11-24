@@ -43,6 +43,16 @@ export class LocalBackend {
 		return this.ftsStore.search(query, topK);
 	}
 
+	/** Total indexed-chunk count — the N for the retriever's rarity weighting. */
+	ftsDocCount(): number {
+		return this.ftsStore.docCount();
+	}
+
+	/** Document frequency of one term (retriever rarity weighting, issue #45). */
+	ftsTermDocCount(term: string): number {
+		return this.ftsStore.termDocCount(term);
+	}
+
 	graphNeighbors(nodeId: string, edgeType?: EdgeType): GraphNode[] {
 		return this.graphStore.getNeighbors(nodeId, edgeType);
 	}

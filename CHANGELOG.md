@@ -2,6 +2,40 @@
 
 All notable changes to `pi-context-engine`. Versions are tag-driven: pushing `vX.Y.Z` triggers CI to publish with OIDC + provenance (see `docs/PUBLISHING.md`). Date format: YYYY-MM-DD.
 
+## 0.12.0 - 2026-11-24
+
+### Added
+
+- **R14 rarity-weighted FTS fusion** (#45): a query whose own tokens are
+  corpus-near-unique (a prose term like `fernwaerme` matching one fixture
+  file) used to lose RRF fusion — flat reciprocal-rank votes let ~30
+  vector-noise hits from hub code files bury the BM25 rank-1 (served at rank
+  16/20; common-token variants missed the top-10 entirely). The retriever now
+  measures the query's token rarity against real document frequencies
+  (new `FTSStore.docCount()` / `termDocCount()`, normalised Lucene-smooth
+  IDF) and adds up to +3.0 extra weight to the BM25 list **head**, decaying
+  with the candidate's FTS rank. Skipped below 50 indexed rows (df stats lie
+  in tiny corpora), so existing small-index behaviour is untouched. Two
+  design points are load-bearing, both caught in the repro: the boost must
+  decay with FTS rank (a flat whole-list boost amplified common-token matches
+  deeper in the list and demoted well-ranked hits on mixed queries), and the
+  ramp must reach 3.0×rarity (weaker ramps left `error code 4100 lost prime`
+  at rank 7). Issue repro after the fix: `fernwaerme` 16→1,
+  `Fernwaerme field notes` MISS→1, `error code 4100 lost prime` MISS→1,
+  `profile F7E null modem` stays 1.
+
+### Changed
+
+- **Retrieval eval baseline re-recorded after R14** (95 queries). Fake
+  backend: fileRecall@5 0.719→0.789, fileRecall@10 0.814→0.854, nDCG@10
+  0.705→0.779, distraction@10 0.735→0.708, identifier R@5 unchanged 0.922.
+  Real ONNX backend: R@5 0.707→0.818, R@10 0.789→0.879, nDCG@10 0.712→0.818,
+  prose slice R@10 0.421→0.789. Known accepted cost: identifier R@10 −0.023
+  on the fake backend (q30 hit→miss) versus +4 prose hits; identifier results
+  are unharmed on the real embedder. New `tests/fts-rarity.test.ts` (7 tests)
+  covers the df primitives, the rarity maths and a deterministic 71-chunk
+  burial corpus; red before the fix, green after.
+
 ## 0.11.0 - 2026-11-23
 
 ### Added
